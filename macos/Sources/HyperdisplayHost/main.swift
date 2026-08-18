@@ -154,10 +154,26 @@ final class DisplayStream {
     private var keyframeOrder: [UInt32] = []
     private let fragLock = NSLock()
 
+    // MARK: 自适应画质（帧率优先：丢片时先降码率、重灾降采集分辨率；静止/恢复时回升）
+    private(set) var targetBitrate: UInt32
+    private(set) var currentBitrate: UInt32
+    private(set) var captureScale = 1.0
+    private let bitrateFloor: UInt32 = 3_000_000
+    private var fragmentsSentTotal: UInt64 = 0
+    private var nackFragmentsTotal: UInt64 = 0
+    private var windowSentBase: UInt64 = 0
+    private var windowNackBase: UInt64 = 0
+    private var windowStart = Date()
+    private var goodWindows = 0
+
     init(display: VirtualDisplay, fps: Int, bitrate: UInt32, host: HostApp, udp: UdpHost) {
         self.display = display
         self.fps = fps
         self.bitrate = bitrate
+        self.targetBitrate = bitrate
+        // 带宽探测从低走高：先 8M 起步（或更低的目标），连续稳定再升——
+        // 避免一上来就满码率大关键帧在弱网送不完导致画面恢复振荡
+        self.currentBitrate = min(bitrate, 8_000_000)
         self.host = host
         self.udp = udp
     }
@@ -199,6 +215,9 @@ final class DisplayStream {
                     }
                     fragLock.unlock()
                 }
+                fragLock.lock()
+                self.fragmentsSentTotal &+= UInt64(frags.count)
+                fragLock.unlock()
                 for var addr in addresses {
                     for (index, frag) in frags.enumerated() {
                         self.udp.sendWithBackpressure(to: &addr, frag)
@@ -210,14 +229,17 @@ final class DisplayStream {
             }
         )
         self.encoder = encoder
-        injector.updateMapping(bounds: display.bounds, streamWidth: Double(display.pixelWidth), streamHeight: Double(display.pixelHeight))
+        let scale = captureScale
+        let scaledW = max(640, Int(Double(display.pixelWidth) * scale))
+        let scaledH = max(480, Int(Double(display.pixelHeight) * scale))
+        injector.updateMapping(bounds: display.bounds, streamWidth: Double(scaledW), streamHeight: Double(scaledH))
 
-        let bitrate = self.bitrate
+        let bitrate = currentBitrate
         let forceH264 = host?.config.forceH264 ?? false
         Task.detached { [weak self] in
             do {
-                let codec = try encoder.start(width: display.pixelWidth, height: display.pixelHeight, fps: fps, bitrate: bitrate, forceH264: forceH264)
-                try await capture.start(displayID: display.displayID, width: display.pixelWidth, height: display.pixelHeight, fps: fps)
+                let codec = try encoder.start(width: scaledW, height: scaledH, fps: fps, bitrate: bitrate, forceH264: forceH264)
+                try await capture.start(displayID: display.displayID, width: scaledW, height: scaledH, fps: fps)
                 await MainActor.run {
                     self?.started = true
                     self?.starting = false
@@ -249,7 +271,10 @@ final class DisplayStream {
     func sendWelcome(codec: VideoEncoder.Codec? = nil) {
         let c = codec ?? encoder?.codec ?? .hevc
         let did = UInt16(display.displayID & 0xFFFF)
-        let data = Wire.welcome(codec: c.rawValue, displayId: did, width: display.pixelWidth, height: display.pixelHeight, fps: fps)
+        let scale = captureScale
+        let w = max(640, Int(Double(display.pixelWidth) * scale))
+        let h = max(480, Int(Double(display.pixelHeight) * scale))
+        let data = Wire.welcome(codec: c.rawValue, displayId: did, width: w, height: h, fps: fps)
         for var addr in host?.addressesOfSubscribers(of: display.displayID) ?? [] {
             udp.send(to: &addr, data)
         }
@@ -274,6 +299,9 @@ final class DisplayStream {
             udp.send(to: &a, frags[Int(idx)])
             sent += 1
         }
+        fragLock.lock()
+        nackFragmentsTotal &+= UInt64(sent)
+        fragLock.unlock()
         if sent > 0 {
             NSLog("[hyperdisplay] NACK display=\(display.displayID) frame=\(frameId) resent=\(sent)")
         }
@@ -285,6 +313,54 @@ final class DisplayStream {
         // 流重启后新会话计数从小值开始，直接按当前计数处理，避免无符号下溢
         effectiveFps = now >= encodedSnapshot ? Int(min(now - encodedSnapshot, 100_000)) : Int(min(now, 100_000))
         encodedSnapshot = now
+    }
+
+    /// 帧率优先的自适应画质：丢片率 >2% 降码率（×0.7，地板 3M）；码率到底仍 >10% 降采集
+    /// 分辨率（-15%，地板 70%）；连续 3 个窗口零丢片逐级回升。降码率立即强制 IDR 生效。
+    func adaptQuality(now: Date) {
+        guard started else { return }
+        guard now.timeIntervalSince(windowStart) >= 2.0 else { return }
+        fragLock.lock()
+        let sent = fragmentsSentTotal - windowSentBase
+        let lost = nackFragmentsTotal - windowNackBase
+        windowSentBase = fragmentsSentTotal
+        windowNackBase = nackFragmentsTotal
+        fragLock.unlock()
+        windowStart = now
+
+        guard sent > 300 else { return } // 窗口内流量太小，不具备统计意义
+        let lossRate = Double(lost) / Double(sent)
+
+        if lossRate > 0.02 {
+            goodWindows = 0
+            if currentBitrate > bitrateFloor {
+                currentBitrate = max(bitrateFloor, currentBitrate * 7 / 10)
+                encoder?.applyBitrate(currentBitrate)
+                NSLog("[hyperdisplay] quality: loss=\(String(format: "%.1f%%", lossRate * 100)) bitrate->\(currentBitrate/1000)kbps display=\(display.displayID)")
+            } else if captureScale > 0.70 && lossRate > 0.10 {
+                captureScale = max(0.70, captureScale - 0.15)
+                NSLog("[hyperdisplay] quality: severe loss=\(String(format: "%.1f%%", lossRate * 100)) scale->\(captureScale) display=\(display.displayID) (restarting stream)")
+                stop()
+                startIfNeeded()
+            }
+        } else if lost == 0 {
+            goodWindows += 1
+            if goodWindows >= 6 { // 12 秒连续零丢片才升级，防止弱网下升降振荡
+                goodWindows = 0
+                if captureScale < 1.0 {
+                    captureScale = min(1.0, captureScale + 0.15)
+                    NSLog("[hyperdisplay] quality: recovered, scale->\(captureScale) display=\(display.displayID)")
+                    stop()
+                    startIfNeeded()
+                } else if currentBitrate < targetBitrate {
+                    currentBitrate = min(targetBitrate, currentBitrate * 5 / 4)
+                    encoder?.applyBitrate(currentBitrate)
+                    NSLog("[hyperdisplay] quality: stable, bitrate->\(currentBitrate/1000)kbps display=\(display.displayID)")
+                }
+            }
+        } else {
+            goodWindows = 0
+        }
     }
 }
 
@@ -568,6 +644,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
         }
         for stream in streams.values {
             stream.sampleStats()
+            stream.adaptQuality(now: now)
             if stream.started, addressesOfSubscribers(of: stream.display.displayID).isEmpty {
                 stream.stop()
                 NSLog("[hyperdisplay] stream stopped for display \(stream.display.displayID) (no subscribers)")
@@ -601,8 +678,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
         for (index, id) in displayOrder.enumerated() {
             guard let s = streams[id] else { continue }
             let subscribers = addressesOfSubscribers(of: id).count
-            let line = "屏 \(index + 1): \(s.display.pixelWidth)×\(s.display.pixelHeight) · id \(id)"
-                + (s.started ? " · \(s.effectiveFps) fps · \(subscribers) 客户端" : " · 待客户端")
+            let scalePct = Int(s.captureScale * 100)
+            let mb = s.currentBitrate / 1_000_000
+            let targetMb = s.targetBitrate / 1_000_000
+            let line = "屏 \(index + 1): \(s.display.pixelWidth)×\(s.display.pixelHeight)"
+                + (s.started ? " · \(s.effectiveFps)fps · \(mb)/\(targetMb)M · 采集\(scalePct)% · \(subscribers)客户端" : " · 待客户端")
             menu.addItem(withTitle: line, action: nil, keyEquivalent: "")
         }
 

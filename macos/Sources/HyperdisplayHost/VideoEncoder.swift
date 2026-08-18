@@ -85,7 +85,7 @@ final class VideoEncoder {
             kVTCompressionPropertyKey_AllowFrameReordering: false,
             kVTCompressionPropertyKey_AverageBitRate: Int(bitrate),
             // 突发上限 2×（原 6× 会让大关键帧冲到 ~800KB/728 分片，WiFi 丢 1 片即整帧报废）
-            kVTCompressionPropertyKey_DataRateLimits: [Int(bitrate) * 2, 1] as [NSNumber],
+            kVTCompressionPropertyKey_DataRateLimits: [Int(bitrate) / 2, 1] as [NSNumber], // 限突发：IDR 体积上限≈bitrate/16，弱网可完整送达+NACK 可补
             kVTCompressionPropertyKey_ExpectedFrameRate: fps,
             kVTCompressionPropertyKey_MaxKeyFrameInterval: fps * 10,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 10,
@@ -129,6 +129,23 @@ final class VideoEncoder {
         lock.lock()
         forceKeyframeFlag = true
         lock.unlock()
+    }
+
+    /// 运行时调整码率（自适应画质阶梯用）：更新 AverageBitRate + DataRateLimits 并强制 IDR，
+    /// 让新码率立即生效（等下一个 GOP 才生效会拖慢降档响应）。
+    func applyBitrate(_ bitrate: UInt32) {
+        lock.lock()
+        guard let s = session else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        let clamped = max(1_000_000, bitrate)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: Int(clamped) as CFTypeRef)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits,
+                             value: [Int(clamped) / 2, 1] as [NSNumber] as CFArray)
+        requestKeyframe()
+        NSLog("[hyperdisplay] bitrate -> \(clamped / 1000)kbps")
     }
 
     func encode(pixelBuffer: CVPixelBuffer) {

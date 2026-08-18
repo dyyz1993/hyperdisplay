@@ -49,8 +49,11 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         @Volatile var width: Int = 0
         @Volatile var height: Int = 0
         @Volatile var surface: Surface? = null
+        @Volatile var lastKeyframeDeliveredAt = 0L
         var lastRendered = 0
         var renderedNow = 0
+        var stallTicks = 0
+        var lastRenderedCheck = 0
     }
 
     private val pipelines = LinkedHashMap<Int, DisplayPipeline>()
@@ -89,6 +92,25 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             }
             renderFps = total
             for (p in snapshot) p.assembler?.stallCheck()
+            // 解码器死亡检测：有关键帧交付但输出 3 秒不涨 → MediaCodec 内部停摆，重建
+            val stallNow = System.currentTimeMillis()
+            for (p in snapshot) {
+                val d = p.decoder
+                if (d != null && p.renderedNow == p.lastRenderedCheck) {
+                    p.stallTicks++
+                    if (p.stallTicks >= 3 && p.lastKeyframeDeliveredAt > 0
+                        && stallNow - p.lastKeyframeDeliveredAt < 25000) { // GOP 最长 20s，窗口须覆盖
+                        Log.w(TAG, "decoder stall detected, rebuilding display=${'$'}{p.id}")
+                        p.decoder = null
+                        d.release()
+                        p.stallTicks = 0
+                        maybeStartDecoder(p)
+                    }
+                } else {
+                    p.stallTicks = 0
+                }
+                p.lastRenderedCheck = p.renderedNow
+            }
             val s = session
             if (s != null && linkUp) {
                 for (p in snapshot) {
@@ -293,6 +315,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
 
         override fun onConfig(displayId: Int, codec: Int, paramSets: ByteArray) {
+            // csd 完整性防御：CONFIG 走不可靠通道，坏参数集会毁掉之后所有解码器重建
+            if (paramSets.size < 20 || paramSets[0] != 0x00.toByte() || paramSets[1] != 0x00.toByte()
+                || paramSets[2] != 0x00.toByte() || paramSets[3] != 0x01.toByte()) {
+                Log.w(TAG, "dropping malformed csd for display=$displayId len=${'$'}{paramSets.size}")
+                return
+            }
             val p = pipelineOf(displayId)
             val old = p.csd
             if (old != null && p.decoder != null && !old.contentEquals(paramSets)) {
@@ -349,6 +377,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val p = DisplayPipeline(id)
             p.assembler = FrameAssembler(object : FrameAssembler.Callback {
                 override fun onFrame(frameId: Int, keyframe: Boolean, data: ByteArray) {
+                    if (keyframe) p.lastKeyframeDeliveredAt = System.currentTimeMillis()
                     val csd = p.csd
                     val payload: ByteArray = if (keyframe && csd != null) csd + data else data
                     p.decoder?.submit(VideoDecoder.Frame(keyframe, payload))
