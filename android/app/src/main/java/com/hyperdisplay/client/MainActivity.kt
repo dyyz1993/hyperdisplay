@@ -88,6 +88,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var pipSelected = false
     private val pipHandles = mutableListOf<View>()
     private var pipChip: View? = null
+    private var pipTapStartX = 0f
+    private var pipTapStartY = 0f
+    private var pipTapAt = 0L
+    private var pipDragActivated = false
 
     @Volatile private var linkUp = false
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -620,6 +624,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val view = StreamView(this)
             view.displayId = id
             view.onSurfaceReady = { did, surface ->
+                paintBlackPlaceholder(surface)
                 val pl = pipelineOf(did)
                 pl.surface = surface
                 maybeStartDecoder(pl)
@@ -710,6 +715,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         view.holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
         view.setZOrderMediaOverlay(true)
         view.onSurfaceReady = { did, surface ->
+            paintBlackPlaceholder(surface)
             val pl = pipelineOf(did)
             pl.surface = surface
             maybeStartDecoder(pl)
@@ -729,19 +735,18 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         regionViews.add(view)
 
-        // 中间拖动（仅选中态；未选中时窗口内容=远程触控）
+        // 选中态：中间拖动=移动窗口；未选中：轻点=选中（不点 Mac），按住拖=远程操作
         view.onTouch = { did, event ->
             if (pipSelected) {
                 movePipByTouch(root, event, sw, sh)
                 true
             } else {
-                handleTouch(did, view, event)
-                true
+                pipUnselectedTouch(view, did, event, root)
             }
         }
 
         // ⠿ 圆点：点击=选中/取消；按住拖=移动窗口（任何时候）
-        val chipD = (44 * resources.displayMetrics.density).toInt()
+        val chipD = (34 * resources.displayMetrics.density).toInt()
         val chip = View(this).apply {
             background = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.OVAL
@@ -770,7 +775,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         })
 
         // 8 个缩放手柄：四角 + 四边中点
-        val hd = (40 * resources.displayMetrics.density).toInt()
+        val hd = (20 * resources.displayMetrics.density).toInt()
         fun handleGravity(role: String): Int = when (role) {
             "TL" -> Gravity.TOP or Gravity.START
             "TR" -> Gravity.TOP or Gravity.END
@@ -848,6 +853,55 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         container.addView(root, lp)
         pipRoot = root
         setPipSelected(root, false)
+    }
+
+    /** 未选中画中画的触摸：轻点(<400ms 未移动)=选中且不点 Mac；移动超阈值=远程拖动
+     *  （按下延迟到确认拖动后才发，轻点选中不会在 Mac 上留下点击） */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun pipUnselectedTouch(view: StreamView, did: Int, e: MotionEvent, root: FrameLayout): Boolean {
+        val s = session ?: return false
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                pipTapStartX = e.rawX; pipTapStartY = e.rawY
+                pipTapAt = System.currentTimeMillis()
+                pipDragActivated = false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!pipDragActivated) {
+                    val moved = kotlin.math.abs(e.rawX - pipTapStartX) > 24 ||
+                        kotlin.math.abs(e.rawY - pipTapStartY) > 24
+                    if (!moved) return true
+                    pipDragActivated = true
+                    view.viewToStream(e.x, e.y)?.let { s.sendButton(did, 0, true, it[0], it[1]) }
+                }
+                view.viewToStream(e.x, e.y)?.let { s.sendMove(did, it[0], it[1]) }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (!pipDragActivated) {
+                    if (System.currentTimeMillis() - pipTapAt < 400) {
+                        setPipSelected(root, true) // 轻点=选中
+                    } else {
+                        view.viewToStream(e.x, e.y)?.let { pt ->
+                            s.sendMove(did, pt[0], pt[1])
+                            s.sendButton(did, 0, true, pt[0], pt[1])
+                            s.sendButton(did, 0, false, pt[0], pt[1])
+                        }
+                    }
+                } else if (e.actionMasked == MotionEvent.ACTION_UP) {
+                    view.viewToStream(e.x, e.y)?.let { pt -> s.sendButton(did, 0, false, pt[0], pt[1]) }
+                }
+            }
+        }
+        return true
+    }
+
+    /** Surface 首帧前刷黑，避免显示显存残色（绿屏来源之一） */
+    private fun paintBlackPlaceholder(surface: Surface) {
+        try {
+            val c = surface.lockCanvas(null)
+            c.drawColor(android.graphics.Color.BLACK)
+            surface.unlockCanvasAndPost(c)
+        } catch (_: Exception) { }
     }
 
     /** 选中/取消选中：显示 8 手柄 + 高亮边框 */
@@ -1188,7 +1242,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        if (connectView == null) showConnectView()
+        // 副屏应用：切走/锁屏不主动断流（此前 onPause 直接断连，回来像「断开了」）
     }
 
     private fun hideSystemBars() {
