@@ -85,6 +85,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var pipRoot: FrameLayout? = null
     private var pipLeft = -1
     private var pipTop = -1
+    private var pipSelected = false
+    private val pipHandles = mutableListOf<View>()
+    private var pipChip: View? = null
 
     @Volatile private var linkUp = false
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -606,6 +609,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         decorViews.clear()
         pipRoot?.let { container.removeView(it) }
         pipRoot = null
+        pipHandles.clear()
+        pipChip = null
+        pipSelected = false
         val ids = subscribedIds.ifEmpty { displays.take(1).map { it.id } }
         if (ids.isEmpty()) return
         val (sw, sh) = screenDims()
@@ -682,7 +688,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
-    /** 画中画悬浮窗：顶栏拖动移动；右下角柄等比缩放；松手按新尺寸重建虚拟屏 */
+    /** 画中画悬浮窗：⠿圆点=选中/拖动；选中态显示 8 个缩放手柄、按住中间拖动整窗 */
     @SuppressLint("ClickableViewAccessibility")
     private fun buildPipWindow(displayId: Int, sw: Int, sh: Int) {
         val container = sessionRoot ?: return
@@ -691,7 +697,6 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         var pipH: Int
         var pipW: Int
         if (layoutConfig.pipCustomW > 0 && layoutConfig.pipCustomH > 0) {
-            // 手指调过的自由尺寸：窗口=虚拟屏像素 1:1
             pipW = layoutConfig.pipCustomW.coerceIn(minSide, sw * 3 / 4)
             pipH = layoutConfig.pipCustomH.coerceIn(minSide, sh * 3 / 4)
         } else {
@@ -702,8 +707,6 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
         val view = StreamView(this)
         view.displayId = displayId
-        // 画中画的 surface 必须排在主画面 surface 之上（默认会在其下，
-        // 导致窗口区域显示未合成的分配器残色/绿色）；必须在 surface 创建前调用
         view.holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
         view.setZOrderMediaOverlay(true)
         view.onSurfaceReady = { did, surface ->
@@ -720,27 +723,123 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 }
             }
         }
-        view.onTouch = { did, event -> handleTouch(did, view, event); true }
         val pl = pipelineOf(displayId)
         if (pl.width > 0) view.updateStreamSize(pl.width, pl.height)
         root.addView(view, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        regionViews.add(view)
 
-        val bar = TextView(this).apply {
-            text = "⠿ 画中画"
-            textSize = 12f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(0x88000000.toInt())
-            gravity = Gravity.CENTER
+        // 中间拖动（仅选中态；未选中时窗口内容=远程触控）
+        view.onTouch = { did, event ->
+            if (pipSelected) {
+                movePipByTouch(root, event, sw, sh)
+                true
+            } else {
+                handleTouch(did, view, event)
+                true
+            }
         }
-        root.addView(bar, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, (28 * resources.displayMetrics.density).toInt(),
-            Gravity.TOP or Gravity.START))
 
-        val corner = View(this).apply { setBackgroundColor(0x88FFFFFF.toInt()) }
-        val cornerSide = (32 * resources.displayMetrics.density).toInt()
-        root.addView(corner, FrameLayout.LayoutParams(cornerSide, cornerSide,
-            Gravity.BOTTOM or Gravity.END))
+        // ⠿ 圆点：点击=选中/取消；按住拖=移动窗口（任何时候）
+        val chipD = (44 * resources.displayMetrics.density).toInt()
+        val chip = View(this).apply {
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(0xCC303030.toInt())
+                setStroke(4, 0xFFFFFFFF.toInt())
+            }
+        }
+        val chipLp = FrameLayout.LayoutParams(chipD, chipD, Gravity.TOP or Gravity.START)
+        chipLp.leftMargin = 8
+        chipLp.topMargin = 8
+        root.addView(chip, chipLp)
+        pipChip = chip
+        chip.setOnTouchListener(object : View.OnTouchListener {
+            var downX = 0f; var downY = 0f; var moved = false
+            override fun onTouch(v: View, e: MotionEvent): Boolean {
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> { downX = e.rawX; downY = e.rawY; moved = false }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (kotlin.math.abs(e.rawX - downX) > 10 || kotlin.math.abs(e.rawY - downY) > 10) moved = true
+                        if (moved) movePipByTouch(root, e, sw, sh)
+                    }
+                    MotionEvent.ACTION_UP -> if (!moved) setPipSelected(root, !pipSelected)
+                }
+                return true
+            }
+        })
+
+        // 8 个缩放手柄：四角 + 四边中点
+        val hd = (40 * resources.displayMetrics.density).toInt()
+        fun handleGravity(role: String): Int = when (role) {
+            "TL" -> Gravity.TOP or Gravity.START
+            "TR" -> Gravity.TOP or Gravity.END
+            "BL" -> Gravity.BOTTOM or Gravity.START
+            "BR" -> Gravity.BOTTOM or Gravity.END
+            "T" -> Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            "B" -> Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            "L" -> Gravity.START or Gravity.CENTER_VERTICAL
+            else -> Gravity.END or Gravity.CENTER_VERTICAL
+        }
+        for (role in listOf("TL", "TR", "BL", "BR", "T", "B", "L", "R")) {
+            val h = View(this).apply {
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                    setColor(0xFFFFFFFF.toInt())
+                    setStroke(4, 0xFF1976D2.toInt())
+                }
+                visibility = View.GONE
+            }
+            val hlp = FrameLayout.LayoutParams(hd, hd, handleGravity(role))
+            root.addView(h, hlp)
+            pipHandles.add(h)
+            h.setOnTouchListener(object : View.OnTouchListener {
+                var x0 = 0f; var y0 = 0f; var l0 = 0; var t0 = 0; var w0 = 0; var hh0 = 0
+                override fun onTouch(v: View, e: MotionEvent): Boolean {
+                    when (e.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            x0 = e.rawX; y0 = e.rawY
+                            l0 = pipLeft; t0 = pipTop; w0 = pipW; hh0 = pipH
+                        }
+                        MotionEvent.ACTION_MOVE -> {
+                            val dx = (e.rawX - x0).toInt(); val dy = (e.rawY - y0).toInt()
+                            var L = l0; var T = t0; var W = w0; var H = hh0
+                            when (role) {
+                                "TL" -> { L = l0 + dx; T = t0 + dy; W = w0 - dx; H = hh0 - dy }
+                                "TR" -> { T = t0 + dy; W = w0 + dx; H = hh0 - dy }
+                                "BL" -> { L = l0 + dx; W = w0 - dx; H = hh0 + dy }
+                                "BR" -> { W = w0 + dx; H = hh0 + dy }
+                                "T" -> { T = t0 + dy; H = hh0 - dy }
+                                "B" -> { H = hh0 + dy }
+                                "L" -> { L = l0 + dx; W = w0 - dx }
+                                "R" -> { W = w0 + dx }
+                            }
+                            // 尺寸夹取；左/上柄同时校正位置，保证对边固定
+                            W = W.coerceIn(minSide, sw * 3 / 4)
+                            H = H.coerceIn(minSide, sh * 3 / 4)
+                            if (role.contains("L")) L = (l0 + w0) - W
+                            if (role == "T" || role == "TL" || role == "TR") T = (t0 + hh0) - H
+                            pipW = W; pipH = H
+                            pipLeft = L.coerceIn(0, (sw - W).coerceAtLeast(0))
+                            pipTop = T.coerceIn(0, (sh - H).coerceAtLeast(0))
+                            val pp = root.layoutParams as FrameLayout.LayoutParams
+                            pp.width = W; pp.height = H
+                            pp.leftMargin = pipLeft; pp.topMargin = pipTop
+                            root.layoutParams = pp
+                        }
+                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                            val newW = evenOf(pipW); val newH = evenOf(pipH)
+                            val oldW = layoutConfig.pipCustomW.takeIf { it > 0 } ?: pipW0(rn, rd, sh)
+                            val oldH = layoutConfig.pipCustomH.takeIf { it > 0 } ?: pipH0(sh)
+                            if (kotlin.math.abs(newW - oldW) > 24 || kotlin.math.abs(newH - oldH) > 24) {
+                                applyLayout(layoutConfig.copy(pipCustomW = newW, pipCustomH = newH))
+                            }
+                        }
+                    }
+                    return true
+                }
+            })
+        }
 
         val lp = FrameLayout.LayoutParams(pipW, pipH, Gravity.TOP or Gravity.START)
         if (pipLeft < 0) { pipLeft = sw - pipW - 48; pipTop = 48 }
@@ -748,58 +847,33 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         lp.topMargin = pipTop.coerceIn(0, (sh - pipH).coerceAtLeast(0))
         container.addView(root, lp)
         pipRoot = root
-        regionViews.add(view)
-
-        bar.setOnTouchListener(object : View.OnTouchListener {
-            var sx = 0f; var sy = 0f; var ml = 0; var mt = 0
-            override fun onTouch(v: View, e: MotionEvent): Boolean {
-                when (e.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> {
-                        sx = e.rawX; sy = e.rawY
-                        ml = root.layoutParams.let { (it as FrameLayout.LayoutParams).leftMargin }
-                        mt = root.layoutParams.let { (it as FrameLayout.LayoutParams).topMargin }
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        val p = root.layoutParams as FrameLayout.LayoutParams
-                        pipLeft = (ml + (e.rawX - sx).toInt()).coerceIn(0, (sw - pipW).coerceAtLeast(0))
-                        pipTop = (mt + (e.rawY - sy).toInt()).coerceIn(0, (sh - pipH).coerceAtLeast(0))
-                        p.leftMargin = pipLeft; p.topMargin = pipTop
-                        root.layoutParams = p
-                    }
-                }
-                return true
-            }
-        })
-
-        corner.setOnTouchListener(object : View.OnTouchListener {
-            var sx = 0f; var sy = 0f; var w0 = 0; var h0 = 0
-            override fun onTouch(v: View, e: MotionEvent): Boolean {
-                when (e.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; w0 = pipW; h0 = pipH }
-                    MotionEvent.ACTION_MOVE -> {
-                        // 自由缩放：宽高独立跟随手指，夹在最小边与 3/4 屏之间
-                        pipW = (w0 + (e.rawX - sx).toInt()).coerceIn(minSide, sw * 3 / 4)
-                        pipH = (h0 + (e.rawY - sy).toInt()).coerceIn(minSide, sh * 3 / 4)
-                        val p = root.layoutParams as FrameLayout.LayoutParams
-                        p.width = pipW; p.height = pipH
-                        root.layoutParams = p
-                    }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        // 松手：按手指划出的实际尺寸重建虚拟屏（像素 1:1）
-                        val newW = evenOf(pipW); val newH = evenOf(pipH)
-                        val oldW = layoutConfig.pipCustomW.takeIf { it > 0 } ?: pipW0(rn, rd, sh)
-                        val oldH = layoutConfig.pipCustomH.takeIf { it > 0 } ?: pipH0(sh)
-                        if (kotlin.math.abs(newW - oldW) > 24 || kotlin.math.abs(newH - oldH) > 24) {
-                            applyLayout(layoutConfig.copy(pipCustomW = newW, pipCustomH = newH))
-                        }
-                    }
-                }
-                return true
-            }
-        })
+        setPipSelected(root, false)
     }
 
-    // MARK: 布局切换
+    /** 选中/取消选中：显示 8 手柄 + 高亮边框 */
+    private fun setPipSelected(root: FrameLayout, on: Boolean) {
+        pipSelected = on
+        for (h in pipHandles) h.visibility = if (on) View.VISIBLE else View.GONE
+        val bg = android.graphics.drawable.GradientDrawable().apply {
+            setStroke(if (on) 8 else 3, if (on) 0xFF1976D2.toInt() else 0x66000000)
+        }
+        root.background = bg
+    }
+
+    /** 手指拖动整窗（chip 或选中态中间） */
+    private fun movePipByTouch(root: FrameLayout, e: MotionEvent, sw: Int, sh: Int) {
+        val p = root.layoutParams as FrameLayout.LayoutParams
+        val w = p.width; val h = p.height
+        when (e.actionMasked) {
+            MotionEvent.ACTION_MOVE -> {
+                pipLeft = (e.rawX - w / 2).toInt().coerceIn(0, (sw - w).coerceAtLeast(0))
+                pipTop = (e.rawY - (28 * resources.displayMetrics.density).toInt())
+                    .toInt().coerceIn(0, (sh - h).coerceAtLeast(0))
+                p.leftMargin = pipLeft; p.topMargin = pipTop
+                root.layoutParams = p
+            }
+        }
+    }
 
     // MARK: 屏幕配置面板
 
@@ -1002,6 +1076,11 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     private fun handleTouch(displayId: Int, view: StreamView, event: MotionEvent) {
         val s = session ?: return
+        // 画中画处于选中（编辑）态时，第一次点其他区域=退出选中，不透传给 Mac
+        if (pipSelected && event.actionMasked == MotionEvent.ACTION_DOWN && pipRoot != null) {
+            pipRoot?.let { setPipSelected(it, false) }
+            return
+        }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 val p = view.viewToStream(event.x, event.y) ?: return
