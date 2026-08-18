@@ -25,7 +25,12 @@ class HostSession private constructor(
         fun onWelcome(codec: Int, width: Int, height: Int, fps: Int)
         fun onConfig(codec: Int, paramSets: ByteArray)
         fun onVideoFragment(frameId: Int, fragIdx: Int, fragCount: Int, keyframe: Boolean, payload: ByteArray)
+        fun onDisplays(displays: List<DisplayInfo>)
         fun onLinkEvent(connected: Boolean)
+    }
+
+    class DisplayInfo(val id: Int, val width: Int, val height: Int, val name: String) {
+        override fun toString(): String = name
     }
 
     companion object {
@@ -35,10 +40,14 @@ class HostSession private constructor(
         private const val TYPE_CONFIG = 0x03
         private const val TYPE_INPUT_ACK = 0x05
         private const val TYPE_PONG = 0x06
+        private const val TYPE_DISPLAYS = 0x07
         private const val TYPE_HELLO = 0x10
         private const val TYPE_KEYFRAME_REQ = 0x11
         private const val TYPE_INPUT = 0x12
         private const val TYPE_PING = 0x13
+        private const val TYPE_SELECT_DISPLAY = 0x14
+        private const val TYPE_CREATE_DISPLAY = 0x15
+        private const val TYPE_DESTROY_DISPLAY = 0x16
         private const val PROTO_VERSION = 1
         private const val RETRANSMIT_MS = 40L
         private const val MAX_TRIES = 12
@@ -65,6 +74,11 @@ class HostSession private constructor(
     @Volatile private var running = true
     private val inputSeq = AtomicInteger(1)
     private val pingSeq = AtomicInteger(1)
+
+    // Android 禁止主线程网络操作（NetworkOnMainThreadException）——
+    // 所有出口包统一投递到该发送线程执行；触摸/看门狗/选屏都从主线程调用。
+    private val sendThread = android.os.HandlerThread("hyperdisplay-send").apply { start() }
+    private val sendHandler = android.os.Handler(sendThread.looper)
 
     private class Pending(val packet: ByteArray, @Volatile var lastSentAt: Long, @Volatile var tries: Int)
     private val pendingAcks = ConcurrentHashMap<Int, Pending>()
@@ -130,6 +144,24 @@ class HostSession private constructor(
                                 buf.copyOfRange(payloadStart, len))
                         }
                     }
+                    TYPE_DISPLAYS -> {
+                        val count = buf[5].toInt() and 0xFF
+                        var off = 6
+                        val list = ArrayList<DisplayInfo>(count)
+                        var ok = true
+                        for (i in 0 until count) {
+                            if (len < off + 9) { ok = false; break }
+                            val id = bb.getInt(off)
+                            val w = bb.getShort(off + 4).toInt() and 0xFFFF
+                            val h = bb.getShort(off + 6).toInt() and 0xFFFF
+                            val nameLen = buf[off + 8].toInt() and 0xFF
+                            if (len < off + 9 + nameLen) { ok = false; break }
+                            val name = String(buf, off + 9, nameLen, Charsets.UTF_8)
+                            list.add(DisplayInfo(id, w, h, name))
+                            off += 9 + nameLen
+                        }
+                        if (ok) listener.onDisplays(list)
+                    }
                     TYPE_INPUT_ACK -> {
                         val seq = bb.getInt(1)
                         pendingAcks.remove(seq)
@@ -159,6 +191,9 @@ class HostSession private constructor(
         running = false
         socket.soTimeout = 1 // 立刻打断阻塞的 receive
         try { thread.join(500) } catch (_: InterruptedException) {}
+        sendHandler.removeCallbacksAndMessages(null)
+        sendThread.quitSafely()
+        socket.close()
     }
 
     // MARK: 发送
@@ -174,10 +209,13 @@ class HostSession private constructor(
 
     private fun send(packet: ByteArray) {
         if (!running) return
-        try {
-            socket.send(DatagramPacket(packet, packet.size, address, port))
-        } catch (e: Exception) {
-            if (running) Log.w(TAG, "send failed: ${e.message}")
+        sendHandler.post {
+            if (!running) return@post
+            try {
+                socket.send(DatagramPacket(packet, packet.size, address, port))
+            } catch (e: Exception) {
+                if (running) Log.w(TAG, "send failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
         }
     }
 
@@ -236,5 +274,23 @@ class HostSession private constructor(
 
     fun requestKeyframe() {
         send(buildPacket(TYPE_KEYFRAME_REQ, pingSeq.getAndIncrement()))
+    }
+
+    fun selectDisplay(id: Int) {
+        val body = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(id).array()
+        send(buildPacket(TYPE_SELECT_DISPLAY, 0, body))
+    }
+
+    fun createDisplay(width: Int, height: Int, name: String) {
+        val nameBytes = name.toByteArray(Charsets.UTF_8).copyOf(minOf(60, name.toByteArray(Charsets.UTF_8).size))
+        val body = ByteBuffer.allocate(5 + nameBytes.size).order(ByteOrder.LITTLE_ENDIAN)
+            .putShort(width.toShort()).putShort(height.toShort()).put(nameBytes.size.toByte())
+            .put(nameBytes).array()
+        send(buildPacket(TYPE_CREATE_DISPLAY, 0, body))
+    }
+
+    fun destroyDisplay(id: Int) {
+        val body = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(id).array()
+        send(buildPacket(TYPE_DESTROY_DISPLAY, 0, body))
     }
 }

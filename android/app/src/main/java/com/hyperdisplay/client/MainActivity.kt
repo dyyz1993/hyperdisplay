@@ -45,6 +45,9 @@ class MainActivity : Activity() {
     @Volatile private var surfaceReady = false
     @Volatile private var linkUp = false
     private val decoderLock = Object()
+    private var displays: List<HostSession.DisplayInfo> = emptyList()
+    private var selectedDisplayId = -1
+    private var displayButton: Button? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lastRendered = 0
@@ -69,8 +72,23 @@ class MainActivity : Activity() {
                 }
             }
             updateOverlay()
+            writeStatusFile()
             mainHandler.postDelayed(this, 1000)
         }
+    }
+
+    /** 状态落盘：锁屏/无屏环境下的可观测通道（adb pull 验证用） */
+    private fun writeStatusFile() {
+        try {
+            val dir = getExternalFilesDir(null) ?: return
+            val link = if (linkUp) "up" else "down"
+            val sel = displays.indexOfFirst { it.id == selectedDisplayId }
+            val text = "link=$link codec=${if (codecId == 2) "h264" else "hevc"} " +
+                "size=${streamWidth}x${streamHeight} fps=$renderFps " +
+                "displays=${displays.size} sel=${if (sel >= 0) sel + 1 else 0} " +
+                "decoder=${if (decoder != null) "on" else "off"}\n"
+            java.io.File(dir, "status.txt").writeText(text)
+        } catch (_: Exception) { }
     }
 
     // 触摸状态机
@@ -169,7 +187,12 @@ class MainActivity : Activity() {
         session = s
         assembler = FrameAssembler(object : FrameAssembler.Callback {
             override fun onFrame(frameId: Int, keyframe: Boolean, data: ByteArray) {
-                decoder?.submit(VideoDecoder.Frame(keyframe, data))
+                // 关键帧在带内携带参数集（部分解码器仅靠 configure 时的 csd-0 不产出后续帧）
+                val payload: ByteArray = if (keyframe) {
+                    val csd = latestCsd
+                    if (csd != null) csd + data else data
+                } else data
+                decoder?.submit(VideoDecoder.Frame(keyframe, payload))
             }
             override fun onKeyframeNeeded(reason: String) {
                 session?.requestKeyframe()
@@ -192,12 +215,38 @@ class MainActivity : Activity() {
         }
 
         override fun onConfig(codec: Int, paramSets: ByteArray) {
+            val current = latestCsd
+            if (current != null && decoder != null && !current.contentEquals(paramSets)) {
+                // 参数集变化（host 编码会话重建/重启）：解码器必须用新 csd 重新配置
+                mainHandler.post {
+                    synchronized(decoderLock) {
+                        decoder?.release()
+                        decoder = null
+                        lastRendered = 0
+                    }
+                    latestCsd = paramSets
+                    maybeStartDecoder()
+                }
+                return
+            }
             latestCsd = paramSets
             maybeStartDecoder()
         }
 
         override fun onVideoFragment(frameId: Int, fragIdx: Int, fragCount: Int, keyframe: Boolean, payload: ByteArray) {
             assembler?.onFragment(frameId, fragIdx, fragCount, keyframe, payload)
+        }
+
+        override fun onDisplays(list: List<HostSession.DisplayInfo>) {
+            mainHandler.post {
+                displays = list
+                if (list.isEmpty()) return@post
+                if (list.none { it.id == selectedDisplayId }) {
+                    selectDisplay(list.first().id, resetVideo = true)
+                } else {
+                    updateDisplayButton()
+                }
+            }
         }
 
         override fun onLinkEvent(connected: Boolean) {
@@ -215,6 +264,64 @@ class MainActivity : Activity() {
                 }
             }
         }
+    }
+
+    // MARK: 多屏管理
+
+    private fun updateDisplayButton() {
+        val button = displayButton ?: return
+        val index = displays.indexOfFirst { it.id == selectedDisplayId }
+        button.text = if (index >= 0) "屏 ${index + 1}/${displays.size} ▾" else "显示器 ▾"
+        button.isEnabled = displays.isNotEmpty()
+    }
+
+    private fun selectDisplay(id: Int, resetVideo: Boolean) {
+        selectedDisplayId = id
+        if (resetVideo) resetVideoPipeline()
+        session?.selectDisplay(id)
+        updateDisplayButton()
+    }
+
+    /** 切屏/删屏后清空解码状态，等待新屏的 WELCOME + CONFIG 重建 */
+    private fun resetVideoPipeline() {
+        synchronized(decoderLock) {
+            decoder?.release()
+            decoder = null
+            latestCsd = null
+        }
+        assembler?.reset()
+        lastRendered = 0
+        renderFps = 0
+    }
+
+    private fun showDisplayPicker() {
+        val s = session ?: return
+        if (displays.isEmpty()) return
+        val names = displays.mapIndexed { i, d -> "${i + 1}. ${d.width}×${d.height}" }.toTypedArray()
+        val checked = displays.indexOfFirst { it.id == selectedDisplayId }.coerceAtLeast(0)
+        var choice = checked
+        android.app.AlertDialog.Builder(this)
+            .setTitle("选择虚拟屏")
+            .setSingleChoiceItems(names, checked) { _, which -> choice = which }
+            .setPositiveButton("切换") { dialog, _ ->
+                dialog.dismiss()
+                val target = displays[choice]
+                if (target.id != selectedDisplayId) selectDisplay(target.id, resetVideo = true)
+            }
+            .setNeutralButton("新建（适配本机）") { _, _ ->
+                val metrics = android.content.res.Resources.getSystem().displayMetrics
+                val w = maxOf(metrics.widthPixels, metrics.heightPixels)
+                val h = minOf(metrics.widthPixels, metrics.heightPixels)
+                resetVideoPipeline()
+                s.createDisplay(w, h, "平板 ${w}×$h")
+            }
+            .setNegativeButton(if (displays.size > 1) "删除当前屏" else "关闭") { _, _ ->
+                if (displays.size > 1 && selectedDisplayId > 0) {
+                    resetVideoPipeline()
+                    s.destroyDisplay(selectedDisplayId)
+                }
+            }
+            .show()
     }
 
     private fun maybeStartDecoder() {
@@ -269,6 +376,19 @@ class MainActivity : Activity() {
         root.addView(overlay, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START))
         statsOverlay = overlay
+
+        val picker = Button(this).apply {
+            text = "显示器 ▾"
+            textSize = 12f
+            setBackgroundColor(0x66000000)
+            setTextColor(Color.WHITE)
+            setPadding(16, 8, 16, 8)
+            isEnabled = false
+            setOnClickListener { showDisplayPicker() }
+        }
+        root.addView(picker, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END))
+        displayButton = picker
         streamView = view
     }
 
@@ -348,7 +468,6 @@ class MainActivity : Activity() {
             decoder?.release()
             decoder = null
         }
-        decoder = null
         session?.close()
         session = null
         assembler = null
@@ -359,6 +478,9 @@ class MainActivity : Activity() {
         streamWidth = 0
         streamHeight = 0
         statsOverlay = null
+        displayButton = null
+        displays = emptyList()
+        selectedDisplayId = -1
         streamView = null
         surfaceReady = false
         touchMode = 0

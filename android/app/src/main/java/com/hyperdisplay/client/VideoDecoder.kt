@@ -32,6 +32,7 @@ class VideoDecoder(
     private val queue = ArrayBlockingQueue<Frame>(3)
     private val running = AtomicBoolean(false)
     private val thread = Thread({ loop() }, "hyperdisplay-decoder")
+    private var ptsIndex = 0L
     @Volatile var renderedFrames: Int = 0
         private set
 
@@ -69,17 +70,26 @@ class VideoDecoder(
 
     private fun loop() {
         val info = MediaCodec.BufferInfo()
+        var statInput = 0L
+        var statInputOk = 0L
+        var statOutput = 0L
+        var lastStatLog = 0L
         while (running.get()) {
             try {
                 val frame = queue.poll(10, TimeUnit.MILLISECONDS)
                 if (frame != null) {
+                    statInput++
                     val inIdx = codec.dequeueInputBuffer(10)
                     if (inIdx >= 0) {
+                        statInputOk++
                         val buf = codec.getInputBuffer(inIdx)!!
                         buf.clear()
                         if (buf.remaining() >= frame.data.size) {
                             buf.put(frame.data)
-                            codec.queueInputBuffer(inIdx, 0, frame.data.size, 0,
+                            // MediaCodec 依赖单调递增 PTS 释放输出缓冲；全零会被无限 hold
+                            val pts = ptsIndex * 33_333L
+                            ptsIndex++
+                            codec.queueInputBuffer(inIdx, 0, frame.data.size, pts,
                                 if (frame.keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
                         } else {
                             Log.w(TAG, "frame too large for input buffer (${frame.data.size}), dropped")
@@ -101,6 +111,12 @@ class VideoDecoder(
                     }
                     codec.releaseOutputBuffer(idx, true)
                     renderedFrames++
+                    statOutput++
+                }
+                val now = System.currentTimeMillis()
+                if (now - lastStatLog > 3000) {
+                    lastStatLog = now
+                    Log.i(TAG, "stats in=$statInput inOk=$statInputOk out=$statOutput rendered=$renderedFrames")
                 }
             } catch (e: Exception) {
                 if (running.get()) Log.e(TAG, "decode loop error", e)

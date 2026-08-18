@@ -30,25 +30,15 @@ final class VideoEncoder {
         self.onFrame = onFrame
     }
 
-    /// 返回实际使用的 codec；HEVC 硬编不可用时降级 H.264。
-    func start(width: Int, height: Int, fps: Int, bitrate: UInt32) throws -> Codec {
+    /// 返回实际使用的 codec；HEVC 硬编不可用（或调用方强制）时降级 H.264。
+    func start(width: Int, height: Int, fps: Int, bitrate: UInt32, forceH264: Bool = false) throws -> Codec {
         stop()
         let hwSpec = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true] as CFDictionary
         var session: VTCompressionSession?
         var codec: Codec = .hevc
 
-        var status = VTCompressionSessionCreate(
-            allocator: nil, width: Int32(width), height: Int32(height),
-            codecType: kCMVideoCodecType_HEVC,
-            encoderSpecification: hwSpec,
-            imageBufferAttributes: nil,
-            compressedDataAllocator: nil,
-            outputCallback: VideoEncoder.outputCallback,
-            refcon: Unmanaged.passUnretained(self).toOpaque(),
-            compressionSessionOut: &session
-        )
-        if status != noErr || session == nil {
-            NSLog("[hyperdisplay] HEVC hardware encoder unavailable (status=%d), falling back to H.264", status)
+        var status: OSStatus = noErr
+        if forceH264 {
             codec = .h264
             status = VTCompressionSessionCreate(
                 allocator: nil, width: Int32(width), height: Int32(height),
@@ -60,6 +50,31 @@ final class VideoEncoder {
                 refcon: Unmanaged.passUnretained(self).toOpaque(),
                 compressionSessionOut: &session
             )
+        } else {
+            status = VTCompressionSessionCreate(
+                allocator: nil, width: Int32(width), height: Int32(height),
+                codecType: kCMVideoCodecType_HEVC,
+                encoderSpecification: hwSpec,
+                imageBufferAttributes: nil,
+                compressedDataAllocator: nil,
+                outputCallback: VideoEncoder.outputCallback,
+                refcon: Unmanaged.passUnretained(self).toOpaque(),
+                compressionSessionOut: &session
+            )
+            if status != noErr || session == nil {
+                NSLog("[hyperdisplay] HEVC hardware encoder unavailable (status=%d), falling back to H.264", status)
+                codec = .h264
+                status = VTCompressionSessionCreate(
+                    allocator: nil, width: Int32(width), height: Int32(height),
+                    codecType: kCMVideoCodecType_H264,
+                    encoderSpecification: hwSpec,
+                    imageBufferAttributes: nil,
+                    compressedDataAllocator: nil,
+                    outputCallback: VideoEncoder.outputCallback,
+                    refcon: Unmanaged.passUnretained(self).toOpaque(),
+                    compressionSessionOut: &session
+                )
+            }
         }
         guard status == noErr, let session else {
             throw HostError("VTCompressionSessionCreate failed: \(status)")
@@ -149,6 +164,13 @@ final class VideoEncoder {
             lock.unlock()
             requestKeyframe()
         }
+    }
+
+    /// 线程安全的编码帧计数（菜单栏统计用）
+    func snapshotEncodedFrames() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return encodedFrames
     }
 
     // MARK: - 输出回调（VideoToolbox 线程）

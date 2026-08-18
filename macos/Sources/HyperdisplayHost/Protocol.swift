@@ -1,16 +1,20 @@
 import Foundation
 
-// UDP 线协议 v1，全部字段 little-endian。
+// UDP 线协议 v2（little-endian）。
 // 公共头：[type u8][seq u32]
 // 视频（host→client，不可靠）：
 //   VIDEO_FRAG  seq=frameId  [fragIdx u16][fragCount u16][flags u8 (bit0=keyframe)][payload ≤1100B]
 //   CONFIG      seq=frameId  [codec u8][len u16][Annex-B 参数集]
 //   WELCOME     seq=0        [proto u8][codec u8][width u16][height u16][fps u8]
+//   DISPLAYS    seq=0        [count u8] × { [id u32][w u16][h u16][nameLen u8][name] }
 //   INPUT_ACK   seq=被确认的输入 seq
 //   PONG        seq=回显 ping 的 seq
 // 控制/输入（client→host，按键/滚轮走 seq+ack 重传）：
 //   HELLO       seq=0        [proto u8][clientW u16][clientH u16]
 //   KEYFRAME_REQ
+//   SELECT_DISPLAY id u32            —— 切换到指定虚拟屏
+//   CREATE_DISPLAY w u16 h u16 nameLen u8 name —— 新建并切换
+//   DESTROY_DISPLAY id u32           —— 删除（最后一块会拒绝）
 //   INPUT       seq          [subtype u8][body]
 //     move   x f32 y f32
 //     button button u8 (0=left 1=right) down u8 x f32 y f32
@@ -18,11 +22,19 @@ import Foundation
 //   PING
 
 enum PacketType: UInt8 {
-    case welcome = 0x01, videoFrag = 0x02, config = 0x03, inputAck = 0x05, pong = 0x06
+    case welcome = 0x01, videoFrag = 0x02, config = 0x03, displays = 0x07, inputAck = 0x05, pong = 0x06
     case hello = 0x10, keyframeReq = 0x11, input = 0x12, ping = 0x13
+    case selectDisplay = 0x14, createDisplay = 0x15, destroyDisplay = 0x16
 }
 
 enum InputSubtype: UInt8 { case move = 0, button = 1, wheel = 2 }
+
+struct DisplayListEntry {
+    var id: UInt32
+    var width: UInt16
+    var height: UInt16
+    var name: String
+}
 
 enum Packet {
     case hello(proto: UInt8, clientWidth: UInt16, clientHeight: UInt16)
@@ -31,6 +43,9 @@ enum Packet {
     case inputButton(seq: UInt32, button: UInt8, down: UInt8, x: Float32, y: Float32)
     case inputWheel(seq: UInt32, dx: Float32, dy: Float32, x: Float32, y: Float32)
     case ping(seq: UInt32)
+    case selectDisplay(id: UInt32)
+    case createDisplay(width: UInt16, height: UInt16, name: String)
+    case destroyDisplay(id: UInt32)
 }
 
 enum Wire {
@@ -72,6 +87,42 @@ enum Wire {
 
     static func keyframeReq(seq: UInt32) -> Data {
         Data(header(.keyframeReq, seq: seq))
+    }
+
+    static func displaysList(_ entries: [DisplayListEntry]) -> Data {
+        var d = Data(header(.displays, seq: 0))
+        d.appendLE(UInt8(min(entries.count, 255)))
+        for e in entries {
+            let name = Data(e.name.utf8.prefix(60))
+            d.appendLE(e.id)
+            d.appendLE(e.width)
+            d.appendLE(e.height)
+            d.appendLE(UInt8(name.count))
+            d.append(name)
+        }
+        return d
+    }
+
+    static func selectDisplay(id: UInt32) -> Data {
+        var d = Data(header(.selectDisplay, seq: 0))
+        d.appendLE(id)
+        return d
+    }
+
+    static func createDisplay(width: UInt16, height: UInt16, name: String) -> Data {
+        var d = Data(header(.createDisplay, seq: 0))
+        d.appendLE(width)
+        d.appendLE(height)
+        let n = Data(name.utf8.prefix(60))
+        d.appendLE(UInt8(n.count))
+        d.append(n)
+        return d
+    }
+
+    static func destroyDisplay(id: UInt32) -> Data {
+        var d = Data(header(.destroyDisplay, seq: 0))
+        d.appendLE(id)
+        return d
     }
 
     static func ping(seq: UInt32) -> Data {
@@ -149,6 +200,22 @@ enum Wire {
             return .keyframeReq
         case PacketType.ping.rawValue:
             return .ping(seq: seq)
+        case PacketType.selectDisplay.rawValue:
+            guard body >= 4 else { return nil }
+            return .selectDisplay(id: data.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: Wire.headerSize, as: UInt32.self).littleEndian
+            })
+        case PacketType.createDisplay.rawValue:
+            guard body >= 5 else { return nil }
+            let w = u16(0), h = u16(2), nameLen = Int(u8(4))
+            guard body >= 5 + nameLen else { return nil }
+            let name = String(data: data.subdata(in: Wire.headerSize + 5..<Wire.headerSize + 5 + nameLen), encoding: .utf8) ?? ""
+            return .createDisplay(width: w, height: h, name: name)
+        case PacketType.destroyDisplay.rawValue:
+            guard body >= 4 else { return nil }
+            return .destroyDisplay(id: data.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: Wire.headerSize, as: UInt32.self).littleEndian
+            })
         case PacketType.input.rawValue:
             guard body >= 1 else { return nil }
             switch InputSubtype(rawValue: u8(0)) {

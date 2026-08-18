@@ -1,13 +1,11 @@
 import Foundation
 import Darwin
 
-/// 单 UDP socket 的 host 端：接收线程解析报文，发送侧非阻塞 sendto。
-/// 用 BSD socket 而非 Network.framework，避免其对端不可达时静默 cancel 的问题。
+/// 单 UDP socket 的 host 端：接收线程解析报文，发送侧非阻塞 sendto 到指定客户端地址。
+/// 客户端注册表由上层（HostApp）管理。
 final class UdpHost {
     private let fd: Int32
     private let sendLock = NSLock()
-    private let addrLock = NSLock()
-    private var clientAddress: sockaddr_in?
     private(set) var port: UInt16
 
     /// 解析成功的入站报文 + 来源地址（在接收线程上回调）
@@ -73,37 +71,13 @@ final class UdpHost {
         }
     }
 
-    func setClientAddress(_ addr: sockaddr_in) {
-        addrLock.lock()
-        clientAddress = addr
-        addrLock.unlock()
-    }
-
-    var clientAddressString: String? {
-        addrLock.lock()
-        defer { addrLock.unlock() }
-        guard let a = clientAddress else { return nil }
-        var addr = a
-        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-        withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                _ = getnameinfo(sa, socklen_t(MemoryLayout<sockaddr_in>.size), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
-            }
-        }
-        return String(cString: host)
-    }
-
-    /// 发送已编码的报文到当前客户端；返回 false 表示本次发送失败（丢包语义可接受）
+    /// 发送已编码的报文；返回 false 表示本次发送失败（丢包语义可接受）
     @discardableResult
-    func sendToClient(_ data: Data) -> Bool {
-        addrLock.lock()
-        var addr = clientAddress
-        addrLock.unlock()
-        guard var addr else { return false }
+    func send(to addr: inout sockaddr_in, _ data: Data) -> Bool {
         sendLock.lock()
         defer { sendLock.unlock() }
         let sent = data.withUnsafeBytes { raw -> Int in
-            withUnsafeMutablePointer(to: &addr) { addrPtr -> Int in
+            withUnsafePointer(to: &addr) { addrPtr -> Int in
                 addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr -> Int in
                     Darwin.sendto(fd, raw.baseAddress, raw.count, 0, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
@@ -112,11 +86,13 @@ final class UdpHost {
         return sent == data.count
     }
 
-    /// 发送一整帧视频（分片）。非阻塞下遇 EWOULDBLOCK 直接放弃本帧剩余分片：
-    /// 对不可靠通道而言等同丢包，客户端 latest-frame 策略会跟随下一帧。
-    func sendVideoFrame(frameId: UInt32, keyframe: Bool, payload: Data) {
-        for frag in Wire.videoFrags(frameId: frameId, keyframe: keyframe, payload: payload) {
-            if !sendToClient(frag) { return }
+    /// 发送一整帧视频分片到多个订阅者。非阻塞下遇发送失败即放弃该客户端本帧剩余分片。
+    func sendVideoFrame(to addresses: [sockaddr_in], frameId: UInt32, keyframe: Bool, payload: Data) {
+        let frags = Wire.videoFrags(frameId: frameId, keyframe: keyframe, payload: payload)
+        for var addr in addresses {
+            for frag in frags {
+                if !send(to: &addr, frag) { break }
+            }
         }
     }
 }
