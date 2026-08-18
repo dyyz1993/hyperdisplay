@@ -342,22 +342,15 @@ final class DisplayStream {
                 currentBitrate = max(bitrateFloor, currentBitrate * 7 / 10)
                 encoder?.applyBitrate(currentBitrate)
                 NSLog("[hyperdisplay] quality: loss=\(String(format: "%.1f%%", lossRate * 100)) bitrate->\(currentBitrate/1000)kbps display=\(display.displayID)")
-            } else if captureScale > 0.70 && lossRate > 0.10 {
-                captureScale = max(0.70, captureScale - 0.15)
-                NSLog("[hyperdisplay] quality: severe loss=\(String(format: "%.1f%%", lossRate * 100)) scale->\(captureScale) display=\(display.displayID) (restarting stream)")
-                stop()
-                startIfNeeded()
             }
+            // 采集缩放降档已禁用：macOS 26 上对虚拟屏的缩放采集（SCK width/height < 屏幕原生）
+            // 会输出全绿帧（实测）。分辨率适配改由「重建更小的虚拟屏」实现（待做），
+            // 当前分辨率始终与虚拟屏 1:1。
         } else if lost == 0 {
             goodWindows += 1
             if goodWindows >= 6 { // 12 秒连续零丢片才升级，防止弱网下升降振荡
                 goodWindows = 0
-                if captureScale < 1.0 {
-                    captureScale = min(1.0, captureScale + 0.15)
-                    NSLog("[hyperdisplay] quality: recovered, scale->\(captureScale) display=\(display.displayID)")
-                    stop()
-                    startIfNeeded()
-                } else if currentBitrate < targetBitrate {
+                if currentBitrate < targetBitrate {
                     currentBitrate = min(targetBitrate, currentBitrate * 5 / 4)
                     encoder?.applyBitrate(currentBitrate)
                     NSLog("[hyperdisplay] quality: stable, bitrate->\(currentBitrate/1000)kbps display=\(display.displayID)")
@@ -459,15 +452,19 @@ final class HostApp: NSObject, NSApplicationDelegate {
     // MARK: 显示器注册表（主线程访问）
 
     private func createDisplay(width: Int, height: Int, name: String) -> CGDirectDisplayID? {
-        guard streams.count < 4 else {
-            NSLog("[hyperdisplay] display limit (4) reached")
+        guard streams.count < 8 else {
+            NSLog("[hyperdisplay] display limit (8) reached")
             return nil
         }
         guard let vd = VirtualDisplay(width: width, height: height, refreshRate: Double(config.fps)) else { return nil }
         guard let udp else { return nil }
+        // 多流并发时按预算均分码率：两路 6M 在 2.4GHz 上合计超带宽必丢包；
+        // 均分后合计不变，AIMD 仍可按各自实测丢片率微调
+        let baseBitrate = config.bitrate ?? Config.autoBitrate(width: width, height: height)
+        let perStream = max(2_500_000, baseBitrate / UInt32(max(1, streams.count + 1)))
         let stream = DisplayStream(
             display: vd, fps: config.fps,
-            bitrate: config.bitrate ?? Config.autoBitrate(width: width, height: height),
+            bitrate: perStream,
             host: self, udp: udp)
         streams[vd.displayID] = stream
         displayOrder.append(vd.displayID)

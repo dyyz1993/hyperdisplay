@@ -46,6 +46,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         var assembler: FrameAssembler? = null
         var decoder: VideoDecoder? = null
         @Volatile var csd: ByteArray? = null
+        @Volatile var codec = 1 // WELCOME 上报：1=HEVC 2=H.264（host 硬编会话耗尽时回退）
         @Volatile var width: Int = 0
         @Volatile var height: Int = 0
         @Volatile var surface: Surface? = null
@@ -61,18 +62,27 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private val pipelines = LinkedHashMap<Int, DisplayPipeline>()
     private val pipelineLock = Object()
 
-    private enum class LayoutMode(val label: String) {
-        SINGLE("单屏全屏"), SPLIT_LR("左右分屏"), SPLIT_TB("上下分屏")
+    enum class LayoutKind(val label: String) {
+        SINGLE("单屏全屏"), SPLIT_LR("左右分屏"), SPLIT_TB("上下分屏"),
+        SIDE("主屏+侧边"), PIP("画中画")
     }
 
-    private var layoutMode = LayoutMode.SINGLE
+    data class LayoutConfig(
+        val kind: LayoutKind = LayoutKind.SINGLE,
+        val fraction: Float = 0.5f,       // 分割位置/侧边占比/画中画高度占比
+        val sideLeft: Boolean = false,    // 侧边在左
+        val pipRatio: String = "16:10"    // 画中画宽高比
+    )
+
+    private var layoutConfig = LayoutConfig()
     private var subscribedIds = listOf<Int>()
-    private val createdIds = mutableListOf<Int>() // 本客户端建的屏，布局重建时回收
+    private val createdIds = mutableListOf<Int>()
     private var pendingRegions: List<Pair<Int, Int>>? = null
-    private var pendingKeep = setOf<Int>()
     private var displays: List<HostSession.DisplayInfo> = emptyList()
-    private var displayButton: Button? = null
-    private var layoutButton: Button? = null
+    private var configButton: Button? = null
+    private var pipRoot: FrameLayout? = null
+    private var pipLeft = -1
+    private var pipTop = -1
 
     @Volatile private var linkUp = false
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -322,6 +332,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         override fun onWelcome(displayId: Int, codec: Int, width: Int, height: Int, fps: Int) {
             mainHandler.post {
                 val p = pipelineOf(displayId)
+                p.codec = codec
                 p.width = width
                 p.height = height
                 regionViews.firstOrNull { it.displayId == displayId }?.updateStreamSize(width, height)
@@ -371,7 +382,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     }
                     rebuildRegionViews()
                 }
-                updateDisplayButton()
+                updateConfigButton()
             }
         }
 
@@ -424,7 +435,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             if (p.width <= 0) return
             val surface = p.surface ?: return
             try {
-                val d = VideoDecoder("video/hevc", p.width, p.height, surface, csd)
+                // 按 host 实际使用的编码选解码器——硬编 HEVC 会话耗尽回退 H.264 时，
+                // 若仍开 HEVC 解码器会输出全零（绿屏）
+                val mime = if (p.codec == 2) "video/avc" else "video/hevc"
+                val d = VideoDecoder(mime, p.width, p.height, surface, csd)
                 d.start()
                 p.decoder = d
                 Log.i(TAG, "decoder started: display=${p.id} ${p.width}x${p.height}")
@@ -458,110 +472,364 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START))
         statsOverlay = overlay
 
-        val layoutBtn = Button(this).apply {
-            text = "布局 ▾"
+        val cfgBtn = Button(this).apply {
+            text = "⚙ 屏幕配置"
             textSize = 12f
             setTextColor(Color.WHITE)
             setBackgroundColor(0x66000000)
             setPadding(16, 8, 16, 8)
-            setOnClickListener { showLayoutPicker() }
+            setOnClickListener { showConfigPanel() }
         }
-        root.addView(layoutBtn, FrameLayout.LayoutParams(
+        root.addView(cfgBtn, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END))
-        layoutButton = layoutBtn
-
-        val picker = Button(this).apply {
-            text = "显示器 ▾"
-            textSize = 12f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(0x66000000)
-            setPadding(16, 8, 16, 8)
-            setOnClickListener { showDisplayPicker() }
-        }
-        root.addView(picker, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END).also {
-            it.topMargin = 132
-        })
-        displayButton = picker
+        configButton = cfgBtn
 
         rebuildRegionViews()
     }
 
-    /** 按当前布局模式与订阅顺序布置每块屏的渲染区域 */
+    private fun screenDims(): Pair<Int, Int> {
+        val m = Resources.getSystem().displayMetrics
+        return maxOf(m.widthPixels, m.heightPixels) to minOf(m.widthPixels, m.heightPixels)
+    }
+
+    private fun evenOf(v: Int) = (v / 2) * 2
+
+    private fun ratioOf(r: String): Pair<Int, Int> = when (r) {
+        "3:2" -> 3 to 2
+        "4:3" -> 4 to 3
+        "1:1" -> 1 to 1
+        else -> 16 to 10
+    }
+
+    /** 布局 → 各区域虚拟屏像素尺寸（顺序即订阅顺序，第一个是主屏） */
+    private fun regionSizes(cfg: LayoutConfig): List<Pair<Int, Int>> {
+        val (sw, sh) = screenDims()
+        val f = cfg.fraction.coerceIn(0.2f, 0.8f)
+        return when (cfg.kind) {
+            LayoutKind.SINGLE -> emptyList()
+            LayoutKind.SPLIT_LR -> {
+                val lw = evenOf((sw * f).toInt().coerceIn(sw / 5, sw * 4 / 5))
+                listOf(lw to sh, evenOf(sw - lw) to sh)
+            }
+            LayoutKind.SPLIT_TB -> {
+                val th = evenOf((sh * f).toInt().coerceIn(sh / 5, sh * 4 / 5))
+                listOf(sw to th, sw to evenOf(sh - th))
+            }
+            LayoutKind.SIDE -> {
+                val sideW = evenOf((sw * f).toInt().coerceIn(sw / 5, sw * 2 / 5))
+                listOf(evenOf(sw - sideW) to sh, sideW to sh)
+            }
+            LayoutKind.PIP -> {
+                val (rn, rd) = ratioOf(cfg.pipRatio)
+                val ph = evenOf((sh * f).toInt().coerceIn(sh / 4, sh / 2))
+                listOf(sw to sh, evenOf(ph * rn / rd) to ph)
+            }
+        }
+    }
+
+    /** 布局当前配置布置渲染区域 */
     @SuppressLint("ClickableViewAccessibility")
     private fun rebuildRegionViews() {
         val container = sessionRoot ?: return
         for (v in regionViews) container.removeView(v)
         regionViews.clear()
-        val ids = if (subscribedIds.isNotEmpty()) subscribedIds else displays.take(1).map { it.id }
+        pipRoot?.let { container.removeView(it) }
+        pipRoot = null
+        val ids = subscribedIds.ifEmpty { displays.take(1).map { it.id } }
         if (ids.isEmpty()) return
+        val (sw, sh) = screenDims()
 
-        val sw = Resources.getSystem().displayMetrics.let { maxOf(it.widthPixels, it.heightPixels) }
-        val sh = Resources.getSystem().displayMetrics.let { minOf(it.widthPixels, it.heightPixels) }
-
-        ids.forEachIndexed { index, id ->
+        fun makeView(id: Int): StreamView {
             val view = StreamView(this)
             view.displayId = id
             view.onSurfaceReady = { did, surface ->
-                val p = pipelineOf(did)
-                p.surface = surface
-                maybeStartDecoder(p)
+                val pl = pipelineOf(did)
+                pl.surface = surface
+                maybeStartDecoder(pl)
             }
             view.onSurfaceDestroyed = { did ->
                 synchronized(pipelineLock) {
-                    pipelines[did]?.let { p ->
-                        p.decoder?.release()
-                        p.decoder = null
-                        p.surface = null
+                    pipelines[did]?.let { pl ->
+                        pl.decoder?.release()
+                        pl.decoder = null
+                        pl.surface = null
                     }
                 }
             }
             view.onTouch = { did, event -> handleTouch(did, view, event); true }
-            val lp = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT,
-                Gravity.TOP or Gravity.START)
-            when (layoutMode) {
-                LayoutMode.SINGLE -> { /* 全屏 */ }
-                LayoutMode.SPLIT_LR -> {
-                    lp.width = if (index == 0) sw / 2 else sw - sw / 2
-                    lp.height = sh
-                    lp.leftMargin = if (index == 0) 0 else sw / 2
-                }
-                LayoutMode.SPLIT_TB -> {
-                    lp.width = sw
-                    lp.height = if (index == 0) sh / 2 else sh - sh / 2
-                    lp.topMargin = if (index == 0) 0 else sh / 2
+            val pl = pipelineOf(id)
+            if (pl.width > 0) view.updateStreamSize(pl.width, pl.height)
+            return view
+        }
+
+        fun place(v: StreamView, w: Int, h: Int, x: Int, y: Int) {
+            val lp = FrameLayout.LayoutParams(w, h, Gravity.TOP or Gravity.START)
+            lp.leftMargin = x
+            lp.topMargin = y
+            container.addView(v, lp)
+            regionViews.add(v)
+        }
+
+        when (layoutConfig.kind) {
+            LayoutKind.SINGLE -> {
+                place(makeView(ids[0]), sw, sh, 0, 0)
+            }
+            LayoutKind.SPLIT_LR -> {
+                if (ids.size >= 2) {
+                    val lw = evenOf((sw * layoutConfig.fraction).toInt().coerceIn(sw / 5, sw * 4 / 5))
+                    place(makeView(ids[0]), lw, sh, 0, 0)
+                    place(makeView(ids[1]), evenOf(sw - lw), sh, lw, 0)
+                } else place(makeView(ids[0]), sw, sh, 0, 0)
+            }
+            LayoutKind.SPLIT_TB -> {
+                if (ids.size >= 2) {
+                    val th = evenOf((sh * layoutConfig.fraction).toInt().coerceIn(sh / 5, sh * 4 / 5))
+                    place(makeView(ids[0]), sw, th, 0, 0)
+                    place(makeView(ids[1]), sw, evenOf(sh - th), 0, th)
+                } else place(makeView(ids[0]), sw, sh, 0, 0)
+            }
+            LayoutKind.SIDE -> {
+                if (ids.size >= 2) {
+                    val sideW = evenOf((sw * layoutConfig.fraction).toInt().coerceIn(sw / 5, sw * 2 / 5))
+                    val main = makeView(ids[0]); val side = makeView(ids[1])
+                    if (layoutConfig.sideLeft) {
+                        place(side, sideW, sh, 0, 0)
+                        place(main, evenOf(sw - sideW), sh, sideW, 0)
+                    } else {
+                        place(main, evenOf(sw - sideW), sh, 0, 0)
+                        place(side, sideW, sh, evenOf(sw - sideW), 0)
+                    }
+                } else place(makeView(ids[0]), sw, sh, 0, 0)
+            }
+            LayoutKind.PIP -> {
+                place(makeView(ids[0]), sw, sh, 0, 0)
+                if (ids.size >= 2) buildPipWindow(ids[1], sw, sh)
+            }
+        }
+    }
+
+    /** 画中画悬浮窗：顶栏拖动移动；右下角柄等比缩放；松手按新尺寸重建虚拟屏 */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun buildPipWindow(displayId: Int, sw: Int, sh: Int) {
+        val container = sessionRoot ?: return
+        val (rn, rd) = ratioOf(layoutConfig.pipRatio)
+        var pipH = (sh * layoutConfig.fraction).toInt().coerceIn(sh / 4, sh / 2)
+        var pipW = pipH * rn / rd
+        val root = FrameLayout(this)
+
+        val view = StreamView(this)
+        view.displayId = displayId
+        // 画中画的 surface 必须排在主画面 surface 之上（默认会在其下，
+        // 导致窗口区域显示未合成的分配器残色/绿色）；必须在 surface 创建前调用
+        view.holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
+        view.setZOrderMediaOverlay(true)
+        view.onSurfaceReady = { did, surface ->
+            val pl = pipelineOf(did)
+            pl.surface = surface
+            maybeStartDecoder(pl)
+        }
+        view.onSurfaceDestroyed = { did ->
+            synchronized(pipelineLock) {
+                pipelines[did]?.let { pl ->
+                    pl.decoder?.release()
+                    pl.decoder = null
+                    pl.surface = null
                 }
             }
-            container.addView(view, lp)
-            val p = pipelineOf(id)
-            if (p.width > 0) view.updateStreamSize(p.width, p.height)
-            regionViews.add(view)
         }
+        view.onTouch = { did, event -> handleTouch(did, view, event); true }
+        val pl = pipelineOf(displayId)
+        if (pl.width > 0) view.updateStreamSize(pl.width, pl.height)
+        root.addView(view, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+        val bar = TextView(this).apply {
+            text = "⠿ 画中画"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(0x88000000.toInt())
+            gravity = Gravity.CENTER
+        }
+        root.addView(bar, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, (28 * resources.displayMetrics.density).toInt(),
+            Gravity.TOP or Gravity.START))
+
+        val corner = View(this).apply { setBackgroundColor(0x88FFFFFF.toInt()) }
+        val cornerSide = (32 * resources.displayMetrics.density).toInt()
+        root.addView(corner, FrameLayout.LayoutParams(cornerSide, cornerSide,
+            Gravity.BOTTOM or Gravity.END))
+
+        val lp = FrameLayout.LayoutParams(pipW, pipH, Gravity.TOP or Gravity.START)
+        if (pipLeft < 0) { pipLeft = sw - pipW - 48; pipTop = 48 }
+        lp.leftMargin = pipLeft.coerceIn(0, (sw - pipW).coerceAtLeast(0))
+        lp.topMargin = pipTop.coerceIn(0, (sh - pipH).coerceAtLeast(0))
+        container.addView(root, lp)
+        pipRoot = root
+        regionViews.add(view)
+
+        bar.setOnTouchListener(object : View.OnTouchListener {
+            var sx = 0f; var sy = 0f; var ml = 0; var mt = 0
+            override fun onTouch(v: View, e: MotionEvent): Boolean {
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        sx = e.rawX; sy = e.rawY
+                        ml = root.layoutParams.let { (it as FrameLayout.LayoutParams).leftMargin }
+                        mt = root.layoutParams.let { (it as FrameLayout.LayoutParams).topMargin }
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val p = root.layoutParams as FrameLayout.LayoutParams
+                        pipLeft = (ml + (e.rawX - sx).toInt()).coerceIn(0, (sw - pipW).coerceAtLeast(0))
+                        pipTop = (mt + (e.rawY - sy).toInt()).coerceIn(0, (sh - pipH).coerceAtLeast(0))
+                        p.leftMargin = pipLeft; p.topMargin = pipTop
+                        root.layoutParams = p
+                    }
+                }
+                return true
+            }
+        })
+
+        corner.setOnTouchListener(object : View.OnTouchListener {
+            var sx = 0f; var w0 = 0
+            override fun onTouch(v: View, e: MotionEvent): Boolean {
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> { sx = e.rawX; w0 = pipW }
+                    MotionEvent.ACTION_MOVE -> {
+                        pipW = (w0 + (e.rawX - sx).toInt()).coerceIn(sw / 6, sw * 3 / 4)
+                        pipH = pipW * rd / rn
+                        val p = root.layoutParams as FrameLayout.LayoutParams
+                        p.width = pipW; p.height = pipH
+                        root.layoutParams = p
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        // 松手：按新尺寸重建虚拟屏（比例跟随，像素 1:1 原则）
+                        val targetH = evenOf(pipH.coerceIn(sh / 4, sh / 2))
+                        val newFraction = targetH.toFloat() / sh
+                        if (kotlin.math.abs(newFraction - layoutConfig.fraction) > 0.08f) {
+                            applyLayout(layoutConfig.copy(fraction = newFraction))
+                        }
+                    }
+                }
+                return true
+            }
+        })
     }
 
     // MARK: 布局切换
 
-    private fun showLayoutPicker() {
-        val labels = LayoutMode.values().map { it.label }.toTypedArray()
-        val checked = layoutMode.ordinal
-        var choice = checked
+    // MARK: 屏幕配置面板
+
+    private fun showConfigPanel() {
+        val pad = (16 * resources.displayMetrics.density).toInt()
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad / 2, pad, 0)
+        }
+
+        var selected = layoutConfig.kind
+        lateinit var refreshParams: () -> Unit
+        val radio = android.widget.RadioGroup(this).apply { orientation = android.widget.RadioGroup.VERTICAL }
+        val kindBtns = LinkedHashMap<LayoutKind, android.widget.RadioButton>()
+        for (k in LayoutKind.values()) {
+            val rb = android.widget.RadioButton(this).apply {
+                text = k.label
+                isChecked = k == layoutConfig.kind
+            }
+            kindBtns[k] = rb
+            radio.addView(rb)
+        }
+        radio.setOnCheckedChangeListener { _, id ->
+            kindBtns.entries.firstOrNull { it.value.id == id }?.let { selected = it.key; refreshParams() }
+        }
+        panel.addView(radio)
+
+        // 参数区（随所选布局刷新）
+        var frac = layoutConfig.fraction
+        var sideLeft = layoutConfig.sideLeft
+        var pipRatio = layoutConfig.pipRatio
+        val paramsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        panel.addView(paramsBox)
+
+        fun seek(labelFmt: String, minPct: Int, maxPct: Int, get: () -> Int, set: (Int) -> Unit) {
+            val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            val label = TextView(this)
+            val seek = android.widget.SeekBar(this).apply {
+                max = maxPct - minPct
+                progress = get() - minPct
+                setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(s: android.widget.SeekBar?, v: Int, fromUser: Boolean) {
+                        set(v + minPct)
+                        label.text = String.format(labelFmt, v + minPct)
+                    }
+                    override fun onStartTrackingTouch(s: android.widget.SeekBar?) {}
+                    override fun onStopTrackingTouch(s: android.widget.SeekBar?) {}
+                })
+            }
+            label.text = String.format(labelFmt, get())
+            row.addView(label)
+            row.addView(seek, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            paramsBox.addView(row)
+        }
+
+        refreshParams = {
+            paramsBox.removeAllViews()
+            when (selected) {
+                LayoutKind.SINGLE -> {
+                    paramsBox.addView(TextView(this).apply {
+                        text = "全屏显示一块虚拟屏。当前：${'$'}{displays.size} 块\n" + displays.mapIndexed { i, d -> "  ${'$'}{i + 1}. ${'$'}{d.width}×${'$'}{d.height}" }.joinToString("\n")
+                        textSize = 12f
+                    })
+                }
+                LayoutKind.SPLIT_LR -> seek("左右分割：%d%%", 30, 70, { (frac * 100).toInt() }) { frac = it / 100f }
+                LayoutKind.SPLIT_TB -> seek("上下分割：%d%%", 30, 70, { (frac * 100).toInt() }) { frac = it / 100f }
+                LayoutKind.SIDE -> {
+                    seek("侧边宽度：%d%%", 20, 40, { (frac * 100).toInt() }) { frac = it / 100f }
+                    val cb = android.widget.CheckBox(this).apply {
+                        text = "侧边放左边"
+                        isChecked = sideLeft
+                        setOnCheckedChangeListener { _, c -> sideLeft = c }
+                    }
+                    paramsBox.addView(cb)
+                }
+                LayoutKind.PIP -> {
+                    seek("画中画高度：%d%%", 25, 50, { (frac * 100).toInt() }) { frac = it / 100f }
+                    val rlab = TextView(this).apply { text = "画中画宽高比：" }
+                    val rg = android.widget.RadioGroup(this).apply { orientation = android.widget.RadioGroup.HORIZONTAL }
+                    for (r in listOf("16:10", "3:2", "4:3", "1:1")) {
+                        val rb = android.widget.RadioButton(this).apply {
+                            text = r
+                            isChecked = r == pipRatio
+                            setOnCheckedChangeListener { _, c -> if (c) pipRatio = r }
+                        }
+                        rg.addView(rb)
+                    }
+                    paramsBox.addView(rlab)
+                    paramsBox.addView(rg)
+                }
+            }
+        }
+
         android.app.AlertDialog.Builder(this)
-            .setTitle("画面布局")
-            .setSingleChoiceItems(labels, checked) { _, which -> choice = which }
+            .setTitle("屏幕布局配置")
+            .setView(panel)
             .setPositiveButton("应用") { d, _ ->
                 d.dismiss()
-                applyLayout(LayoutMode.values()[choice])
+                applyLayout(LayoutConfig(selected, frac, sideLeft, pipRatio))
+            }
+            .setNeutralButton("新建（适配本机）") { _, _ ->
+                val (sw2, sh2) = screenDims()
+                session?.createDisplay(sw2, sh2, "平板 ${'$'}{sw2}×${'$'}{sh2}")
             }
             .setNegativeButton("取消", null)
             .show()
     }
 
-    /** 分屏 = 虚拟屏尺寸取平板对应区域的物理像素（每格像素 1:1，总带宽≈单路原生） */
-    private fun applyLayout(mode: LayoutMode) {
+    // MARK: 布局应用引擎
+
+    private fun applyLayout(cfg: LayoutConfig) {
         val s = session ?: return
-        layoutMode = mode
-        if (mode == LayoutMode.SINGLE) {
+        layoutConfig = cfg
+        if (cfg.kind == LayoutKind.SINGLE) {
             pendingRegions = null
             val first = displays.firstOrNull()?.id
             if (first != null) {
@@ -569,54 +837,46 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 resetPipelines()
                 rebuildRegionViews()
                 s.selectDisplay(first)
+                // 回收布局模式创建的多余屏，避免越积越多
+                for (id in createdIds.toList()) {
+                    if (id != first) {
+                        s.destroyDisplay(id)
+                        createdIds.remove(id)
+                    }
+                }
             }
-            updateDisplayButton()
-            updateOverlay()
+            updateConfigButton(); updateOverlay()
             return
         }
-
-        val metrics = Resources.getSystem().displayMetrics
-        val sw = maxOf(metrics.widthPixels, metrics.heightPixels)
-        val sh = minOf(metrics.widthPixels, metrics.heightPixels)
-        val regions = when (mode) {
-            LayoutMode.SPLIT_LR -> listOf(sw / 2 to sh, (sw - sw / 2) to sh)
-            LayoutMode.SPLIT_TB -> listOf(sw to sh / 2, sw to (sh - sh / 2))
-            else -> return
-        }
-        pendingRegions = regions
-
-        // 按唯一尺寸统计缺口（相同尺寸只算一次，避免重复 CREATE）
-        for (r in regions.toSet()) {
-            val need = regions.count { it == r }
-            val have = displays.count { (it.width to it.height) == r }
-            val missing = (need - have).coerceAtLeast(0)
-            for (i in 0 until missing) {
-                s.createDisplay(r.first, r.second, "分屏 ${r.first}x${r.second}")
+        pendingRegions = regionSizes(cfg)
+        val regions = pendingRegions!!
+        // 按唯一尺寸计数补建（同尺寸多块也正确）
+        for (size in regions.toSet()) {
+            val need = regions.count { it == size }
+            val have = displays.count { (it.width to it.height) == size }
+            repeat((need - have).coerceAtLeast(0)) {
+                s.createDisplay(size.first, size.second, "布局 ${'$'}{size.first}x${'$'}{size.second}")
             }
         }
-        updateOverlay()
+        updateConfigButton(); updateOverlay()
     }
 
-    /** DISPLAYS 更新后：尺寸匹配凑齐即整体 SUBSCRIBE，并回收不再使用的自建屏 */
+    /** DISPLAYS 更新后：按尺寸（含重复）分配屏，凑齐即订阅；回收未用到的自建屏 */
     private fun tryFulfillPendingLayout() {
         val regions = pendingRegions ?: return
         val s = session ?: return
         val matched = mutableListOf<Int>()
-        val used = mutableListOf<Pair<Int, Int>>()
-        for (d in displays.sortedBy { it.id }) {
-            val size = d.width to d.height
-            if (size in regions && used.count { it == size } < regions.count { it == size }) {
-                matched.add(d.id)
-                used.add(size)
-            }
+        val usedIds = mutableSetOf<Int>()
+        for (region in regions) {
+            val found = displays.filter { (it.width to it.height) == region && it.id !in usedIds }
+                .minByOrNull { it.id }
+            if (found != null) { matched.add(found.id); usedIds.add(found.id) }
         }
         if (matched.size < regions.size) return
 
         pendingRegions = null
-        // 回收：尺寸属于分屏需求但不在目标集里的屏（含本客户端多建的），其余（如默认屏）不动
         for (d in displays) {
-            val size = d.width to d.height
-            if (size in regions && d.id !in matched) {
+            if (d.id in createdIds && d.id !in usedIds) {
                 s.destroyDisplay(d.id)
                 createdIds.remove(d.id)
             }
@@ -626,8 +886,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         resetPipelines()
         rebuildRegionViews()
         s.sendSubscribeDisplays(matched)
-        Log.i(TAG, "split layout applied: screens=${matched.joinToString()}")
-        updateDisplayButton()
+        Log.i(TAG, "layout ${'$'}{layoutConfig.kind} applied: screens=${'$'}{matched.joinToString()}")
+        updateConfigButton()
     }
 
     /** 切换布局/屏集后清空全部解码管线，等各屏 WELCOME/CONFIG 重建 */
@@ -643,43 +903,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         lastWatchdogKfAt = 0
     }
 
-    // MARK: 显示器选择（单屏切换保留）
-
-    private fun updateDisplayButton() {
-        val button = displayButton ?: return
-        button.text = if (subscribedIds.size > 1) "屏×${subscribedIds.size}" else "显示器 ▾"
-        button.isEnabled = displays.isNotEmpty()
-    }
-
-    private fun showDisplayPicker() {
-        val s = session ?: return
-        if (displays.isEmpty()) return
-        val names = displays.mapIndexed { i, d -> "${i + 1}. ${d.width}×${d.height}" }.toTypedArray()
-        val checked = displays.indexOfFirst { it.id == subscribedIds.firstOrNull() }.coerceAtLeast(0)
-        var choice = checked
-        android.app.AlertDialog.Builder(this)
-            .setTitle("选择虚拟屏（单屏模式）")
-            .setSingleChoiceItems(names, checked) { _, which -> choice = which }
-            .setPositiveButton("切换") { dialog, _ ->
-                dialog.dismiss()
-                val target = displays[choice]
-                layoutMode = LayoutMode.SINGLE
-                subscribedIds = listOf(target.id)
-                resetPipelines()
-                rebuildRegionViews()
-                s.selectDisplay(target.id)
-            }
-            .setNeutralButton("新建（适配本机）") { _, _ ->
-                val metrics = Resources.getSystem().displayMetrics
-                val w = maxOf(metrics.widthPixels, metrics.heightPixels)
-                val h = minOf(metrics.widthPixels, metrics.heightPixels)
-                s.createDisplay(w, h, "平板 ${w}×$h")
-            }
-            .setNegativeButton(if (displays.size > 1) "删除当前屏" else "关闭") { _, _ ->
-                val current = subscribedIds.firstOrNull()
-                if (displays.size > 1 && current != null) s.destroyDisplay(current)
-            }
-            .show()
+    private fun updateConfigButton() {
+        val button = configButton ?: return
+        button.text = layoutConfig.kind.label +
+            (if (subscribedIds.size > 1) "·" + subscribedIds.size + "屏" else "")
     }
 
     // MARK: 触摸 → 输入（按区域路由）
@@ -741,7 +968,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val overlay = statsOverlay ?: return
         val link = if (linkUp) "链路 OK" else "等待主机…"
         val screens = if (subscribedIds.size > 1) {
-            "${subscribedIds.size} 屏分屏"
+            "${subscribedIds.size} 屏"
         } else {
             val p = pipelines.values.firstOrNull()
             if (p != null && p.width > 0) "${p.width}x${p.height}" else "?"
@@ -757,7 +984,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val pips = synchronized(pipelineLock) {
                 pipelines.values.joinToString(";") { "${it.id}:${it.width}x${it.height}:${it.renderedNow}" }
             }
-            val text = "link=$link fps=$renderFps layout=$layoutMode subs=${subscribedIds.joinToString()} pipelines=$pips\n"
+            val text = "link=$link fps=$renderFps layout=${layoutConfig.kind} subs=${subscribedIds.joinToString()} pipelines=$pips\n"
             java.io.File(dir, "status.txt").writeText(text)
         } catch (_: Exception) { }
     }
@@ -775,8 +1002,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         linkUp = false
         renderFps = 0
         statsOverlay = null
-        displayButton = null
-        layoutButton = null
+        configButton = null
+        pipRoot = null
         displays = emptyList()
         subscribedIds = emptyList()
         createdIds.clear()

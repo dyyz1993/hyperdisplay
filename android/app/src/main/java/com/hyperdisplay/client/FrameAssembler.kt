@@ -41,14 +41,14 @@ class FrameAssembler(private val callback: Callback) {
                     if (currentKeyframe) {
                         nackMissing(currentFrameId)
                     } else if (everGotKeyframe) {
-                        degraded = true
+                        waitingForKeyframe = true
                         requestKeyframeRateLimited("incomplete delta $currentFrameId", now)
                     }
                 }
                 if (lastDeliveredFrameId >= 0 && frameId > lastDeliveredFrameId + 1 && everGotKeyframe) {
-                    // 帧序号缺口：依赖链已断。降级续播——继续投递增量帧（画面可能糊/花，
-                    // 但不冻结），同时限频请求 IDR 让画面自行恢复清晰。帧率优先。
-                    degraded = true
+                    // 帧序号缺口：依赖链已断。丢弃后续增量直到干净 IDR（实测华为硬解对
+                    // 断链增量输出整帧绿色伪影，比短暂冻结更差）；限频请求 IDR 尽快恢复。
+                    waitingForKeyframe = true
                     requestKeyframeRateLimited("gap $lastDeliveredFrameId -> $frameId", now)
                 }
                 currentFrameId = frameId
@@ -81,10 +81,7 @@ class FrameAssembler(private val callback: Callback) {
                     waitingForKeyframe = false
                 }
                 if (keyframe) {
-                    degraded = false // 干净 IDR 到达，退出降级
-                } else if (degraded) {
-                    // 降级续播中：这帧大概率有伪影，但保持画面流动
-                    requestKeyframeRateLimited("degraded refresh", now)
+                    degraded = false
                 }
                 callback.onFrame(frameId, keyframe, out)
             }
@@ -106,7 +103,7 @@ class FrameAssembler(private val callback: Callback) {
                 if (currentKeyframe) {
                     nackMissing(currentFrameId)
                 } else if (everGotKeyframe) {
-                    degraded = true
+                    waitingForKeyframe = true
                 }
                 currentFrameId = -1
                 fragments = arrayOfNulls(0)
