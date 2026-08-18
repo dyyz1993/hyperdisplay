@@ -218,11 +218,15 @@ final class DisplayStream {
                 fragLock.lock()
                 self.fragmentsSentTotal &+= UInt64(frags.count)
                 fragLock.unlock()
+                // 平滑匀速发送：整帧分片摊到 ~8ms 窗口内，而不是突发猛发——
+                // 突发会打满 WiFi 队列/接收缓冲造成大面积丢片（实测 13-21% 丢片的主因之一）
+                let fragCount = frags.count
+                let perFragDelay: useconds_t = fragCount > 1 ? useconds_t(min(8000, 8_000_000 / 600)) / useconds_t(fragCount) : 0
                 for var addr in addresses {
                     for (index, frag) in frags.enumerated() {
                         self.udp.sendWithBackpressure(to: &addr, frag)
-                        if index > 0 && index % 64 == 0 {
-                            usleep(1500)
+                        if index < fragCount - 1 && perFragDelay > 60 {
+                            usleep(perFragDelay)
                         }
                     }
                 }
@@ -298,6 +302,7 @@ final class DisplayStream {
             var a = addr
             udp.send(to: &a, frags[Int(idx)])
             sent += 1
+            if sent % 32 == 0 { usleep(500) } // 重发也匀速，避免再次冲爆队列
         }
         fragLock.lock()
         nackFragmentsTotal &+= UInt64(sent)

@@ -22,7 +22,9 @@ class FrameAssembler(private val callback: Callback) {
     private var fragments = arrayOfNulls<ByteArray>(0)
     private var deliveredCurrent = false
     private var lastFragmentAt = 0L
-    private var waitingForKeyframe = true
+    private var waitingForKeyframe = true   // 仅用于会话最初：第一帧必须是 IDR
+    private var everGotKeyframe = false
+    private var degraded = false            // 丢包后降级续播：增量帧照放（允许糊/花），后台刷新 IDR
     private var lastKeyframeRequestAt = 0L
     private val lock = Object()
 
@@ -36,10 +38,17 @@ class FrameAssembler(private val callback: Callback) {
                 // 新帧开始；旧帧未投递且缺分片才视为丢弃（latest-frame policy）
                 if (currentFrameId >= 0 && !deliveredCurrent && !isComplete()) {
                     onAbandoned(currentFrameId)
-                    if (currentKeyframe) nackMissing(currentFrameId)
+                    if (currentKeyframe) {
+                        nackMissing(currentFrameId)
+                    } else if (everGotKeyframe) {
+                        degraded = true
+                        requestKeyframeRateLimited("incomplete delta $currentFrameId", now)
+                    }
                 }
-                if (lastDeliveredFrameId >= 0 && frameId > lastDeliveredFrameId + 1 && !waitingForKeyframe) {
-                    waitingForKeyframe = true
+                if (lastDeliveredFrameId >= 0 && frameId > lastDeliveredFrameId + 1 && everGotKeyframe) {
+                    // 帧序号缺口：依赖链已断。降级续播——继续投递增量帧（画面可能糊/花，
+                    // 但不冻结），同时限频请求 IDR 让画面自行恢复清晰。帧率优先。
+                    degraded = true
                     requestKeyframeRateLimited("gap $lastDeliveredFrameId -> $frameId", now)
                 }
                 currentFrameId = frameId
@@ -66,9 +75,16 @@ class FrameAssembler(private val callback: Callback) {
                 if (waitingForKeyframe) {
                     if (!keyframe) {
                         onAbandoned(frameId)
-                        return // 依赖链断裂后的非关键帧，丢弃
+                        return // 会话最初：解码器还没有任何参考帧，必须等 IDR
                     }
+                    everGotKeyframe = true
                     waitingForKeyframe = false
+                }
+                if (keyframe) {
+                    degraded = false // 干净 IDR 到达，退出降级
+                } else if (degraded) {
+                    // 降级续播中：这帧大概率有伪影，但保持画面流动
+                    requestKeyframeRateLimited("degraded refresh", now)
                 }
                 callback.onFrame(frameId, keyframe, out)
             }
@@ -80,17 +96,21 @@ class FrameAssembler(private val callback: Callback) {
         synchronized(lock) {
             if (currentFrameId < 0) {
                 // 等关键帧但没有任何分片到达（如首帧全丢）：NACK 无从触发，周期性请求 IDR
-                if (waitingForKeyframe) requestKeyframeRateLimited("idle-wait", System.currentTimeMillis())
+                if (waitingForKeyframe || degraded) requestKeyframeRateLimited("idle-wait", System.currentTimeMillis())
                 return
             }
             if (deliveredCurrent || isComplete()) return
             val idle = System.currentTimeMillis() - lastFragmentAt
             if (idle > 300) {
                 onAbandoned(currentFrameId)
-                if (currentKeyframe) nackMissing(currentFrameId)
+                if (currentKeyframe) {
+                    nackMissing(currentFrameId)
+                } else if (everGotKeyframe) {
+                    degraded = true
+                }
                 currentFrameId = -1
                 fragments = arrayOfNulls(0)
-                waitingForKeyframe = true
+                if (!everGotKeyframe) waitingForKeyframe = true
                 requestKeyframeRateLimited("stall ${idle}ms", System.currentTimeMillis())
             }
         }
@@ -103,6 +123,8 @@ class FrameAssembler(private val callback: Callback) {
             currentFrameId = -1
             fragments = arrayOfNulls(0)
             waitingForKeyframe = true
+            everGotKeyframe = false
+            degraded = false
         }
     }
 
