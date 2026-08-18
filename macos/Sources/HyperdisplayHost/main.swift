@@ -149,6 +149,8 @@ final class DisplayStream {
     private(set) var started = false
     private(set) var effectiveFps = 0
     private var encodedSnapshot: UInt64 = 0
+    var idleSince: Date?          // 无订阅者起始时间（自动回收用）
+    var isInitialDisplay = false  // 启动配置创建的屏不参与自动回收
     // 近期关键帧的分片缓存（NACK 重传用；增量帧可丢不缓存）
     private var keyframeFragments: [UInt32: [Data]] = [:]
     private var keyframeOrder: [UInt32] = []
@@ -432,7 +434,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
             udp.start()
             self.udp = udp
             for d in config.displays {
-                _ = createDisplay(width: d.width, height: d.height, name: nextDisplayName())
+                let id = createDisplay(width: d.width, height: d.height, name: nextDisplayName())
+                if let id { streams[id]?.isInitialDisplay = true }
             }
             let hostName = Host.current().localizedName ?? "Mac"
             _ = bonjour.start(name: "Hyperdisplay (\(hostName))", port: udp.port)
@@ -647,9 +650,21 @@ final class HostApp: NSObject, NSApplicationDelegate {
         for stream in streams.values {
             stream.sampleStats()
             stream.adaptQuality(now: now)
-            if stream.started, addressesOfSubscribers(of: stream.display.displayID).isEmpty {
-                stream.stop()
-                NSLog("[hyperdisplay] stream stopped for display \(stream.display.displayID) (no subscribers)")
+            if addressesOfSubscribers(of: stream.display.displayID).isEmpty {
+                if stream.started { stream.stop() }
+                if stream.idleSince == nil { stream.idleSince = now }
+            } else {
+                stream.idleSince = nil
+            }
+        }
+        // 闲置回收：协议创建的屏 60s 无人订阅且还留有其他屏 → 销毁
+        // （防止客户端异常退出/反复换布局后孤儿屏堆积、占满上限）
+        for id in displayOrder {
+            guard let s = streams[id] else { continue }
+            if !s.isInitialDisplay, let idle = s.idleSince,
+               now.timeIntervalSince(idle) > 60, streams.count > 1 {
+                NSLog("[hyperdisplay] recycling idle display \(id) (no subscribers 60s)")
+                destroyDisplay(id: id)
             }
         }
         rebuildMenu(clientCount: clientCount)

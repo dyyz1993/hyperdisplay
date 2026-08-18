@@ -71,7 +71,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val kind: LayoutKind = LayoutKind.SINGLE,
         val fraction: Float = 0.5f,       // 分割位置/侧边占比/画中画高度占比
         val sideLeft: Boolean = false,    // 侧边在左
-        val pipRatio: String = "16:10"    // 画中画宽高比
+        val pipRatio: String = "16:10",   // 画中画宽高比（初始形状）
+        val pipCustomW: Int = 0,          // 手指自由缩放后的画中画尺寸（0=按比例默认）
+        val pipCustomH: Int = 0
     )
 
     private var layoutConfig = LayoutConfig()
@@ -494,6 +496,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     private fun evenOf(v: Int) = (v / 2) * 2
 
+    /** 画中画最小边：约大屏短边的 1/10（用户口径 1/20 太小点不中），下限 160px */
+    private fun pipMinSide(sw: Int, sh: Int) = maxOf(160, minOf(sw, sh) / 10)
+
+    private fun pipH0(sh: Int) = evenOf((sh * layoutConfig.fraction).toInt().coerceIn(sh / 4, sh / 2))
+    private fun pipW0(rn: Int, rd: Int, sh: Int) = evenOf(pipH0(sh) * rn / rd)
+
     private fun ratioOf(r: String): Pair<Int, Int> = when (r) {
         "3:2" -> 3 to 2
         "4:3" -> 4 to 3
@@ -520,11 +528,72 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 listOf(evenOf(sw - sideW) to sh, sideW to sh)
             }
             LayoutKind.PIP -> {
-                val (rn, rd) = ratioOf(cfg.pipRatio)
-                val ph = evenOf((sh * f).toInt().coerceIn(sh / 4, sh / 2))
-                listOf(sw to sh, evenOf(ph * rn / rd) to ph)
+                val minSide = pipMinSide(sw, sh)
+                if (cfg.pipCustomW > 0 && cfg.pipCustomH > 0) {
+                    // 手指自由缩放过的尺寸：直接采用（夹在最小边与 3/4 屏之间）
+                    val w = evenOf(cfg.pipCustomW.coerceIn(minSide, sw * 3 / 4))
+                    val h = evenOf(cfg.pipCustomH.coerceIn(minSide, sh * 3 / 4))
+                    listOf(sw to sh, w to h)
+                } else {
+                    val (rn, rd) = ratioOf(cfg.pipRatio)
+                    val ph = evenOf((sh * f).toInt().coerceIn(sh / 4, sh / 2))
+                    listOf(sw to sh, evenOf(ph * rn / rd) to ph)
+                }
             }
         }
+    }
+
+    private val decorViews = mutableListOf<View>()
+
+    /** 可拖分割线：拖动实时预览两区大小，松手按新比例重建虚拟屏 */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun addDivider(container: FrameLayout, vertical: Boolean, pos: Int, sw: Int, sh: Int,
+                           minFrac: Float, maxFrac: Float, side: Boolean) {
+        val thickness = (20 * resources.displayMetrics.density).toInt()
+        val divider = View(this).apply { setBackgroundColor(0x99FFFFFF.toInt()) }
+        val lp = if (vertical) {
+            FrameLayout.LayoutParams(thickness, sh, Gravity.TOP or Gravity.START).also { it.leftMargin = pos - thickness / 2 }
+        } else {
+            FrameLayout.LayoutParams(sw, thickness, Gravity.TOP or Gravity.START).also { it.topMargin = pos - thickness / 2 }
+        }
+        container.addView(divider, lp)
+        decorViews.add(divider)
+
+        divider.setOnTouchListener(object : View.OnTouchListener {
+            var liveFrac = 0f
+            override fun onTouch(v: View, e: MotionEvent): Boolean {
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> liveFrac = layoutConfig.fraction
+                    MotionEvent.ACTION_MOVE -> {
+                        val f = (if (vertical) e.rawX / sw else e.rawY / sh)
+                            .coerceIn(minFrac, maxFrac)
+                        liveFrac = f
+                        // 实时预览：只改视图布局，不动流
+                        val p = (f * (if (vertical) sw else sh)).toInt()
+                        for (rv in regionViews) {
+                            val rlp = rv.layoutParams as FrameLayout.LayoutParams
+                            if (vertical) {
+                                if (rlp.leftMargin == 0) rlp.width = p
+                                else { rlp.leftMargin = p; rlp.width = sw - p }
+            } else {
+                                if (rlp.topMargin == 0) rlp.height = p
+                                else { rlp.topMargin = p; rlp.height = sh - p }
+                            }
+                            rv.layoutParams = rlp
+                        }
+                        val dlp = divider.layoutParams as FrameLayout.LayoutParams
+                        if (vertical) dlp.leftMargin = p - thickness / 2 else dlp.topMargin = p - thickness / 2
+                        divider.layoutParams = dlp
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        if (kotlin.math.abs(liveFrac - layoutConfig.fraction) > 0.015f) {
+                            applyLayout(layoutConfig.copy(fraction = liveFrac))
+                        }
+                    }
+                }
+                return true
+            }
+        })
     }
 
     /** 布局当前配置布置渲染区域 */
@@ -533,6 +602,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val container = sessionRoot ?: return
         for (v in regionViews) container.removeView(v)
         regionViews.clear()
+        for (v in decorViews) container.removeView(v)
+        decorViews.clear()
         pipRoot?.let { container.removeView(it) }
         pipRoot = null
         val ids = subscribedIds.ifEmpty { displays.take(1).map { it.id } }
@@ -579,6 +650,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     val lw = evenOf((sw * layoutConfig.fraction).toInt().coerceIn(sw / 5, sw * 4 / 5))
                     place(makeView(ids[0]), lw, sh, 0, 0)
                     place(makeView(ids[1]), evenOf(sw - lw), sh, lw, 0)
+                    addDivider(container, true, lw, sw, sh, 0.3f, 0.7f, false)
                 } else place(makeView(ids[0]), sw, sh, 0, 0)
             }
             LayoutKind.SPLIT_TB -> {
@@ -586,6 +658,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     val th = evenOf((sh * layoutConfig.fraction).toInt().coerceIn(sh / 5, sh * 4 / 5))
                     place(makeView(ids[0]), sw, th, 0, 0)
                     place(makeView(ids[1]), sw, evenOf(sh - th), 0, th)
+                    addDivider(container, false, th, sw, sh, 0.3f, 0.7f, false)
                 } else place(makeView(ids[0]), sw, sh, 0, 0)
             }
             LayoutKind.SIDE -> {
@@ -599,6 +672,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                         place(main, evenOf(sw - sideW), sh, 0, 0)
                         place(side, sideW, sh, evenOf(sw - sideW), 0)
                     }
+                    addDivider(container, true, sideW, sw, sh, 0.2f, 0.4f, true)
                 } else place(makeView(ids[0]), sw, sh, 0, 0)
             }
             LayoutKind.PIP -> {
@@ -613,8 +687,17 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private fun buildPipWindow(displayId: Int, sw: Int, sh: Int) {
         val container = sessionRoot ?: return
         val (rn, rd) = ratioOf(layoutConfig.pipRatio)
-        var pipH = (sh * layoutConfig.fraction).toInt().coerceIn(sh / 4, sh / 2)
-        var pipW = pipH * rn / rd
+        val minSide = pipMinSide(sw, sh)
+        var pipH: Int
+        var pipW: Int
+        if (layoutConfig.pipCustomW > 0 && layoutConfig.pipCustomH > 0) {
+            // 手指调过的自由尺寸：窗口=虚拟屏像素 1:1
+            pipW = layoutConfig.pipCustomW.coerceIn(minSide, sw * 3 / 4)
+            pipH = layoutConfig.pipCustomH.coerceIn(minSide, sh * 3 / 4)
+        } else {
+            pipH = (sh * layoutConfig.fraction).toInt().coerceIn(sh / 4, sh / 2)
+            pipW = pipH * rn / rd
+        }
         val root = FrameLayout(this)
 
         val view = StreamView(this)
@@ -689,23 +772,25 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         })
 
         corner.setOnTouchListener(object : View.OnTouchListener {
-            var sx = 0f; var w0 = 0
+            var sx = 0f; var sy = 0f; var w0 = 0; var h0 = 0
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> { sx = e.rawX; w0 = pipW }
+                    MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; w0 = pipW; h0 = pipH }
                     MotionEvent.ACTION_MOVE -> {
-                        pipW = (w0 + (e.rawX - sx).toInt()).coerceIn(sw / 6, sw * 3 / 4)
-                        pipH = pipW * rd / rn
+                        // 自由缩放：宽高独立跟随手指，夹在最小边与 3/4 屏之间
+                        pipW = (w0 + (e.rawX - sx).toInt()).coerceIn(minSide, sw * 3 / 4)
+                        pipH = (h0 + (e.rawY - sy).toInt()).coerceIn(minSide, sh * 3 / 4)
                         val p = root.layoutParams as FrameLayout.LayoutParams
                         p.width = pipW; p.height = pipH
                         root.layoutParams = p
                     }
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        // 松手：按新尺寸重建虚拟屏（比例跟随，像素 1:1 原则）
-                        val targetH = evenOf(pipH.coerceIn(sh / 4, sh / 2))
-                        val newFraction = targetH.toFloat() / sh
-                        if (kotlin.math.abs(newFraction - layoutConfig.fraction) > 0.08f) {
-                            applyLayout(layoutConfig.copy(fraction = newFraction))
+                        // 松手：按手指划出的实际尺寸重建虚拟屏（像素 1:1）
+                        val newW = evenOf(pipW); val newH = evenOf(pipH)
+                        val oldW = layoutConfig.pipCustomW.takeIf { it > 0 } ?: pipW0(rn, rd, sh)
+                        val oldH = layoutConfig.pipCustomH.takeIf { it > 0 } ?: pipH0(sh)
+                        if (kotlin.math.abs(newW - oldW) > 24 || kotlin.math.abs(newH - oldH) > 24) {
+                            applyLayout(layoutConfig.copy(pipCustomW = newW, pipCustomH = newH))
                         }
                     }
                 }
