@@ -1,0 +1,15 @@
+#!/bin/sh
+DIR="$(cd "$(dirname "$0")" && pwd)"
+GRADLE_HOME="$HOME/.gradle/wrapper/dists/gradle-8.4-bin"
+GRADLE_ZIP="$GRADLE_HOME/gradle-8.4-bin.zip"
+GRADLE_BIN="$GRADLE_HOME/gradle-8.4/bin/gradle"
+
+if [ ! -f "$GRADLE_BIN" ]; then
+    echo "Downloading Gradle 8.4..."
+    mkdir -p "$GRADLE_HOME"
+    curl -L "https://services.gradle.org/distributions/gradle-8.4-bin.zip" -o "$GRADLE_ZIP"
+    cd "$GRADLE_HOME"
+    unzip -q gradle-8.4-bin.zip
+fi
+
+exec "$GRADLE_BIN" -p "$DIR" "$@"

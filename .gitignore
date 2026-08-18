@@ -1,0 +1,24 @@
+# macOS
+.build/
+DerivedData/
+*.app
+.DS_Store
+
+# Android / gradle
+.gradle/
+build/
+local.properties
+*.apk
+*.aab
+captures/
+.externalNativeBuild/
+.cxx/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Swift Package Manager
+.swiftpm/
+Package.resolved
