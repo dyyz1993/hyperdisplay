@@ -465,7 +465,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         connectView = null
         hideSystemBars()
 
-        val container = FrameLayout(this)
+        val container = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         root.addView(container, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         sessionRoot = container
@@ -624,7 +624,6 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val view = StreamView(this)
             view.displayId = id
             view.onSurfaceReady = { did, surface ->
-                paintBlackPlaceholder(surface)
                 val pl = pipelineOf(did)
                 pl.surface = surface
                 maybeStartDecoder(pl)
@@ -693,7 +692,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
-    /** 画中画悬浮窗：⠿圆点=选中/拖动；选中态显示 8 个缩放手柄、按住中间拖动整窗 */
+    /** 画中画悬浮窗：轻点=选中（仅选中时显示 8 个小方块手柄）；选中态按住中间拖动整窗（偏移量） */
     @SuppressLint("ClickableViewAccessibility")
     private fun buildPipWindow(displayId: Int, sw: Int, sh: Int) {
         val container = sessionRoot ?: return
@@ -709,13 +708,15 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             pipW = pipH * rn / rd
         }
         val root = FrameLayout(this)
+        // 黑色垫底：surface 首帧到达前保持黑色（替代曾导致 MediaCodec configure 失败的 lockCanvas 方案）
+        root.addView(View(this).apply { setBackgroundColor(Color.BLACK) }, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
         val view = StreamView(this)
         view.displayId = displayId
         view.holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
         view.setZOrderMediaOverlay(true)
         view.onSurfaceReady = { did, surface ->
-            paintBlackPlaceholder(surface)
             val pl = pipelineOf(did)
             pl.surface = surface
             maybeStartDecoder(pl)
@@ -745,37 +746,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             }
         }
 
-        // ⠿ 圆点：点击=选中/取消；按住拖=移动窗口（任何时候）
-        val chipD = (34 * resources.displayMetrics.density).toInt()
-        val chip = View(this).apply {
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(0xCC303030.toInt())
-                setStroke(4, 0xFFFFFFFF.toInt())
-            }
-        }
-        val chipLp = FrameLayout.LayoutParams(chipD, chipD, Gravity.TOP or Gravity.START)
-        chipLp.leftMargin = 8
-        chipLp.topMargin = 8
-        root.addView(chip, chipLp)
-        pipChip = chip
-        chip.setOnTouchListener(object : View.OnTouchListener {
-            var downX = 0f; var downY = 0f; var moved = false
-            override fun onTouch(v: View, e: MotionEvent): Boolean {
-                when (e.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> { downX = e.rawX; downY = e.rawY; moved = false }
-                    MotionEvent.ACTION_MOVE -> {
-                        if (kotlin.math.abs(e.rawX - downX) > 10 || kotlin.math.abs(e.rawY - downY) > 10) moved = true
-                        if (moved) movePipByTouch(root, e, sw, sh)
-                    }
-                    MotionEvent.ACTION_UP -> if (!moved) setPipSelected(root, !pipSelected)
-                }
-                return true
-            }
-        })
-
-        // 8 个缩放手柄：四角 + 四边中点
-        val hd = (20 * resources.displayMetrics.density).toInt()
+        // 8 个缩放手柄：四角 + 四边中点（web 端样式：小白方块、仅选中时可见）
+        val hd = (13 * resources.displayMetrics.density).toInt()
         fun handleGravity(role: String): Int = when (role) {
             "TL" -> Gravity.TOP or Gravity.START
             "TR" -> Gravity.TOP or Gravity.END
@@ -789,9 +761,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         for (role in listOf("TL", "TR", "BL", "BR", "T", "B", "L", "R")) {
             val h = View(this).apply {
                 background = android.graphics.drawable.GradientDrawable().apply {
-                    shape = android.graphics.drawable.GradientDrawable.OVAL
                     setColor(0xFFFFFFFF.toInt())
-                    setStroke(4, 0xFF1976D2.toInt())
+                    setStroke(2, 0xFF1565C0.toInt())
+                    cornerRadius = 3f
                 }
                 visibility = View.GONE
             }
@@ -895,34 +867,36 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         return true
     }
 
-    /** Surface 首帧前刷黑，避免显示显存残色（绿屏来源之一） */
-    private fun paintBlackPlaceholder(surface: Surface) {
-        try {
-            val c = surface.lockCanvas(null)
-            c.drawColor(android.graphics.Color.BLACK)
-            surface.unlockCanvasAndPost(c)
-        } catch (_: Exception) { }
-    }
-
     /** 选中/取消选中：显示 8 手柄 + 高亮边框 */
     private fun setPipSelected(root: FrameLayout, on: Boolean) {
         pipSelected = on
         for (h in pipHandles) h.visibility = if (on) View.VISIBLE else View.GONE
         val bg = android.graphics.drawable.GradientDrawable().apply {
-            setStroke(if (on) 8 else 3, if (on) 0xFF1976D2.toInt() else 0x66000000)
+            setStroke(if (on) 4 else 2, if (on) 0xFF1976D2.toInt() else 0x33000000)
         }
         root.background = bg
     }
 
-    /** 手指拖动整窗（chip 或选中态中间） */
+    private var moveStartRawX = 0f
+    private var moveStartRawY = 0f
+    private var moveStartL = 0
+    private var moveStartT = 0
+
+    /** 手指拖动整窗：纯偏移量（按下点与窗口的相对关系保持不变，不吸附、不跳动） */
     private fun movePipByTouch(root: FrameLayout, e: MotionEvent, sw: Int, sh: Int) {
-        val p = root.layoutParams as FrameLayout.LayoutParams
-        val w = p.width; val h = p.height
         when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                moveStartRawX = e.rawX; moveStartRawY = e.rawY
+                val p = root.layoutParams as FrameLayout.LayoutParams
+                moveStartL = p.leftMargin; moveStartT = p.topMargin
+            }
             MotionEvent.ACTION_MOVE -> {
-                pipLeft = (e.rawX - w / 2).toInt().coerceIn(0, (sw - w).coerceAtLeast(0))
-                pipTop = (e.rawY - (28 * resources.displayMetrics.density).toInt())
-                    .toInt().coerceIn(0, (sh - h).coerceAtLeast(0))
+                val p = root.layoutParams as FrameLayout.LayoutParams
+                val w = p.width; val h = p.height
+                pipLeft = (moveStartL + (e.rawX - moveStartRawX).toInt())
+                    .coerceIn(0, (sw - w).coerceAtLeast(0))
+                pipTop = (moveStartT + (e.rawY - moveStartRawY).toInt())
+                    .coerceIn(0, (sh - h).coerceAtLeast(0))
                 p.leftMargin = pipLeft; p.topMargin = pipTop
                 root.layoutParams = p
             }

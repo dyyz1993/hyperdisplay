@@ -378,6 +378,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
     private var permissionsGranted = false
     private var displaySerial = 0
     private var loggedInputClients = Set<String>()
+    private var didIdleReset = false
     private let bonjour = BonjourAdvertiser()
     private let qrPanel = QRPanelController()
 
@@ -637,6 +638,22 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     // MARK: 周期 tick：统计 + 客户端 prune
 
+    /// 全量自愈：销毁全部流与虚拟屏，重建初始配置（编码器池归零）
+    private func fullIdleReset() {
+        for id in displayOrder {
+            streams[id]?.stop()
+            streams[id]?.display.destroy()
+        }
+        streams.removeAll()
+        displayOrder.removeAll()
+        for d in config.displays {
+            let id = createDisplay(width: d.width, height: d.height, name: nextDisplayName())
+            if let id { streams[id]?.isInitialDisplay = true }
+        }
+        NSLog("[hyperdisplay] idle reset: \(streams.count) fresh display(s), encoder pool recycled")
+        rebuildMenu()
+    }
+
     private func tick() {
         let now = Date()
         clientsLock.lock()
@@ -646,6 +663,14 @@ final class HostApp: NSObject, NSApplicationDelegate {
         clientsLock.unlock()
         if !stale.isEmpty {
             NSLog("[hyperdisplay] pruned \(stale.count) stale client(s)")
+        }
+        // 空闲自愈：最后一个客户端断开后全量重建（VideoToolbox 会话经反复建销会劣化——
+        // 新会话产出 ffmpeg 可解但华为硬解输出全零的流；归零重建即恢复）
+        if clientCount == 0 && !didIdleReset {
+            didIdleReset = true
+            fullIdleReset()
+        } else if clientCount > 0 {
+            didIdleReset = false
         }
         for stream in streams.values {
             stream.sampleStats()
