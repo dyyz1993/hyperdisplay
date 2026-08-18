@@ -18,6 +18,7 @@ class FrameAssembler(private val callback: Callback) {
     private var currentFragCount = 0
     private var currentKeyframe = false
     private var fragments = arrayOfNulls<ByteArray>(0)
+    private var deliveredCurrent = false
     private var lastFragmentAt = 0L
     private var waitingForKeyframe = true
     private var lastKeyframeRequestAt = 0L
@@ -30,8 +31,10 @@ class FrameAssembler(private val callback: Callback) {
 
             if (frameId < currentFrameId) return // 过期分片
             if (frameId > currentFrameId) {
-                // 新帧开始（旧帧未完成则被丢弃——latest-frame policy）
-                if (currentFrameId >= 0 && !isComplete()) onAbandoned(currentFrameId)
+                // 新帧开始；旧帧未投递且缺分片才视为丢弃（latest-frame policy）
+                if (currentFrameId >= 0 && !deliveredCurrent && !isComplete()) {
+                    onAbandoned(currentFrameId)
+                }
                 if (lastDeliveredFrameId >= 0 && frameId > lastDeliveredFrameId + 1 && !waitingForKeyframe) {
                     waitingForKeyframe = true
                     requestKeyframeRateLimited("gap $lastDeliveredFrameId -> $frameId", now)
@@ -39,6 +42,7 @@ class FrameAssembler(private val callback: Callback) {
                 currentFrameId = frameId
                 currentFragCount = fragCount
                 currentKeyframe = keyframe
+                deliveredCurrent = false
                 fragments = arrayOfNulls(fragCount)
             }
 
@@ -54,6 +58,7 @@ class FrameAssembler(private val callback: Callback) {
                     offset += frag.size
                 }
                 fragments = arrayOfNulls(0)
+                deliveredCurrent = true
                 lastDeliveredFrameId = frameId
                 if (waitingForKeyframe) {
                     if (!keyframe) {
@@ -70,7 +75,7 @@ class FrameAssembler(private val callback: Callback) {
     /** 由外部周期调用（≥100ms 一次）：分片停滞检测 */
     fun stallCheck() {
         synchronized(lock) {
-            if (currentFrameId < 0 || isComplete()) return
+            if (currentFrameId < 0 || deliveredCurrent || isComplete()) return
             val idle = System.currentTimeMillis() - lastFragmentAt
             if (idle > 300) {
                 onAbandoned(currentFrameId)
@@ -95,7 +100,9 @@ class FrameAssembler(private val callback: Callback) {
     private fun isComplete(): Boolean = fragments.isNotEmpty() && fragments.all { it != null }
 
     private fun onAbandoned(frameId: Int) {
-        android.util.Log.d("FrameAssembler", "abandon incomplete frame $frameId")
+        val missing = fragments.indices.filter { fragments[it] == null }
+        android.util.Log.d("FrameAssembler",
+            "abandon incomplete frame $frameId fragCount=$currentFragCount missing=$missing")
     }
 
     private fun requestKeyframeRateLimited(reason: String, now: Long) {

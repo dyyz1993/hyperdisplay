@@ -49,6 +49,7 @@ class MainActivity : Activity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lastRendered = 0
     private var renderFps = 0
+    private var lastWatchdogKfAt = 0L
     private val statsTick = object : Runnable {
         override fun run() {
             val d = decoder
@@ -58,6 +59,15 @@ class MainActivity : Activity() {
                 lastRendered = now
             }
             assembler?.stallCheck()
+            // 视频看门狗：链路已通但没有任何帧（host 侧静态桌面不出新帧）→ 主动要 IDR
+            val s = session
+            if (s != null && linkUp && decoder == null && latestCsd == null) {
+                val now = System.currentTimeMillis()
+                if (now - lastWatchdogKfAt > 700) {
+                    lastWatchdogKfAt = now
+                    s.requestKeyframe()
+                }
+            }
             updateOverlay()
             mainHandler.postDelayed(this, 1000)
         }
@@ -74,6 +84,10 @@ class MainActivity : Activity() {
         root = FrameLayout(this)
         setContentView(root)
         showConnectView()
+        // 支持 adb/自动化直连：am start -e host 192.168.1.23:5277
+        intent.getStringExtra("host")?.trim()?.takeIf { it.isNotEmpty() }?.let { text ->
+            parseEndpoint(text)?.let { (host, port) -> connect(host, port) }
+        }
     }
 
     // MARK: 连接界面

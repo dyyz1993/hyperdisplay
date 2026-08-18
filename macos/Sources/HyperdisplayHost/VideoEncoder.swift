@@ -133,13 +133,14 @@ final class VideoEncoder {
         if force {
             properties = [kVTEncodeFrameOptionKey_ForceKeyFrame as NSString: kCFBooleanTrue] as CFDictionary
         }
+        // 注意：输出回调收到的 refcon 是「每帧」的 sourceFrameRefcon（建会话时的 refcon 不会传给回调）
         let status = VTCompressionSessionEncodeFrame(
             session!,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: CMTime(value: CMTimeValue(pts), timescale: timescale),
             duration: CMTime.invalid,
             frameProperties: properties,
-            sourceFrameRefcon: nil,
+            sourceFrameRefcon: Unmanaged.passUnretained(self).toOpaque(),
             infoFlagsOut: nil
         )
         if status != noErr {
@@ -180,6 +181,7 @@ final class VideoEncoder {
         encodedFrames &+= 1
         lock.unlock()
         guard !config.isEmpty else {
+            NSLog("[hyperdisplay] encoder output without param sets — requesting fresh keyframe")
             requestKeyframe() // 没有参数集就无法被解码，重试关键帧
             return
         }
@@ -191,9 +193,13 @@ final class VideoEncoder {
             CMBlockBufferCopyDataBytes(dataBuffer, atOffset: 0, dataLength: dataLength, destination: bytes.baseAddress!)
         }
         guard copyStatus == noErr else { return }
-        guard let annexB = Self.lengthPrefixedToAnnexB(payload, lengthSize: lengthSize) else { return }
+        guard let annexB = Self.lengthPrefixedToAnnexB(payload, lengthSize: lengthSize) else {
+            NSLog("[hyperdisplay] annex-B conversion failed (len=\(dataLength) lengthSize=\(lengthSize))")
+            return
+        }
 
         if keyframe {
+            NSLog("[hyperdisplay] keyframe encoded: \(annexB.count)B, param sets \(config.count)B")
             onConfig(config) // 每个关键帧都重发参数集，客户端随时可加入
         }
         onFrame(keyframe, annexB)

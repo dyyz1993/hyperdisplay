@@ -175,6 +175,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 startStreaming()
             } else {
                 encoder?.requestKeyframe()
+                capture?.replayLastFrame()
                 if let vd = virtualDisplay {
                     injector.updateMapping(bounds: vd.bounds, streamWidth: Double(config.width), streamHeight: Double(config.height))
                 }
@@ -185,6 +186,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
             if Date().timeIntervalSince(lastKeyframeRequestAt) >= 0.5 {
                 lastKeyframeRequestAt = Date()
                 encoder?.requestKeyframe()
+                capture?.replayLastFrame() // 静态桌面可能没有新源帧，重放最新帧出 IDR
             }
         case .inputMove(let seq, let x, let y):
             injector.move(x: Double(x), y: Double(y))

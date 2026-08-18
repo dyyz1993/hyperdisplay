@@ -58,7 +58,10 @@ class HostSession private constructor(
         }
     }
 
-    private val socket = DatagramSocket()
+    private val socket = DatagramSocket().apply {
+        receiveBufferSize = 4 shl 20
+        sendBufferSize = 1 shl 20
+    }
     @Volatile private var running = true
     private val inputSeq = AtomicInteger(1)
     private val pingSeq = AtomicInteger(1)

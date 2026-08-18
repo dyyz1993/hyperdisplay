@@ -13,6 +13,24 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private var displayID: CGDirectDisplayID = 0
     private let lock = NSLock()
     private(set) var capturedFrames: UInt64 = 0
+    private var lastFrame: CVPixelBuffer?
+    private var statusCounts: [Int: Int] = [:]
+    private var loggedEvents = 0
+    private(set) var buffersSeen: UInt64 = 0
+
+    /// 把最近一帧重新送编码（配合 force keyframe），用于客户端中途加入/重连时
+    /// 静态桌面不出新帧的场景——否则 PLI 永远等不到新源帧。
+    func replayLastFrame() {
+        lock.lock()
+        let frame = lastFrame
+        lock.unlock()
+        if let frame {
+            NSLog("[hyperdisplay] replaying last captured frame for forced keyframe")
+            onFrame?(frame)
+        } else {
+            NSLog("[hyperdisplay] replay requested but no buffered frame yet")
+        }
+    }
 
     func start(displayID: CGDirectDisplayID, width: Int, height: Int, fps: Int) async throws {
         self.displayID = displayID
@@ -62,18 +80,41 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     // SCStreamOutput
+    // macOS 26 上对静态虚拟屏：complete(1) 事件无缓冲，idle(0) 事件反而带最新缓冲。
+    // 策略：有缓冲即更新 lastFrame；complete 帧直接编码；idle 帧不主动编码
+    //（静态桌面不出码率，关键帧请求走 replayLastFrame）。
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen else { return }
         guard sampleBuffer.isValid else { return }
         guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[String: Any]],
-              let first = attachments.first,
-              let statusRaw = first[SCStreamFrameInfo.status.rawValue] as? Int,
-              statusRaw == SCFrameStatus.complete.rawValue else { return }
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+              let first = attachments.first else { return }
+        let statusRaw = first[SCStreamFrameInfo.status.rawValue] as? Int ?? -1
+        let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
+        lock.lock()
+        statusCounts[statusRaw, default: 0] += 1
+        if let pixelBuffer {
+            lastFrame = pixelBuffer
+            buffersSeen &+= 1
+        }
+        if loggedEvents < 8 {
+            loggedEvents += 1
+            let size = pixelBuffer.map { "\(CVPixelBufferGetWidth($0))x\(CVPixelBufferGetHeight($0))" } ?? "nil"
+            NSLog("[hyperdisplay] sck event status=\(statusRaw) buffer=\(size)")
+        }
+        lock.unlock()
+        guard statusRaw == SCFrameStatus.complete.rawValue, let pixelBuffer else { return }
         lock.lock()
         capturedFrames &+= 1
         lock.unlock()
         onFrame?(pixelBuffer)
+    }
+
+    /// SCK 帧状态直方图（菜单栏诊断用）
+    var statusSummary: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return statusCounts.sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }.joined(separator: " ")
     }
 
     // SCStreamDelegate
