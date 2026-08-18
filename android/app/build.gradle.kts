@@ -32,5 +32,8 @@ android {
 }
 
 dependencies {
-    // 零第三方依赖：只用系统 API（DatagramSocket / MediaCodec / SurfaceView）
+    implementation("androidx.appcompat:appcompat:1.6.1")
+    // 扫码（与 hypercast 同款、久经验证的组合）
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("com.google.zxing:core:3.5.1")
 }

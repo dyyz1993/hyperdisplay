@@ -25,6 +25,7 @@ enum PacketType: UInt8 {
     case welcome = 0x01, videoFrag = 0x02, config = 0x03, displays = 0x07, inputAck = 0x05, pong = 0x06
     case hello = 0x10, keyframeReq = 0x11, input = 0x12, ping = 0x13
     case selectDisplay = 0x14, createDisplay = 0x15, destroyDisplay = 0x16
+    case nack = 0x17
 }
 
 enum InputSubtype: UInt8 { case move = 0, button = 1, wheel = 2 }
@@ -46,6 +47,7 @@ enum Packet {
     case selectDisplay(id: UInt32)
     case createDisplay(width: UInt16, height: UInt16, name: String)
     case destroyDisplay(id: UInt32)
+    case nack(frameId: UInt32, indices: [UInt16])
 }
 
 enum Wire {
@@ -122,6 +124,17 @@ enum Wire {
     static func destroyDisplay(id: UInt32) -> Data {
         var d = Data(header(.destroyDisplay, seq: 0))
         d.appendLE(id)
+        return d
+    }
+
+    /// NACK：请求重传指定关键帧的缺失分片（仅关键帧需要完整，增量帧可丢）
+    static func nack(frameId: UInt32, indices: [UInt16]) -> Data {
+        var d = Data(header(.nack, seq: 0))
+        d.appendLE(frameId)
+        d.appendLE(UInt16(min(indices.count, 255)))
+        for i in indices.prefix(255) {
+            d.appendLE(i)
+        }
         return d
     }
 
@@ -216,6 +229,19 @@ enum Wire {
             return .destroyDisplay(id: data.withUnsafeBytes {
                 $0.loadUnaligned(fromByteOffset: Wire.headerSize, as: UInt32.self).littleEndian
             })
+        case PacketType.nack.rawValue:
+            guard body >= 6 else { return nil }
+            let frameId = data.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: Wire.headerSize, as: UInt32.self).littleEndian
+            }
+            let count = Int(u16(4))
+            guard body >= 6 + count * 2 else { return nil }
+            var indices = [UInt16]()
+            indices.reserveCapacity(count)
+            for i in 0..<count {
+                indices.append(u16(6 + i * 2))
+            }
+            return .nack(frameId: frameId, indices: indices)
         case PacketType.input.rawValue:
             guard body >= 1 else { return nil }
             switch InputSubtype(rawValue: u8(0)) {

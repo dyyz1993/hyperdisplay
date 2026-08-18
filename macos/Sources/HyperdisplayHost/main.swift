@@ -21,7 +21,8 @@ struct Config {
 
     static func autoBitrate(width: Int, height: Int) -> UInt32 {
         let megapixels = Double(width * height) / 1_000_000
-        return UInt32(min(40, max(4, megapixels * 5))) * 1_000_000
+        // 3.5Mbps/百万像素：office 文字够清晰，同时把大关键帧压小（WiFi 丢片率随突发size升）
+        return UInt32(min(28, max(4, megapixels * 3.5))) * 1_000_000
     }
 
     static func parse(_ args: [String]) -> Config {
@@ -148,6 +149,10 @@ final class DisplayStream {
     private(set) var started = false
     private(set) var effectiveFps = 0
     private var encodedSnapshot: UInt64 = 0
+    // 近期关键帧的分片缓存（NACK 重传用；增量帧可丢不缓存）
+    private var keyframeFragments: [UInt32: [Data]] = [:]
+    private var keyframeOrder: [UInt32] = []
+    private let fragLock = NSLock()
 
     init(display: VirtualDisplay, fps: Int, bitrate: UInt32, host: HostApp, udp: UdpHost) {
         self.display = display
@@ -180,9 +185,26 @@ final class DisplayStream {
             onFrame: { [weak self] keyframe, payload in
                 guard let self else { return }
                 self.frameId &+= 1
-                self.udp.sendVideoFrame(
-                    to: self.host?.addressesOfSubscribers(of: self.display.displayID) ?? [],
-                    frameId: self.frameId, keyframe: keyframe, payload: payload)
+                let addresses = self.host?.addressesOfSubscribers(of: self.display.displayID) ?? []
+                let frags = Wire.videoFrags(frameId: self.frameId, keyframe: keyframe, payload: payload)
+                if keyframe {
+                    fragLock.lock()
+                    self.keyframeFragments[self.frameId] = frags
+                    self.keyframeOrder.append(self.frameId)
+                    if self.keyframeOrder.count > 8 {
+                        let evict = self.keyframeOrder.removeFirst()
+                        self.keyframeFragments.removeValue(forKey: evict)
+                    }
+                    fragLock.unlock()
+                }
+                for var addr in addresses {
+                    for (index, frag) in frags.enumerated() {
+                        self.udp.sendWithBackpressure(to: &addr, frag)
+                        if index > 0 && index % 64 == 0 {
+                            usleep(1500)
+                        }
+                    }
+                }
             }
         )
         self.encoder = encoder
@@ -237,6 +259,23 @@ final class DisplayStream {
         capture?.replayLastFrame()
     }
 
+    /// NACK：只重传缓存中的关键帧分片
+    func handleNack(frameId: UInt32, indices: [UInt16], to addr: sockaddr_in) {
+        fragLock.lock()
+        let frags = keyframeFragments[frameId]
+        fragLock.unlock()
+        guard let frags else { return }
+        var sent = 0
+        for idx in indices where Int(idx) < frags.count {
+            var a = addr
+            udp.send(to: &a, frags[Int(idx)])
+            sent += 1
+        }
+        if sent > 0 {
+            NSLog("[hyperdisplay] NACK display=\(display.displayID) frame=\(frameId) resent=\(sent)")
+        }
+    }
+
     func sampleStats() {
         guard let encoder else { return }
         let now = encoder.snapshotEncodedFrames()
@@ -260,6 +299,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
     private var permissionsGranted = false
     private var displaySerial = 0
     private var loggedInputClients = Set<String>()
+    private let bonjour = BonjourAdvertiser()
+    private let qrPanel = QRPanelController()
 
     init(config: Config) {
         self.config = config
@@ -316,6 +357,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
             for d in config.displays {
                 _ = createDisplay(width: d.width, height: d.height, name: nextDisplayName())
             }
+            let hostName = Host.current().localizedName ?? "Mac"
+            _ = bonjour.start(name: "Hyperdisplay (\(hostName))", port: udp.port)
             NSLog("[hyperdisplay] host listening on UDP \(udp.port); \(streams.count) virtual display(s)")
         } catch {
             NSLog("[hyperdisplay] \(error)")
@@ -407,6 +450,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
         case .keyframeReq:
             if let id = clients[key]?.displayId, let stream = streams[id] {
                 stream.requestKeyframeAndReplay()
+            }
+
+        case .nack(let frameId, let indices):
+            if let id = clients[key]?.displayId, let stream = streams[id] {
+                stream.handleNack(frameId: frameId, indices: indices, to: addr)
             }
 
         case .inputMove(let seq, let x, let y):
@@ -553,6 +601,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
         menu.setSubmenu(removeSub, for: remove)
 
         menu.addItem(.separator())
+        let qrItem = menu.addItem(withTitle: "显示连接二维码…", action: #selector(showQR), keyEquivalent: "")
+        qrItem.target = self
         let port = udp?.port ?? config.port
         menu.addItem(withTitle: "本机 UDP \(port)：", action: nil, keyEquivalent: "")
         for line in Self.allInterfaceAddresses(port: Int(port)) {
@@ -583,6 +633,17 @@ final class HostApp: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    @objc private func showQR() {
+        let port = Int(udp?.port ?? config.port)
+        let ips = Self.allInterfaceAddresses(port: port)
+        let list = ips.compactMap { line -> (String, Int)? in
+            // "192.168.0.9（en0）:5277" → ("192.168.0.9:5277", 5277)
+            guard let ip = line.split(whereSeparator: { $0 == "（" }).first else { return nil }
+            return (String(ip), port)
+        }
+        qrPanel.show(ipPortList: list.isEmpty ? [("?.?.?.?:\(port)", port)] : list, port: port)
+    }
+
     @objc private func requestScreenPerm() {
         Permissions.requestScreenRecording()
     }
@@ -592,6 +653,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        bonjour.stop()
         for stream in streams.values {
             stream.stop()
             stream.display.destroy()

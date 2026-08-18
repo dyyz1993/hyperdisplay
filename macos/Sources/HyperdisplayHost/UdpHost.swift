@@ -86,13 +86,12 @@ final class UdpHost {
         return sent == data.count
     }
 
-    /// 发送一整帧视频分片到多个订阅者。非阻塞下遇发送失败即放弃该客户端本帧剩余分片。
-    func sendVideoFrame(to addresses: [sockaddr_in], frameId: UInt32, keyframe: Bool, payload: Data) {
-        let frags = Wire.videoFrags(frameId: frameId, keyframe: keyframe, payload: payload)
-        for var addr in addresses {
-            for frag in frags {
-                if !send(to: &addr, frag) { break }
-            }
+    /// 视频分片发送：遇缓冲满（EWOULDBLOCK）小睡重试——把背压转化为流控，
+    /// 而不是丢弃剩余分片（自残式丢帧）。重试上限防真实故障死循环。
+    func sendWithBackpressure(to addr: inout sockaddr_in, _ data: Data) {
+        for _ in 0..<200 {
+            if send(to: &addr, data) { return }
+            usleep(2000)
         }
     }
 }

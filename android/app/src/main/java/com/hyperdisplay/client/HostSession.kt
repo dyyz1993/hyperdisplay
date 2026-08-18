@@ -48,6 +48,7 @@ class HostSession private constructor(
         private const val TYPE_SELECT_DISPLAY = 0x14
         private const val TYPE_CREATE_DISPLAY = 0x15
         private const val TYPE_DESTROY_DISPLAY = 0x16
+        private const val TYPE_NACK = 0x17
         private const val PROTO_VERSION = 1
         private const val RETRANSMIT_MS = 40L
         private const val MAX_TRIES = 12
@@ -292,5 +293,12 @@ class HostSession private constructor(
     fun destroyDisplay(id: Int) {
         val body = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(id).array()
         send(buildPacket(TYPE_DESTROY_DISPLAY, 0, body))
+    }
+
+    fun sendNack(frameId: Int, indices: List<Int>) {
+        val body = ByteBuffer.allocate(6 + indices.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(frameId).putShort(indices.size.toShort())
+        for (i in indices) body.putShort(i.toShort())
+        send(buildPacket(TYPE_NACK, 0, body.array()))
     }
 }

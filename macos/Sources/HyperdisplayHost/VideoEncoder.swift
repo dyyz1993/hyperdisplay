@@ -84,7 +84,8 @@ final class VideoEncoder {
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
             kVTCompressionPropertyKey_AverageBitRate: Int(bitrate),
-            kVTCompressionPropertyKey_DataRateLimits: [Int(bitrate) * 6, 1] as [NSNumber],
+            // 突发上限 2×（原 6× 会让大关键帧冲到 ~800KB/728 分片，WiFi 丢 1 片即整帧报废）
+            kVTCompressionPropertyKey_DataRateLimits: [Int(bitrate) * 2, 1] as [NSNumber],
             kVTCompressionPropertyKey_ExpectedFrameRate: fps,
             kVTCompressionPropertyKey_MaxKeyFrameInterval: fps * 10,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 10,

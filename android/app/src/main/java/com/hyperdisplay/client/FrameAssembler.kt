@@ -11,6 +11,8 @@ class FrameAssembler(private val callback: Callback) {
     interface Callback {
         fun onFrame(frameId: Int, keyframe: Boolean, data: ByteArray)
         fun onKeyframeNeeded(reason: String)
+        /** 关键帧缺片 NACK：请求 host 重传（增量帧可丢，关键帧必须完整） */
+        fun onNackKeyframeFragments(frameId: Int, missing: List<Int>)
     }
 
     private var lastDeliveredFrameId = -1
@@ -34,6 +36,7 @@ class FrameAssembler(private val callback: Callback) {
                 // 新帧开始；旧帧未投递且缺分片才视为丢弃（latest-frame policy）
                 if (currentFrameId >= 0 && !deliveredCurrent && !isComplete()) {
                     onAbandoned(currentFrameId)
+                    if (currentKeyframe) nackMissing(currentFrameId)
                 }
                 if (lastDeliveredFrameId >= 0 && frameId > lastDeliveredFrameId + 1 && !waitingForKeyframe) {
                     waitingForKeyframe = true
@@ -75,10 +78,16 @@ class FrameAssembler(private val callback: Callback) {
     /** 由外部周期调用（≥100ms 一次）：分片停滞检测 */
     fun stallCheck() {
         synchronized(lock) {
-            if (currentFrameId < 0 || deliveredCurrent || isComplete()) return
+            if (currentFrameId < 0) {
+                // 等关键帧但没有任何分片到达（如首帧全丢）：NACK 无从触发，周期性请求 IDR
+                if (waitingForKeyframe) requestKeyframeRateLimited("idle-wait", System.currentTimeMillis())
+                return
+            }
+            if (deliveredCurrent || isComplete()) return
             val idle = System.currentTimeMillis() - lastFragmentAt
             if (idle > 300) {
                 onAbandoned(currentFrameId)
+                if (currentKeyframe) nackMissing(currentFrameId)
                 currentFrameId = -1
                 fragments = arrayOfNulls(0)
                 waitingForKeyframe = true
@@ -99,6 +108,18 @@ class FrameAssembler(private val callback: Callback) {
 
     private fun isComplete(): Boolean = fragments.isNotEmpty() && fragments.all { it != null }
 
+    private var lastNackAt = 0L
+
+    private fun nackMissing(frameId: Int) {
+        val now = System.currentTimeMillis()
+        if (now - lastNackAt < 150) return // NACK 节流
+        val missing = fragments.indices.filter { fragments[it] == null }
+        if (missing.isEmpty()) return
+        lastNackAt = now
+        // 丢片过多时分批请求（单包上限 255），剩余由下一轮 stall/NACK 继续
+        callback.onNackKeyframeFragments(frameId, missing.take(255))
+    }
+
     private fun onAbandoned(frameId: Int) {
         val missing = fragments.indices.filter { fragments[it] == null }
         android.util.Log.d("FrameAssembler",
@@ -106,7 +127,8 @@ class FrameAssembler(private val callback: Callback) {
     }
 
     private fun requestKeyframeRateLimited(reason: String, now: Long) {
-        if (now - lastKeyframeRequestAt < 500) return
+        // 1000ms 退避：大关键帧在途时反复请求只会加剧拥塞（自 DDoS）
+        if (now - lastKeyframeRequestAt < 1000) return
         lastKeyframeRequestAt = now
         android.util.Log.d("FrameAssembler", "keyframe requested: $reason")
         callback.onKeyframeNeeded(reason)

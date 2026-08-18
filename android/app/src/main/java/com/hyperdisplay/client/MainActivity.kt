@@ -21,7 +21,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 
-class MainActivity : Activity() {
+class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     companion object {
         private const val TAG = "MainActivity"
         private const val DEFAULT_PORT = 5277
@@ -66,7 +66,7 @@ class MainActivity : Activity() {
             val s = session
             if (s != null && linkUp && decoder == null && latestCsd == null) {
                 val now = System.currentTimeMillis()
-                if (now - lastWatchdogKfAt > 700) {
+                if (now - lastWatchdogKfAt > 1200) {
                     lastWatchdogKfAt = now
                     s.requestKeyframe()
                 }
@@ -140,6 +140,16 @@ class MainActivity : Activity() {
             textSize = 16f
         }
         val button = Button(this).apply { text = "连接" }
+
+        val scanButton = Button(this).apply { text = "扫码连接" }
+        val findButton = Button(this).apply { text = "局域网发现" }
+        val buttonRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        buttonRow.addView(scanButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        buttonRow.addView(findButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
         statusText = TextView(this).apply {
             text = ""
             textSize = 13f
@@ -151,6 +161,7 @@ class MainActivity : Activity() {
         box.addView(subtitle)
         box.addView(input)
         box.addView(button)
+        box.addView(buttonRow)
         box.addView(statusText)
         root.addView(box, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
@@ -166,6 +177,74 @@ class MainActivity : Activity() {
             prefs.edit().putString("host", text).apply()
             connect(host, port)
         }
+        scanButton.setOnClickListener { launchQrScan() }
+        findButton.setOnClickListener { showDiscoveryDialog() }
+    }
+
+    // MARK: 扫码
+
+    private fun launchQrScan() {
+        val intent = com.journeyapps.barcodescanner.ScanContract().createIntent(
+            this,
+            com.journeyapps.barcodescanner.ScanOptions().apply {
+                setPrompt("对准 Mac 菜单栏二维码（显示连接二维码…）")
+                setBeepEnabled(false)
+                setDesiredBarcodeFormats(com.journeyapps.barcodescanner.ScanOptions.QR_CODE)
+            })
+        qrActivityResult.launch(intent)
+    }
+
+    private val qrActivityResult = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val content = com.journeyapps.barcodescanner.ScanContract().parseResult(result.resultCode, result.data)?.contents
+        if (content.isNullOrBlank()) return@registerForActivityResult
+        val cleaned = content.removePrefix("hyperdisplay://").trim()
+        val (host, port) = parseEndpoint(cleaned) ?: run {
+            statusText.text = "二维码内容无法识别：$content"
+            return@registerForActivityResult
+        }
+        getPreferences(MODE_PRIVATE).edit().putString("host", "$host:$port").apply()
+        connect(host, port)
+    }
+
+    // MARK: 局域网发现
+
+    private val nsdFinder by lazy { NsdFinder(this) }
+    private var discoveryDialog: android.app.AlertDialog? = null
+
+    private fun showDiscoveryDialog() {
+        nsdFinder.setCallbacks(
+            onStart = { statusText.text = "正在搜索局域网内的 Mac…" },
+            onHost = { rebuildDiscoveryDialog() },
+            onStop = { error ->
+                statusText.text = error ?: "发现已停止"
+                discoveryDialog?.dismiss()
+            }
+        )
+        nsdFinder.startDiscovery()
+        rebuildDiscoveryDialog()
+    }
+
+    private fun rebuildDiscoveryDialog() {
+        discoveryDialog?.dismiss()
+        val hosts = nsdFinder.currentHosts()
+        val items = if (hosts.isEmpty()) {
+            arrayOf("搜索中…（确认 Mac 正在运行且同一 WiFi）")
+        } else {
+            hosts.map { "${it.name}\n${it.host}:${it.port}" }.toTypedArray()
+        }
+        discoveryDialog = android.app.AlertDialog.Builder(this)
+            .setTitle("局域网设备")
+            .setItems(items) { _, which ->
+                nsdFinder.stopDiscovery()
+                hosts.getOrNull(which)?.let { connect(it.host, it.port) }
+            }
+            .setNegativeButton("取消") { d, _ ->
+                nsdFinder.stopDiscovery()
+                d.dismiss()
+            }
+            .show()
     }
 
     private fun parseEndpoint(text: String): Pair<String, Int>? {
@@ -196,6 +275,9 @@ class MainActivity : Activity() {
             }
             override fun onKeyframeNeeded(reason: String) {
                 session?.requestKeyframe()
+            }
+            override fun onNackKeyframeFragments(frameId: Int, missing: List<Int>) {
+                session?.sendNack(frameId, missing)
             }
         })
         showSessionView()
