@@ -8,18 +8,20 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 
 /**
- * 全屏渲染 SurfaceView + 流内容几何。
- * 流内容按宽高比 aspect-fit 到视图（居中 letterbox）；触摸只接受落在内容区内的点。
+ * 单个虚拟屏的渲染视图（分屏模式下每块屏一个实例）。
+ * 流内容按宽高比 aspect-fit 到视图；触摸只接受落在内容区内的点。
  */
 class StreamView(context: Context) : SurfaceView(context), SurfaceHolder.Callback {
+    var displayId = -1
     @Volatile var streamWidth = 0f
     @Volatile var streamHeight = 0f
-    var onSurfaceReady: ((Surface) -> Unit)? = null
-    var onSurfaceDestroyed: (() -> Unit)? = null
-    var onTouch: ((MotionEvent) -> Boolean)? = null
+    var onSurfaceReady: ((Int, Surface) -> Unit)? = null
+    var onSurfaceDestroyed: ((Int) -> Unit)? = null
+    var onTouch: ((Int, MotionEvent) -> Boolean)? = null
 
     init {
         holder.addCallback(this)
+        holder.setKeepScreenOn(true)
     }
 
     fun updateStreamSize(w: Int, h: Int) {
@@ -28,7 +30,6 @@ class StreamView(context: Context) : SurfaceView(context), SurfaceHolder.Callbac
         holder.setFixedSize(w, h) // SurfaceView 缓冲 = 流原生分辨率，缩放交给合成器
     }
 
-    /** 流内容在视图坐标里的显示矩形 */
     fun contentRect(): RectF? {
         if (streamWidth <= 0 || streamHeight <= 0) return null
         val vw = width.toFloat()
@@ -40,7 +41,6 @@ class StreamView(context: Context) : SurfaceView(context), SurfaceHolder.Callbac
         return RectF((vw - w) / 2f, (vh - h) / 2f, (vw + w) / 2f, (vh + h) / 2f)
     }
 
-    /** 视图坐标 → 流坐标；越界返回 null */
     fun viewToStream(x: Float, y: Float): FloatArray? {
         val rect = contentRect() ?: return null
         if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return null
@@ -50,17 +50,19 @@ class StreamView(context: Context) : SurfaceView(context), SurfaceHolder.Callbac
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        return onTouch?.invoke(event) ?: false
+        val id = displayId
+        if (id < 0) return false
+        return onTouch?.invoke(id, event) ?: false
     }
 
     // SurfaceHolder.Callback
     override fun surfaceCreated(holder: SurfaceHolder) { }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        onSurfaceReady?.invoke(holder.surface)
+        onSurfaceReady?.invoke(displayId, holder.surface)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        onSurfaceDestroyed?.invoke()
+        onSurfaceDestroyed?.invoke(displayId)
     }
 }

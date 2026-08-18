@@ -112,7 +112,7 @@ enum CheckMode {
 
 struct Client {
     let addr: sockaddr_in
-    var displayId: CGDirectDisplayID
+    var displayIds: Set<CGDirectDisplayID> // 单屏=1个元素；分屏=多个
     var lastSeen: Date
 }
 
@@ -178,15 +178,17 @@ final class DisplayStream {
             onConfig: { [weak self] config in
                 guard let self else { return }
                 let codec = self.encoder?.codec ?? .hevc
+                let did = UInt16(self.display.displayID & 0xFFFF)
                 for var addr in self.host?.addressesOfSubscribers(of: self.display.displayID) ?? [] {
-                    self.udp.send(to: &addr, Wire.config(codec: codec.rawValue, frameId: self.frameId, paramSets: config))
+                    self.udp.send(to: &addr, Wire.config(codec: codec.rawValue, displayId: did, frameId: self.frameId, paramSets: config))
                 }
             },
             onFrame: { [weak self] keyframe, payload in
                 guard let self else { return }
                 self.frameId &+= 1
                 let addresses = self.host?.addressesOfSubscribers(of: self.display.displayID) ?? []
-                let frags = Wire.videoFrags(frameId: self.frameId, keyframe: keyframe, payload: payload)
+                let did = UInt16(self.display.displayID & 0xFFFF)
+                let frags = Wire.videoFrags(displayId: did, frameId: self.frameId, keyframe: keyframe, payload: payload)
                 if keyframe {
                     fragLock.lock()
                     self.keyframeFragments[self.frameId] = frags
@@ -246,7 +248,8 @@ final class DisplayStream {
 
     func sendWelcome(codec: VideoEncoder.Codec? = nil) {
         let c = codec ?? encoder?.codec ?? .hevc
-        let data = Wire.welcome(codec: c.rawValue, width: display.pixelWidth, height: display.pixelHeight, fps: fps)
+        let did = UInt16(display.displayID & 0xFFFF)
+        let data = Wire.welcome(codec: c.rawValue, displayId: did, width: display.pixelWidth, height: display.pixelHeight, fps: fps)
         for var addr in host?.addressesOfSubscribers(of: display.displayID) ?? [] {
             udp.send(to: &addr, data)
         }
@@ -398,7 +401,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
         displayOrder.removeAll { $0 == id }
         clientsLock.lock()
         for key in clients.keys {
-            if clients[key]?.displayId == id { clients[key]?.displayId = displayOrder.first ?? 0 }
+            clients[key]?.displayIds.remove(id)
         }
         clientsLock.unlock()
     }
@@ -419,18 +422,24 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
         switch packet {
         case .hello(let proto, let cw, let ch):
-            let target = clients[key]?.displayId ?? (displayOrder.first ?? 0)
+            let existing = clients[key]?.displayIds
+            let targets = (existing?.isEmpty == false) ? existing! : Set([displayOrder.first].compactMap { $0 })
             clientsLock.lock()
-            clients[key] = Client(addr: addr, displayId: target, lastSeen: Date())
+            clients[key] = Client(addr: addr, displayIds: targets, lastSeen: Date())
             clientsLock.unlock()
             NSLog("[hyperdisplay] HELLO proto=\(proto) client=\(cw)x\(ch) from \(addressString(addr))")
             pushDisplays()
-            subscribe(key: key, displayId: target)
+            for id in targets { subscribe(key: key, displayId: id) }
 
         case .selectDisplay(let id):
             guard streams[CGDirectDisplayID(id)] != nil else { break }
             pushDisplays()
-            subscribe(key: key, displayId: CGDirectDisplayID(id))
+            setSubscriptions(key: key, ids: [CGDirectDisplayID(id)])
+
+        case .subscribeDisplays(let ids):
+            let valid = ids.compactMap { CGDirectDisplayID(exactly: $0) }.filter { streams[$0] != nil }
+            guard !valid.isEmpty else { break }
+            setSubscriptions(key: key, ids: Set(valid))
 
         case .createDisplay(let w, let h, let name):
             let id = createDisplay(width: Int(w), height: Int(h), name: name.isEmpty ? nextDisplayName() : name)
@@ -443,39 +452,48 @@ final class HostApp: NSObject, NSApplicationDelegate {
             guard streams.count > 1 else { break }
             destroyDisplay(id: CGDirectDisplayID(id))
             pushDisplays()
-            if let fallback = displayOrder.first {
+            clientsLock.lock()
+            if clients[key]?.displayIds.isEmpty == true, let fallback = displayOrder.first {
+                clients[key]?.displayIds = [fallback]
+                clientsLock.unlock()
                 subscribe(key: key, displayId: fallback)
+            } else {
+                clientsLock.unlock()
             }
 
-        case .keyframeReq:
-            if let id = clients[key]?.displayId, let stream = streams[id] {
+        case .keyframeReq(let displayId):
+            if displayId == displayIdBroadcast {
+                for stream in streams.values {
+                    stream.requestKeyframeAndReplay()
+                }
+            } else if let stream = streams[CGDirectDisplayID(displayId)] {
                 stream.requestKeyframeAndReplay()
             }
 
-        case .nack(let frameId, let indices):
-            if let id = clients[key]?.displayId, let stream = streams[id] {
+        case .nack(let displayId, let frameId, let indices):
+            if let stream = streams[CGDirectDisplayID(displayId)] {
                 stream.handleNack(frameId: frameId, indices: indices, to: addr)
             }
 
-        case .inputMove(let seq, let x, let y):
-            if let id = clients[key]?.displayId, let stream = streams[id] {
+        case .inputMove(let displayId, let seq, let x, let y):
+            if let stream = streams[CGDirectDisplayID(displayId)] {
                 if loggedInputClients.insert(key).inserted {
-                    NSLog("[hyperdisplay] first input from \(addressString(addr)): move=(\(x), \(y)) display=\(id)")
+                    NSLog("[hyperdisplay] first input from \(addressString(addr)): move=(\(x), \(y)) display=\(displayId)")
                 }
                 stream.injector.move(x: Double(x), y: Double(y))
                 var a = addr
                 udp?.send(to: &a, Wire.inputAck(seq: seq))
             }
 
-        case .inputButton(let seq, let button, let down, let x, let y):
-            if let id = clients[key]?.displayId, let stream = streams[id] {
+        case .inputButton(let displayId, let seq, let button, let down, let x, let y):
+            if let stream = streams[CGDirectDisplayID(displayId)] {
                 stream.injector.button(button, down: down != 0, x: Double(x), y: Double(y))
                 var a = addr
                 udp?.send(to: &a, Wire.inputAck(seq: seq))
             }
 
-        case .inputWheel(let seq, let dx, let dy, let x, let y):
-            if let id = clients[key]?.displayId, let stream = streams[id] {
+        case .inputWheel(let displayId, let seq, let dx, let dy, let x, let y):
+            if let stream = streams[CGDirectDisplayID(displayId)] {
                 stream.injector.wheel(dx: Double(dx), dy: Double(dy), x: Double(x), y: Double(y))
                 var a = addr
                 udp?.send(to: &a, Wire.inputAck(seq: seq))
@@ -490,10 +508,23 @@ final class HostApp: NSObject, NSApplicationDelegate {
     private func subscribe(key: String, displayId: CGDirectDisplayID) {
         guard streams[displayId] != nil else { return }
         clientsLock.lock()
-        clients[key]?.displayId = displayId
+        clients[key]?.displayIds.insert(displayId)
         clientsLock.unlock()
         streams[displayId]?.startIfNeeded()
         streams[displayId]?.sendWelcome()
+    }
+
+    /// 单屏/分屏模式的订阅集整体切换
+    private func setSubscriptions(key: String, ids: Set<CGDirectDisplayID>) {
+        clientsLock.lock()
+        let removed = clients[key]?.displayIds.subtracting(ids) ?? []
+        clients[key]?.displayIds = ids
+        clientsLock.unlock()
+        for id in ids where streams[id] != nil {
+            streams[id]?.startIfNeeded()
+            streams[id]?.sendWelcome()
+        }
+        _ = removed // 移除的屏在 tick 中因无订阅者自动停流
     }
 
     private func pushDisplays() {
@@ -520,7 +551,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
     func addressesOfSubscribers(of displayId: CGDirectDisplayID) -> [sockaddr_in] {
         clientsLock.lock()
         defer { clientsLock.unlock() }
-        return clients.values.filter { $0.displayId == displayId }.map { $0.addr }
+        return clients.values.filter { $0.displayIds.contains(displayId) }.map { $0.addr }
     }
 
     // MARK: 周期 tick：统计 + 客户端 prune

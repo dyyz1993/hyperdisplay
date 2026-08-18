@@ -22,9 +22,9 @@ class HostSession private constructor(
     private val listener: Listener
 ) {
     interface Listener {
-        fun onWelcome(codec: Int, width: Int, height: Int, fps: Int)
-        fun onConfig(codec: Int, paramSets: ByteArray)
-        fun onVideoFragment(frameId: Int, fragIdx: Int, fragCount: Int, keyframe: Boolean, payload: ByteArray)
+        fun onWelcome(displayId: Int, codec: Int, width: Int, height: Int, fps: Int)
+        fun onConfig(displayId: Int, codec: Int, paramSets: ByteArray)
+        fun onVideoFragment(displayId: Int, frameId: Int, fragIdx: Int, fragCount: Int, keyframe: Boolean, payload: ByteArray)
         fun onDisplays(displays: List<DisplayInfo>)
         fun onLinkEvent(connected: Boolean)
     }
@@ -49,6 +49,8 @@ class HostSession private constructor(
         private const val TYPE_CREATE_DISPLAY = 0x15
         private const val TYPE_DESTROY_DISPLAY = 0x16
         private const val TYPE_NACK = 0x17
+        private const val TYPE_SUBSCRIBE_DISPLAYS = 0x18
+        private const val DISPLAY_ID_BROADCAST = 0xFFFF
         private const val PROTO_VERSION = 1
         private const val RETRANSMIT_MS = 40L
         private const val MAX_TRIES = 12
@@ -120,28 +122,34 @@ class HostSession private constructor(
                 val bb = ByteBuffer.wrap(buf, 0, len).order(ByteOrder.LITTLE_ENDIAN)
                 when (buf[0].toInt() and 0xFF) {
                     TYPE_WELCOME -> {
-                        val proto = buf[5].toInt() and 0xFF
-                        val codec = buf[6].toInt() and 0xFF
-                        val w = bb.getShort(7).toInt() and 0xFFFF
-                        val h = bb.getShort(9).toInt() and 0xFFFF
-                        val fps = buf[11].toInt() and 0xFF
-                        if (proto == PROTO_VERSION) listener.onWelcome(codec, w, h, fps)
+                        // [displayId u16][proto u8][codec u8][w u16][h u16][fps u8]
+                        val displayId = bb.getShort(5).toInt() and 0xFFFF
+                        val proto = buf[7].toInt() and 0xFF
+                        val codec = buf[8].toInt() and 0xFF
+                        val w = bb.getShort(9).toInt() and 0xFFFF
+                        val h = bb.getShort(11).toInt() and 0xFFFF
+                        val fps = buf[13].toInt() and 0xFF
+                        if (proto == PROTO_VERSION) listener.onWelcome(displayId, codec, w, h, fps)
                     }
                     TYPE_CONFIG -> {
-                        val codec = buf[5].toInt() and 0xFF
-                        val paramLen = bb.getShort(6).toInt() and 0xFFFF
-                        if (len >= 8 + paramLen) {
-                            listener.onConfig(codec, buf.copyOfRange(8, 8 + paramLen))
+                        // [displayId u16][codec u8][len u16][bytes]
+                        val displayId = bb.getShort(5).toInt() and 0xFFFF
+                        val codec = buf[7].toInt() and 0xFF
+                        val paramLen = bb.getShort(8).toInt() and 0xFFFF
+                        if (len >= 10 + paramLen) {
+                            listener.onConfig(displayId, codec, buf.copyOfRange(10, 10 + paramLen))
                         }
                     }
                     TYPE_VIDEO_FRAG -> {
+                        // [displayId u16][fragIdx u16][fragCount u16][flags u8][payload]
                         val frameId = bb.getInt(1)
-                        val fragIdx = bb.getShort(5).toInt() and 0xFFFF
-                        val fragCount = bb.getShort(7).toInt() and 0xFFFF
-                        val flags = buf[9].toInt() and 0xFF
-                        val payloadStart = 10
+                        val displayId = bb.getShort(5).toInt() and 0xFFFF
+                        val fragIdx = bb.getShort(7).toInt() and 0xFFFF
+                        val fragCount = bb.getShort(9).toInt() and 0xFFFF
+                        val flags = buf[11].toInt() and 0xFF
+                        val payloadStart = 12
                         if (len > payloadStart && fragIdx < fragCount && fragCount < 4096) {
-                            listener.onVideoFragment(frameId, fragIdx, fragCount, flags and 1 == 1,
+                            listener.onVideoFragment(displayId, frameId, fragIdx, fragCount, flags and 1 == 1,
                                 buf.copyOfRange(payloadStart, len))
                         }
                     }
@@ -254,27 +262,37 @@ class HostSession private constructor(
         send(packet)
     }
 
-    fun sendMove(x: Float, y: Float) {
-        val body = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
-            .put(0).putFloat(x).putFloat(y).array()
+    fun sendMove(displayId: Int, x: Float, y: Float) {
+        val body = ByteBuffer.allocate(11).order(ByteOrder.LITTLE_ENDIAN)
+            .putShort(displayId.toShort()).put(0).putFloat(x).putFloat(y).array()
         send(buildPacket(TYPE_INPUT, inputSeq.getAndIncrement(), body))
     }
 
-    fun sendButton(button: Int, down: Boolean, x: Float, y: Float) {
-        val body = ByteBuffer.allocate(11).order(ByteOrder.LITTLE_ENDIAN)
-            .put(1).put(button.toByte()).put(if (down) 1 else 0.toByte())
+    fun sendButton(displayId: Int, button: Int, down: Boolean, x: Float, y: Float) {
+        val body = ByteBuffer.allocate(13).order(ByteOrder.LITTLE_ENDIAN)
+            .putShort(displayId.toShort()).put(1).put(button.toByte()).put(if (down) 1 else 0.toByte())
             .putFloat(x).putFloat(y).array()
         sendReliable(body)
     }
 
-    fun sendWheel(dx: Float, dy: Float, x: Float, y: Float) {
-        val body = ByteBuffer.allocate(17).order(ByteOrder.LITTLE_ENDIAN)
-            .put(2).putFloat(dx).putFloat(dy).putFloat(x).putFloat(y).array()
+    fun sendWheel(displayId: Int, dx: Float, dy: Float, x: Float, y: Float) {
+        val body = ByteBuffer.allocate(19).order(ByteOrder.LITTLE_ENDIAN)
+            .putShort(displayId.toShort()).put(2).putFloat(dx).putFloat(dy).putFloat(x).putFloat(y).array()
         sendReliable(body)
     }
 
-    fun requestKeyframe() {
-        send(buildPacket(TYPE_KEYFRAME_REQ, pingSeq.getAndIncrement()))
+    /** displayId < 0 = 请求全部屏 */
+    fun requestKeyframe(displayId: Int = -1) {
+        val id = if (displayId < 0) DISPLAY_ID_BROADCAST else displayId
+        val body = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort(id.toShort()).array()
+        send(buildPacket(TYPE_KEYFRAME_REQ, pingSeq.getAndIncrement(), body))
+    }
+
+    fun sendSubscribeDisplays(ids: List<Int>) {
+        val body = ByteBuffer.allocate(1 + ids.size * 4).order(ByteOrder.LITTLE_ENDIAN)
+            .put(ids.size.toByte())
+        for (id in ids) body.putInt(id)
+        send(buildPacket(TYPE_SUBSCRIBE_DISPLAYS, 0, body.array()))
     }
 
     fun selectDisplay(id: Int) {
@@ -295,9 +313,9 @@ class HostSession private constructor(
         send(buildPacket(TYPE_DESTROY_DISPLAY, 0, body))
     }
 
-    fun sendNack(frameId: Int, indices: List<Int>) {
-        val body = ByteBuffer.allocate(6 + indices.size * 2).order(ByteOrder.LITTLE_ENDIAN)
-            .putInt(frameId).putShort(indices.size.toShort())
+    fun sendNack(displayId: Int, frameId: Int, indices: List<Int>) {
+        val body = ByteBuffer.allocate(8 + indices.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+            .putShort(displayId.toShort()).putInt(frameId).putShort(indices.size.toShort())
         for (i in indices) body.putShort(i.toShort())
         send(buildPacket(TYPE_NACK, 0, body.array()))
     }
