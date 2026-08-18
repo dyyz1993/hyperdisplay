@@ -53,7 +53,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         var lastRendered = 0
         var renderedNow = 0
         var stallTicks = 0
-        var lastRenderedCheck = 0
+        var stallDecoderRef: VideoDecoder? = null
+        var stallInputBase = 0L
+        var stallOutputBase = 0
     }
 
     private val pipelines = LinkedHashMap<Int, DisplayPipeline>()
@@ -92,24 +94,37 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             }
             renderFps = total
             for (p in snapshot) p.assembler?.stallCheck()
-            // 解码器死亡检测：有关键帧交付但输出 3 秒不涨 → MediaCodec 内部停摆，重建
-            val stallNow = System.currentTimeMillis()
+            // 解码器死亡检测：仅在「有输入提交但输出 3 秒不涨」时重建——
+            // 静止桌面（内容驱动、无新帧）下输出冻结是合法状态，不能误杀
             for (p in snapshot) {
                 val d = p.decoder
-                if (d != null && p.renderedNow == p.lastRenderedCheck) {
-                    p.stallTicks++
-                    if (p.stallTicks >= 3 && p.lastKeyframeDeliveredAt > 0
-                        && stallNow - p.lastKeyframeDeliveredAt < 25000) { // GOP 最长 20s，窗口须覆盖
-                        Log.w(TAG, "decoder stall detected, rebuilding display=${'$'}{p.id}")
-                        p.decoder = null
-                        d.release()
+                if (d != null) {
+                    val input = d.snapshotInputCount()
+                    val output = d.renderedFrames
+                    if (d !== p.stallDecoderRef) {
+                        p.stallDecoderRef = d
+                        p.stallInputBase = input
+                        p.stallOutputBase = output
                         p.stallTicks = 0
-                        maybeStartDecoder(p)
+                    } else if (output == p.stallOutputBase && input > p.stallInputBase) {
+                        p.stallTicks++
+                        if (p.stallTicks >= 3) {
+                            Log.w(TAG, "decoder dead (input growing, no output), rebuilding display=" + p.id)
+                            p.decoder = null
+                            d.release()
+                            p.stallDecoderRef = null
+                            p.stallTicks = 0
+                            maybeStartDecoder(p)
+                        }
+                    } else {
+                        p.stallTicks = 0
                     }
+                    p.stallInputBase = input
+                    p.stallOutputBase = output
                 } else {
+                    p.stallDecoderRef = null
                     p.stallTicks = 0
                 }
-                p.lastRenderedCheck = p.renderedNow
             }
             val s = session
             if (s != null && linkUp) {
@@ -348,6 +363,14 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             mainHandler.post {
                 displays = list
                 pendingRegions?.let { tryFulfillPendingLayout() }
+                // 连接初期（单屏默认）：DISPLAYS 首次到达时视图还没建——
+                // 默认订阅第一块屏并立即建渲染区，否则永远灰屏
+                if (regionViews.isEmpty() && pendingRegions == null && list.isNotEmpty()) {
+                    if (subscribedIds.isEmpty()) {
+                        subscribedIds = listOf(list.first().id)
+                    }
+                    rebuildRegionViews()
+                }
                 updateDisplayButton()
             }
         }

@@ -18,7 +18,19 @@
 - **csd 完整性防御**：CONFIG 走不可靠通道，坏参数集（起始码校验不过）直接丢弃。
 - 菜单栏诚实显示：每屏「实测fps · 生效/目标码率 · 采集百分比 · 客户端数」。
 
-## ⚠ 未决：M5 改动后端到端渲染回归（灰屏）
+## ✅ 回归已修复（2026-08-19 追记，根因三连）
+
+二分定位（M4 client×M5 host / M5 client×M4 host 交叉测试 + 码流 ffmpeg 校验 + 屏幕像素统计）：
+
+| # | 根因 | 修复 |
+|---|---|---|
+| 1 | 客户端重写后**普通连接不建渲染视图**（DISPLAYS 到达时无人调 rebuildRegionViews；M4 验证走了分屏路径掩盖了它） | onDisplays 首次到达即默认订阅+建视图 |
+| 2 | M5 死亡检测**误杀健康解码器**（静止桌面输出合法冻结被当死亡→重建循环→灰） | 仅「输入在涨且输出冻结 3s」才重建 |
+| 3 | **DataRateLimits [bitrate/2, 1] 超紧限制**：VideoToolbox 产出的流 ffmpeg 可解、华为硬解输出全零 YUV（屏幕纯绿，像素 0,72,0 实测） | 恢复 [bitrate×2, 1]；AIMD 运行中只调 AverageBitRate 不动 DataRateLimits |
+
+修复后真机实测：壁纸正确渲染（像素校验）、**动态 49fps**、AIMD 保留生效。
+
+## 原「未决」记录（留档）
 
 现象：真机与模拟器均出现「链路 OK、WELCOME 正常、delta 帧在收（waitingForKeyframe
 丢弃日志可见）、NACK 在补、host 关键帧在编」，但画面纯灰、0 fps、部分会话 app 自身

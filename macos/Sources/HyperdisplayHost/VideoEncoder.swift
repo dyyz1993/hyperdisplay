@@ -85,7 +85,7 @@ final class VideoEncoder {
             kVTCompressionPropertyKey_AllowFrameReordering: false,
             kVTCompressionPropertyKey_AverageBitRate: Int(bitrate),
             // 突发上限 2×（原 6× 会让大关键帧冲到 ~800KB/728 分片，WiFi 丢 1 片即整帧报废）
-            kVTCompressionPropertyKey_DataRateLimits: [Int(bitrate) / 2, 1] as [NSNumber], // 限突发：IDR 体积上限≈bitrate/16，弱网可完整送达+NACK 可补
+            kVTCompressionPropertyKey_DataRateLimits: [Int(bitrate) * 2, 1] as [NSNumber],
             kVTCompressionPropertyKey_ExpectedFrameRate: fps,
             kVTCompressionPropertyKey_MaxKeyFrameInterval: fps * 10,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 10,
@@ -141,9 +141,8 @@ final class VideoEncoder {
         }
         lock.unlock()
         let clamped = max(1_000_000, bitrate)
+        // 只调平均码率：运行中同时改 DataRateLimits 曾产生华为硬解输出全零的流（绿屏）
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: Int(clamped) as CFTypeRef)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits,
-                             value: [Int(clamped) / 2, 1] as [NSNumber] as CFArray)
         requestKeyframe()
         NSLog("[hyperdisplay] bitrate -> \(clamped / 1000)kbps")
     }

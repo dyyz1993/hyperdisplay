@@ -35,6 +35,7 @@ class VideoDecoder(
     private var ptsIndex = 0L
     @Volatile var renderedFrames: Int = 0
         private set
+    @Volatile private var inputSubmitted = 0L
 
     fun start() {
         // KEY_CSD_0 在部分 SDK 中不对外导出，直接用其稳定字面值 "csd-0"
@@ -61,6 +62,9 @@ class VideoDecoder(
         queue.offer(frame)
     }
 
+    /** 供死亡检测用：累计提交进解码器的帧数 */
+    fun snapshotInputCount(): Long = inputSubmitted
+
     fun release() {
         running.set(false)
         try { thread.join(500) } catch (_: InterruptedException) { }
@@ -79,6 +83,7 @@ class VideoDecoder(
                 val frame = queue.poll(10, TimeUnit.MILLISECONDS)
                 if (frame != null) {
                     statInput++
+                    inputSubmitted++
                     val inIdx = codec.dequeueInputBuffer(10)
                     if (inIdx >= 0) {
                         statInputOk++
