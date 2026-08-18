@@ -476,6 +476,11 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             setTextColor(Color.WHITE)
             setBackgroundColor(0x66000000)
             setPadding(12, 6, 12, 6)
+            // 绿屏逃生口：华为硬解偶发坏会话（流正常但输出全零），长按重建全部解码器即恢复
+            setOnLongClickListener {
+                bounceAllDecoders()
+                true
+            }
         }
         root.addView(overlay, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START))
@@ -746,8 +751,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             }
         }
 
-        // 8 个缩放手柄：四角 + 四边中点（web 端样式：小白方块、仅选中时可见）
-        val hd = (13 * resources.displayMetrics.density).toInt()
+        // 8 个缩放手柄：四角 + 四边中点（web 端样式：小白方块；触摸热区 44dp 全在窗口内，
+        // 避免点手柄时手指落到窗外被「点外部=取消选中」吃掉）
+        val touchD = (44 * resources.displayMetrics.density).toInt()
+        val visualD = (12 * resources.displayMetrics.density).toInt()
         fun handleGravity(role: String): Int = when (role) {
             "TL" -> Gravity.TOP or Gravity.START
             "TR" -> Gravity.TOP or Gravity.END
@@ -759,15 +766,17 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             else -> Gravity.END or Gravity.CENTER_VERTICAL
         }
         for (role in listOf("TL", "TR", "BL", "BR", "T", "B", "L", "R")) {
-            val h = View(this).apply {
+            // 热区容器（44dp，透明）+ 居中的 12dp 视觉小方块
+            val h = FrameLayout(this).apply { visibility = View.GONE }
+            val dot = View(this).apply {
                 background = android.graphics.drawable.GradientDrawable().apply {
                     setColor(0xFFFFFFFF.toInt())
                     setStroke(2, 0xFF1565C0.toInt())
                     cornerRadius = 3f
                 }
-                visibility = View.GONE
             }
-            val hlp = FrameLayout.LayoutParams(hd, hd, handleGravity(role))
+            h.addView(dot, FrameLayout.LayoutParams(visualD, visualD, Gravity.CENTER))
+            val hlp = FrameLayout.LayoutParams(touchD, touchD, handleGravity(role))
             root.addView(h, hlp)
             pipHandles.add(h)
             h.setOnTouchListener(object : View.OnTouchListener {
@@ -1154,6 +1163,18 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
+    /** 重建全部解码管线（等效重启 app 的解码部分，不丢布局/连接） */
+    private fun bounceAllDecoders() {
+        val s = session ?: return
+        val ids = subscribedIds.toList()
+        if (ids.isEmpty()) return
+        resetPipelines()
+        rebuildRegionViews()
+        s.sendSubscribeDisplays(ids)
+        for (id in ids) s.requestKeyframe(id)
+        Log.i(TAG, "decoder bounce: " + ids.joinToString())
+    }
+
     // MARK: 状态
 
     private fun updateOverlay() {
@@ -1165,7 +1186,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val p = pipelines.values.firstOrNull()
             if (p != null && p.width > 0) "${p.width}x${p.height}" else "?"
         }
-        overlay.text = "$renderFps fps · $screens · $link · 返回键断开"
+        overlay.text = "$renderFps fps · $screens · $link · 长按修复画面"
     }
 
     /** 状态落盘：锁屏/无屏环境下的可观测通道（adb pull 验证用） */
