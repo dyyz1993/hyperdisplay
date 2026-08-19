@@ -74,7 +74,15 @@ class HostSession private constructor(
         receiveBufferSize = 4 shl 20
         sendBufferSize = 1 shl 20
     }
+    // USB 隧道模式：连 127.0.0.1 走 adb reverse 的 TCP（帧格式 [len u32][payload]），
+    // Mac 侧 usb-tunnel.py 桥接回 host 的 UDP。WiFi 版平板没有原生 USB 网络共享的替代。
+    private val useTcpTunnel = address.hostAddress == "127.0.0.1"
+    @Volatile private var tcpSocket: java.net.Socket? = null
+    @Volatile private var tcpOut: java.io.OutputStream? = null
+    private val tcpFrames = longArrayOf(0, 0, 0, 0, 0) // total/welcome/video/config/pong
     @Volatile private var running = true
+    @Volatile private var threadLinkUp = false
+    @Volatile private var lastPongAt = System.currentTimeMillis()
     private val inputSeq = AtomicInteger(1)
     private val pingSeq = AtomicInteger(1)
 
@@ -87,12 +95,87 @@ class HostSession private constructor(
     private val pendingAcks = ConcurrentHashMap<Int, Pending>()
 
     private val thread = Thread({
+        if (useTcpTunnel) {
+            try {
+                val s = java.net.Socket()
+                s.tcpNoDelay = true
+                // adb reverse 的监听绑在 IPv6（::）上，必须连 ::1 而不是 127.0.0.1
+                val v6 = java.net.InetAddress.getByAddress(
+                    byteArrayOf(0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1))
+                s.connect(java.net.InetSocketAddress(v6, port), 3000)
+                s.soTimeout = 500 // 读超时驱动心跳周期任务
+                tcpSocket = s
+                tcpOut = s.getOutputStream()
+            } catch (e: Exception) {
+                Log.e(TAG, "tcp tunnel connect failed: ${e.javaClass.simpleName}: ${e.message}")
+                running = false
+                listener.onLinkEvent(false)
+                return@Thread
+            }
+        }
         socket.soTimeout = 200
         sendHello()
         var lastPingAt = 0L
-        var linkUp = false
-        var lastPongAt = System.currentTimeMillis()
         val buf = ByteArray(65_536)
+        if (useTcpTunnel) {
+            // TCP 隧道接收循环
+            val inp = tcpSocket?.getInputStream() ?: ByteArray(0).inputStream()
+            val fbuf = ByteArray(65536 + 8)
+            var acc = 0
+            try {
+                while (running) {
+                    val n = try {
+                        inp.read(fbuf, acc, fbuf.size - acc)
+                    } catch (e: java.net.SocketTimeoutException) {
+                        // 心跳与重连（与 UDP 循环同职责）
+                        val now = System.currentTimeMillis()
+                        send(buildPacket(TYPE_PING, pingSeq.getAndIncrement()))
+                        val pongAge = now - lastPongAt
+                        if (threadLinkUp && pongAge > 5000) {
+                            threadLinkUp = false
+                            listener.onLinkEvent(false)
+                            sendHello()
+                        }
+                        if (!threadLinkUp && pongAge > 2500) {
+                            sendHello()
+                            lastPongAt = now
+                        }
+                        continue
+                    }
+                    if (n < 0) break
+                    acc += n
+                    while (acc >= 4) {
+                        val ln = ((fbuf[0].toInt() and 0xFF) or
+                            ((fbuf[1].toInt() and 0xFF) shl 8) or
+                            ((fbuf[2].toInt() and 0xFF) shl 16) or
+                            ((fbuf[3].toInt() and 0xFF) shl 24))
+                        if (ln <= 0 || ln > 65536) { acc = 0; break }
+                        if (acc < 4 + ln) break
+                        val pkt = fbuf.copyOfRange(4, 4 + ln)
+                        System.arraycopy(fbuf, 4 + ln, fbuf, 0, acc - 4 - ln)
+                        acc -= 4 + ln
+                        tcpFrames[0]++
+                        if (tcpFrames[0] <= 6) {
+                            Log.i(TAG, "tcpframe#" + tcpFrames[0] + " type=" + (pkt[0].toInt() and 0xFF) + " len=" + ln)
+                        } else if ((pkt[0].toInt() and 0xFF) == 0x02 && tcpFrames[2] < 3) {
+                            Log.i(TAG, "firstvideofrag len=" + ln + " did=" +
+                                ((pkt[5].toInt() and 0xFF) or ((pkt[6].toInt() and 0xFF) shl 8)))
+                        }
+                        when (pkt[0].toInt() and 0xFF) {
+                            0x01 -> tcpFrames[1]++
+                            0x02 -> tcpFrames[2]++
+                            0x03 -> tcpFrames[3]++
+                            0x06 -> tcpFrames[4]++
+                        }
+                        dispatch(pkt, ln)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "tcp read loop died: ${e.javaClass.simpleName}: ${e.message}")
+            }
+            Log.i(TAG, "tcp frames: total=${tcpFrames[0]} welcome=${tcpFrames[1]} video=${tcpFrames[2]} config=${tcpFrames[3]} pong=${tcpFrames[4]}")
+            if (running) { running = false; listener.onLinkEvent(false) }
+        }
         while (running) {
             val now = System.currentTimeMillis()
             // 心跳 / 掉线重连（host 重启后靠重复 HELLO 重新入会）
@@ -101,12 +184,12 @@ class HostSession private constructor(
                 send(buildPacket(TYPE_PING, pingSeq.getAndIncrement()))
             }
             val pongAge = now - lastPongAt
-            if (linkUp && pongAge > 5000) {
-                linkUp = false
+            if (threadLinkUp && pongAge > 5000) {
+                threadLinkUp = false
                 listener.onLinkEvent(false)
                 sendHello()
             }
-            if (!linkUp && pongAge < 4000 && now - lastPongAt > 2500) {
+            if (!threadLinkUp && pongAge < 4000 && now - lastPongAt > 2500) {
                 // 未连通时低频重试 HELLO
                 sendHello()
                 lastPongAt = now
@@ -119,8 +202,20 @@ class HostSession private constructor(
                 socket.receive(packet)
                 val len = packet.length
                 if (len < 5) continue
-                val bb = ByteBuffer.wrap(buf, 0, len).order(ByteOrder.LITTLE_ENDIAN)
-                when (buf[0].toInt() and 0xFF) {
+                dispatch(buf.copyOf(len), len)
+            } catch (_: java.net.SocketTimeoutException) {
+                // 周期循环继续
+            } catch (e: Exception) {
+                if (running) Log.e(TAG, "receive failed", e)
+            }
+        }
+        socket.close()
+    }, "hyperdisplay-session")
+
+    private fun dispatch(pkt: ByteArray, len: Int) {
+        val buf = pkt
+        val bb = ByteBuffer.wrap(buf, 0, buf.size).order(ByteOrder.LITTLE_ENDIAN)
+        when (buf[0].toInt() and 0xFF) {
                     TYPE_WELCOME -> {
                         // [displayId u16][proto u8][codec u8][w u16][h u16][fps u8]
                         val displayId = bb.getShort(5).toInt() and 0xFFFF
@@ -176,21 +271,14 @@ class HostSession private constructor(
                         pendingAcks.remove(seq)
                     }
                     TYPE_PONG -> {
-                        if (!linkUp) {
-                            linkUp = true
+                        if (!threadLinkUp) {
+                            threadLinkUp = true
                             listener.onLinkEvent(true)
                         }
                         lastPongAt = System.currentTimeMillis()
                     }
-                }
-            } catch (_: java.net.SocketTimeoutException) {
-                // 周期循环继续
-            } catch (e: Exception) {
-                if (running) Log.e(TAG, "receive failed", e)
-            }
         }
-        socket.close()
-    }, "hyperdisplay-session")
+    }
 
     fun start() {
         thread.start()
@@ -202,6 +290,7 @@ class HostSession private constructor(
         try { thread.join(500) } catch (_: InterruptedException) {}
         sendHandler.removeCallbacksAndMessages(null)
         sendThread.quitSafely()
+        try { tcpSocket?.close() } catch (_: Exception) { }
         socket.close()
     }
 
@@ -221,7 +310,15 @@ class HostSession private constructor(
         sendHandler.post {
             if (!running) return@post
             try {
-                socket.send(DatagramPacket(packet, packet.size, address, port))
+                val out = tcpOut
+                if (useTcpTunnel && out != null) {
+                    val frame = ByteBuffer.allocate(4 + packet.size).order(ByteOrder.LITTLE_ENDIAN)
+                        .putInt(packet.size).put(packet).array()
+                    out.write(frame)
+                    out.flush()
+                } else {
+                    socket.send(DatagramPacket(packet, packet.size, address, port))
+                }
             } catch (e: Exception) {
                 if (running) Log.w(TAG, "send failed: ${e.javaClass.simpleName}: ${e.message}")
             }

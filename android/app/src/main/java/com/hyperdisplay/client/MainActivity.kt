@@ -210,12 +210,14 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val button = Button(this).apply { text = "连接" }
         val scanButton = Button(this).apply { text = "扫码连接" }
         val findButton = Button(this).apply { text = "局域网发现" }
+        val usbButton = Button(this).apply { text = "USB 连线" }
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
         buttonRow.addView(scanButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         buttonRow.addView(findButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        buttonRow.addView(usbButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         statusText = TextView(this).apply {
             text = ""
             textSize = 13f
@@ -245,6 +247,11 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
         scanButton.setOnClickListener { launchQrScan() }
         findButton.setOnClickListener { showDiscoveryDialog() }
+        usbButton.setOnClickListener {
+            // USB 隧道：adb reverse 把 127.0.0.1:5280 经 USB 线转到 Mac 的隧道桥
+            statusText.text = "USB 隧道连接中…（需插线且 Mac 侧桥接在运行）"
+            connect("127.0.0.1", 5280)
+        }
     }
 
     private fun parseEndpoint(text: String): Pair<String, Int>? {
