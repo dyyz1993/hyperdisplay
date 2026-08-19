@@ -44,7 +44,9 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         cfg.height = height
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
         cfg.queueDepth = 3
-        cfg.showsCursor = true
+        // 系统光标不进画面：光标反馈由客户端本地绘制（零延迟），
+        // 否则光标要经 采集→编码→传输→解码 一整圈（50-80ms），手感明显拖沓
+        cfg.showsCursor = false
         cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         cfg.capturesAudio = false
 

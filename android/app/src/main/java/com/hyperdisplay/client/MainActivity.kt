@@ -83,6 +83,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var pendingRegions: List<Pair<Int, Int>>? = null
     private var displays: List<HostSession.DisplayInfo> = emptyList()
     private var configButton: Button? = null
+    private var localCursor: LocalCursorView? = null
     private var pipRoot: FrameLayout? = null
     private var pipLeft = -1
     private var pipTop = -1
@@ -655,7 +656,20 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END))
         configButton = cfgBtn
 
+        // 本地光标层（最顶层）：手指位置零延迟反馈
+        val cursor = LocalCursorView(this)
+        root.addView(cursor, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        localCursor = cursor
+
         rebuildRegionViews()
+    }
+
+    /** 把子视图内坐标换算为窗口坐标（本地光标用） */
+    private fun windowPos(view: View, x: Float, y: Float): FloatArray {
+        val loc = IntArray(2)
+        view.getLocationInWindow(loc)
+        return floatArrayOf(loc[0] + x, loc[1] + y)
     }
 
     private fun screenDims(): Pair<Int, Int> {
@@ -1281,6 +1295,17 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     private fun handleTouch(displayId: Int, view: StreamView, event: MotionEvent) {
         val s = session ?: return
+        // 本地光标：手指位置零延迟反馈（远程画面不再含系统光标）
+        val lc = localCursor
+        if (lc != null) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
+                    val w = windowPos(view, event.x, event.y)
+                    lc.moveTo(w[0], w[1])
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> lc.hide()
+            }
+        }
         // 画中画处于选中（编辑）态时，第一次点其他区域=退出选中，不透传给 Mac
         if (pipSelected && event.actionMasked == MotionEvent.ACTION_DOWN && pipRoot != null) {
             pipRoot?.let { setPipSelected(it, false) }
@@ -1385,6 +1410,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         renderFps = 0
         statsOverlay = null
         configButton = null
+        localCursor = null
         pipRoot = null
         displays = emptyList()
         subscribedIds = emptyList()
