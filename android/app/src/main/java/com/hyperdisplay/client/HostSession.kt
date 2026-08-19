@@ -52,6 +52,7 @@ class HostSession private constructor(
         private const val TYPE_DESTROY_DISPLAY = 0x16
         private const val TYPE_NACK = 0x17
         private const val TYPE_SUBSCRIBE_DISPLAYS = 0x18
+        private const val TYPE_RECYCLE = 0x19
         private const val DISPLAY_ID_BROADCAST = 0xFFFF
         private const val PROTO_VERSION = 1
         private const val RETRANSMIT_MS = 40L
@@ -402,6 +403,11 @@ class HostSession private constructor(
         val id = if (displayId < 0) DISPLAY_ID_BROADCAST else displayId
         val body = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort(id.toShort()).array()
         send(buildPacket(TYPE_KEYFRAME_REQ, pingSeq.getAndIncrement(), body))
+    }
+
+    /** 请求 host 整体回收流/屏（编码器池归零——切布局前调用，防绿屏流） */
+    fun sendRecycle() {
+        send(buildPacket(TYPE_RECYCLE, 0))
     }
 
     fun sendSubscribeDisplays(ids: List<Int>) {

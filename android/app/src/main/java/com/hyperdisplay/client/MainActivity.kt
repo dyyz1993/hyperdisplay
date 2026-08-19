@@ -1299,15 +1299,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             return
         }
         pendingRegions = regionSizes(cfg)
-        val regions = pendingRegions!!
-        // 按唯一尺寸计数补建（同尺寸多块也正确）
-        for (size in regions.toSet()) {
-            val need = regions.count { it == size }
-            val have = displays.count { (it.width to it.height) == size }
-            repeat((need - have).coerceAtLeast(0)) {
-                s.createDisplay(size.first, size.second, "布局 ${'$'}{size.first}x${'$'}{size.second}")
-            }
-        }
+        // 先让 host 整体回收编码器池（防坏流），回收后的 DISPLAYS 触发补建
+        s.sendRecycle()
         updateConfigButton(); updateOverlay()
     }
 
@@ -1315,6 +1308,14 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private fun tryFulfillPendingLayout() {
         val regions = pendingRegions ?: return
         val s = session ?: return
+        // 先按缺口补建（RECYCLE 后通常全缺；幂等，凑齐前每轮 DISPLAYS 重复检查）
+        for (size in regions.toSet()) {
+            val need = regions.count { it == size }
+            val have = displays.count { (it.width to it.height) == size }
+            repeat((need - have).coerceAtLeast(0)) {
+                s.createDisplay(size.first, size.second, "布局 ${'$'}{size.first}x${'$'}{size.second}")
+            }
+        }
         val matched = mutableListOf<Int>()
         val usedIds = mutableSetOf<Int>()
         for (region in regions) {

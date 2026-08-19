@@ -591,6 +591,14 @@ final class HostApp: NSObject, NSApplicationDelegate {
         case .ping(let seq):
             var a = addr
             udp?.send(to: &a, Wire.pong(seq: seq))
+
+        case .recycle:
+            // 客户端要换布局：整体回收流/屏（VideoToolbox 会话经反复建销会产出
+            // 华为硬解渲染为全零绿的流；切布局前归零 = 每次布局都是干净编码池）
+            NSLog("[hyperdisplay] recycle requested by client — rebuilding all streams/displays")
+            didIdleReset = true
+            fullIdleReset()
+            pushDisplays()
         }
     }
 
