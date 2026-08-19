@@ -58,6 +58,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         var stallInputBase = 0L
         var stallOutputBase = 0
         var deadTicks = 0 // csd 已到但零渲染的持续秒数（华为坏会话自动恢复用）
+        var decoderAgeTicks = 0   // 解码器已存活 tick 数（绿屏取证调度用）
+        var greenChecks = 0       // 已执行的绿屏取证次数（上限后交给手动）
     }
 
     private val pipelines = LinkedHashMap<Int, DisplayPipeline>()
@@ -151,20 +153,30 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     p.stallTicks = 0
                 }
             }
-            // 坏解码器自动恢复：csd 已到但持续 6 秒零渲染（华为硬解坏会话=绿屏）——
-            // 自动重建一次；若重建后仍死则不再自动（避免循环），留给长按手动修复
+            // 坏解码器自动恢复（两种形态）：
+            // a) 零渲染型：csd 已到但 6 秒零渲染
+            // b) 绿屏型：解码器「正常渲染」但输出全零 YUV（华为坏会话）——渲染计数无法
+            //    发现，必须画面取证：PixelCopy 采样三点，识别 (r<30, 45<g<110, b<30)
+            //    且均匀的特征绿。两种都在解码器启动后第 5/12/19 秒各查一次，最多三轮。
             for (p in snapshot) {
                 val d = p.decoder
+                if (d == null) { p.deadTicks = 0; p.decoderAgeTicks = 0; continue }
+                p.decoderAgeTicks++
                 if (d != null && p.csd != null && p.renderedNow == 0) {
                     p.deadTicks++
                     if (p.deadTicks == 6) {
-                        Log.w(TAG, "dead decoder (0 renders with csd), auto-bounce display=" + p.id)
+                        Log.w(TAG, "dead decoder (0 renders), auto-bounce display=" + p.id)
                         p.decoder = null
                         d.release()
                         maybeStartDecoder(p)
+                        continue
                     }
                 } else {
                     p.deadTicks = 0
+                }
+                if (p.decoderAgeTicks in listOf(5, 12, 19) && p.csd != null) {
+                    val view = regionViews.firstOrNull { it.displayId == p.id }
+                    if (view != null) detectGreenAndBounce(view, p)
                 }
             }
             val s = session
@@ -682,6 +694,45 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         localCursor = cursor
 
         rebuildRegionViews()
+    }
+
+    /** 绿屏取证：PixelCopy 采三点，特征绿（全零 YUV）→ 重建该屏解码器 */
+    private fun detectGreenAndBounce(view: StreamView, p: DisplayPipeline) {
+        p.greenChecks++
+        val w = view.width; val h = view.height
+        if (w <= 0 || h <= 0) return
+        val points = listOf(w / 4 to h / 4, w / 2 to h / 2, 3 * w / 4 to 3 * h / 4)
+        val results = java.util.concurrent.atomic.AtomicInteger(0)
+        var sampled = java.util.concurrent.atomic.AtomicInteger(0)
+        for ((px, py) in points) {
+            val rect = android.graphics.Rect(px - 2, py - 1, px + 2, py + 1)
+            val bmp = android.graphics.Bitmap.createBitmap(4, 2, android.graphics.Bitmap.Config.ARGB_8888)
+            try {
+                android.view.PixelCopy.request(view, rect, bmp, { _ ->
+                    sampled.incrementAndGet()
+                    var greens = 0
+                    for (i in 0 until 8) {
+                        val c = bmp.getPixel(i % 4, i / 4)
+                        val r = android.graphics.Color.red(c); val g = android.graphics.Color.green(c); val b = android.graphics.Color.blue(c)
+                        if (r < 30 && g in 45..110 && b < 30) greens++
+                    }
+                    if (greens >= 7) results.incrementAndGet()
+                }, mainHandler)
+            } catch (_: Exception) { sampled.incrementAndGet() }
+        }
+        mainHandler.postDelayed({
+            if (results.get() >= 2) {
+                Log.w(TAG, "GREEN detected (pixel forensics), auto-bounce display=" + p.id +
+                    " check#" + p.greenChecks)
+                val d = p.decoder
+                if (d != null) {
+                    p.decoder = null
+                    d.release()
+                    maybeStartDecoder(p)
+                    session?.requestKeyframe(p.id)
+                }
+            }
+        }, 400)
     }
 
     /** 把子视图内坐标换算为窗口坐标（本地光标用） */
