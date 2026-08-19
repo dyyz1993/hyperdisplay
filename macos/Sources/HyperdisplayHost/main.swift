@@ -596,10 +596,22 @@ final class HostApp: NSObject, NSApplicationDelegate {
                         NSLog("[hyperdisplay] device \(deviceId) reconnected → recreated \(profile.name) \(profile.w)x\(profile.h) id=\(id)")
                     }
                 } else {
-                    // 新档案直接存 16 对齐尺寸（与 createDisplay 建屏口径一致，重连匹配恒命中）
+                    // 新档案存 16 对齐 + 舒适上限尺寸（与 createDisplay 建屏口径一致，重连匹配恒命中）。
+                    // 舒适上限：原生 2800 级面板（~252PPI）上 macOS 按原生像素渲染 → 菜单栏/
+                    // 图标/文字只有常规大小的 ~60%，用户观感"画面很小"。长边 >1920 时等比
+                    // 收缩到 1920：保持设备宽高比（客户端 aspect-fit 无拉伸），UI 回归正常
+                    // 大小，且关键帧体积/编码负载随之大降（2800x1840 → 1920x1264）。
                     let aw = max(640, (Int(cw) + 15) & ~15)
                     let ah = max(480, (Int(ch) + 15) & ~15)
-                    deviceProfiles[deviceId] = (aw, ah, "Hyperdisplay 设备 \(deviceId % 10000)")
+                    let pw: Int, ph: Int
+                    if max(aw, ah) > 1920 {
+                        let scale = 1920.0 / Double(max(aw, ah))
+                        pw = max(640, (Int(Double(aw) * scale) + 15) & ~15)
+                        ph = max(480, (Int(Double(ah) * scale) + 15) & ~15)
+                    } else {
+                        pw = aw; ph = ah
+                    }
+                    deviceProfiles[deviceId] = (pw, ph, "Hyperdisplay 设备 \(deviceId % 10000)")
                 }
             }
             // 目标屏：档案屏优先（剪枝后重入会也能回到自己的屏——setSubscriptions 对

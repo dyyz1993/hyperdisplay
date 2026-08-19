@@ -585,6 +585,24 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         override fun onDisplays(list: List<HostSession.DisplayInfo>) {
             mainHandler.post {
                 displays = list
+                // 对账：host 重启/屏回收后 display id 会整体换代。已订阅的 id 若全部
+                // 不在新列表里（UI 已有视图时选屏器不会重跑），解码器将绑死死 id、
+                // 丢弃全部视频分片且关键帧请求被 host 静默忽略——永久 idle-wait 冻屏。
+                val liveIds = list.map { it.id }.toSet()
+                val validSubs = subscribedIds.filter { it in liveIds }
+                if (validSubs.size != subscribedIds.size && list.isNotEmpty()) {
+                    if (validSubs.isEmpty()) {
+                        subscribedIds = listOf(list.first().id)
+                        recycledSingle = false
+                        resetPipelines()
+                        rebuildRegionViews()
+                        session?.selectDisplay(subscribedIds.first())
+                        session?.requestKeyframe(subscribedIds.first())
+                    } else {
+                        subscribedIds = validSubs
+                        session?.sendSubscribeDisplays(validSubs)
+                    }
+                }
                 pendingRegions?.let { tryFulfillPendingLayout() }
                 // 连接初期（单屏默认）：DISPLAYS 首次到达时视图还没建——
                 // 默认订阅第一块屏并立即建渲染区，否则永远灰屏
@@ -606,9 +624,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                         val dh = minOf(m.widthPixels, m.heightPixels)
                         val prefs = getSharedPreferences("hyperdisplay", MODE_PRIVATE)
                         val myDisplay = prefs.getInt("myDisplayId", -1)
-                        // 优先级：我的屏（持久化，跨重启/重连一致）> 与设备分辨率一致的屏 > first()
+                        // 优先级：我的屏（持久化，跨重启/重连一致）> 与设备宽高比最接近的屏
+                        // > first()。注意必须取「最接近」而非「第一个低于阈值」——否则
+                        // 1920x1200 初始屏(Δ0.078)会抢在 1920x1264 设备档案屏(Δ0.003)前被选中
+                        val devAspect = dw.toFloat() / dh.toFloat()
                         val pick = list.firstOrNull { it.id == myDisplay }
-                            ?: list.firstOrNull { kotlin.math.abs(it.width.toFloat() / it.height - dw.toFloat() / dh) < 0.08f }
+                            ?: list.minByOrNull { kotlin.math.abs(it.width.toFloat() / it.height - devAspect) }
                             ?: list.first()
                         val wantNative = pick.width.toFloat() / pick.height.let { it.toFloat() } !=
                                 dw.toFloat() / dh.toFloat() &&
