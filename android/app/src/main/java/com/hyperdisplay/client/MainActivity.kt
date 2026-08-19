@@ -352,7 +352,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private fun openSession(host: String, port: Int) {
         disconnectSession()
         val code = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
-        val s = HostSession.create(host, port, sessionListener, code)
+        val deviceId = HostSession.loadOrCreateDeviceId(this)
+        val s = HostSession.create(host, port, sessionListener, code, deviceId)
         if (s == null) {
             transport = Transport.WIFI
             showConnectView()
@@ -603,15 +604,26 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                         val m = Resources.getSystem().displayMetrics
                         val dw = maxOf(m.widthPixels, m.heightPixels)
                         val dh = minOf(m.widthPixels, m.heightPixels)
-                        val first = list.first()
-                        val deviceAspect = dw.toFloat() / dh
-                        val screenAspect = first.width.toFloat() / first.height
-                        if (kotlin.math.abs(deviceAspect - screenAspect) < 0.08f || subscribedIds.isNotEmpty()) {
-                            if (subscribedIds.isEmpty()) subscribedIds = listOf(first.id)
+                        val prefs = getSharedPreferences("hyperdisplay", MODE_PRIVATE)
+                        val myDisplay = prefs.getInt("myDisplayId", -1)
+                        // 优先级：我的屏（持久化，跨重启/重连一致）> 与设备分辨率一致的屏 > first()
+                        val pick = list.firstOrNull { it.id == myDisplay }
+                            ?: list.firstOrNull { kotlin.math.abs(it.width.toFloat() / it.height - dw.toFloat() / dh) < 0.08f }
+                            ?: list.first()
+                        val wantNative = pick.width.toFloat() / pick.height.let { it.toFloat() } !=
+                                dw.toFloat() / dh.toFloat() &&
+                                kotlin.math.abs(pick.width.toFloat() / pick.height - dw.toFloat() / dh) >= 0.08f
+                        if (!wantNative || list.any { it.id == myDisplay }) {
+                            subscribedIds = listOf(pick.id)
+                            prefs.edit().putInt("myDisplayId", pick.id).apply()
                             rebuildRegionViews()
+                            // host 已按设备档案代订阅（setSubscriptions）；仅当本地选择与
+                            // host 视图不一致时才发 SELECT（避免覆盖回默认屏）
+                            if (pick.id != myDisplay) {
+                                session?.selectDisplay(pick.id)
+                            }
                         } else {
-                            // 默认屏与设备比例不符（如手机 2340×1080 vs 默认 1920×1200）：
-                            // 自动按设备原生尺寸建屏——像素 1:1 无变形（这才是副屏的正确形态）
+                            // 没有匹配设备比例的屏：按设备原生尺寸建（像素 1:1），建好即订阅
                             pendingRegions = listOf(dw to dh)
                             tryFulfillPendingLayout()
                         }

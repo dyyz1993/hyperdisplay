@@ -376,9 +376,14 @@ final class HostApp: NSObject, NSApplicationDelegate {
     private var clients: [String: Client] = [:]
     private let clientsLock = NSLock()
     private var permissionsGranted = false
+    private var currentDeviceId: UInt32 = 0
     private var displaySerial = 0
     private var loggedInputClients = Set<String>()
     private var didIdleReset = false
+    /// 设备档案：deviceId → (宽, 高, 名称, 上次位置)。重连时按档案复建同一块屏
+    /// （同分辨率同名），macOS 会把窗口按原摆放恢复——「这台设备就是这块显示器」。
+    private var deviceProfiles: [UInt32: (w: Int, h: Int, name: String)] = [:]
+    private var lastDeviceDisplays: [UInt32: (w: Int, h: Int)] = [:]
     /// 配对码：阻止局域网内任意设备连接（不校验则任何人都可看屏+控鼠标）
     let pairingCode: UInt32 = {
         let defaults = UserDefaults.standard
@@ -489,6 +494,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
             host: self, udp: udp)
         streams[vd.displayID] = stream
         displayOrder.append(vd.displayID)
+        if currentDeviceId != 0 {
+            deviceProfiles[currentDeviceId] = (width, height, name)
+        }
         return vd.displayID
     }
 
@@ -520,10 +528,29 @@ final class HostApp: NSObject, NSApplicationDelegate {
         clientsLock.unlock()
 
         switch packet {
-        case .hello(let proto, let cw, let ch, let code):
+        case .hello(let proto, let cw, let ch, let code, let deviceId):
             guard code == pairingCode else {
                 NSLog("[hyperdisplay] HELLO from \(addressString(addr)) REJECTED (bad pairing code)")
                 return
+            }
+            currentDeviceId = deviceId
+            // 设备档案：优先复用既有同尺寸屏（连续性），否则建一块并记住
+            if deviceId != 0 {
+                if let profile = deviceProfiles[deviceId] {
+                    if let existing = streams.first(where: { $0.value.display.pixelWidth == profile.w && $0.value.display.pixelHeight == profile.h })?.key {
+                        NSLog("[hyperdisplay] device \(deviceId) reconnected → reusing display \(existing) (\(profile.w)x\(profile.h))")
+                        _ = existing
+                    } else if let id = createDisplay(width: profile.w, height: profile.h, name: profile.name) {
+                        NSLog("[hyperdisplay] device \(deviceId) reconnected → recreated \(profile.name) \(profile.w)x\(profile.h) id=\(id)")
+                    }
+                    // 直接订阅档案屏：客户端单屏默认选 displays.first()（默认屏），
+                    // 不会主动挑档案屏——服务端代选，一步到位
+                    if let target = streams.first(where: { $0.value.display.pixelWidth == profile.w && $0.value.display.pixelHeight == profile.h })?.key {
+                        setSubscriptions(key: key, ids: [target])
+                    }
+                } else {
+                    deviceProfiles[deviceId] = (Int(cw), Int(ch), "Hyperdisplay 设备 \(deviceId % 10000)")
+                }
             }
             let existing = clients[key]?.displayIds
             let targets = (existing?.isEmpty == false) ? existing! : Set([displayOrder.first].compactMap { $0 })

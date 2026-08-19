@@ -20,7 +20,8 @@ class HostSession private constructor(
     private val address: InetAddress,
     private val port: Int,
     private val listener: Listener,
-    private val pairingCode: Int
+    private val pairingCode: Int,
+    private val deviceId: Int
 ) {
     interface Listener {
         fun onCursor(displayId: Int, x: Float, y: Float) // did=0=光标离开虚拟屏（隐藏）
@@ -37,6 +38,17 @@ class HostSession private constructor(
 
     companion object {
         private const val TAG = "HostSession"
+
+        /** 设备指纹：安装后恒定（host 据此复建同一块屏） */
+        fun loadOrCreateDeviceId(ctx: android.content.Context): Int {
+            val prefs = ctx.getSharedPreferences("hyperdisplay", android.content.Context.MODE_PRIVATE)
+            var id = prefs.getInt("deviceId", 0)
+            if (id == 0) {
+                id = java.util.Random().nextInt(Int.MAX_VALUE - 1) + 1
+                prefs.edit().putInt("deviceId", id).apply()
+            }
+            return id
+        }
         private const val TYPE_WELCOME = 0x01
         private const val TYPE_VIDEO_FRAG = 0x02
         private const val TYPE_CONFIG = 0x03
@@ -60,13 +72,13 @@ class HostSession private constructor(
         private const val MAX_TRIES = 12
         private const val PING_INTERVAL_MS = 1500L
 
-        fun create(host: String, port: Int, listener: Listener, code: Int = 0): HostSession? {
+        fun create(host: String, port: Int, listener: Listener, code: Int = 0, deviceId: Int = 0): HostSession? {
             return try {
                 // M1 只支持数字 IPv4，避免主线程 DNS 解析
                 val parts = host.split(".").map { it.toInt() }
                 require(parts.size == 4 && parts.all { it in 0..255 })
                 val addr = InetAddress.getByAddress(parts.map { it.toByte() }.toByteArray())
-                HostSession(addr, port, listener, code)
+                HostSession(addr, port, listener, code, deviceId)
             } catch (e: Exception) {
                 Log.e(TAG, "invalid host address: $host", e)
                 null
@@ -351,9 +363,9 @@ class HostSession private constructor(
         val w = maxOf(metrics.widthPixels, metrics.heightPixels)
         val h = minOf(metrics.widthPixels, metrics.heightPixels)
         // [proto u8][w u16][h u16][code u32]——host 校验配对码，错误即拒绝
-        val body = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
+        val body = ByteBuffer.allocate(13).order(ByteOrder.LITTLE_ENDIAN)
             .put(PROTO_VERSION.toByte()).putShort(w.toShort()).putShort(h.toShort())
-            .putInt(pairingCode).array()
+            .putInt(pairingCode).putInt(deviceId).array()
         send(buildPacket(TYPE_HELLO, 0, body))
     }
 
