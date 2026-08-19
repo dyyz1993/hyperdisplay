@@ -174,7 +174,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 } else {
                     p.deadTicks = 0
                 }
-                if (p.decoderAgeTicks in listOf(5, 12, 19) && p.csd != null) {
+                if (p.decoderAgeTicks in listOf(3, 8, 15) && p.csd != null) {
                     val view = regionViews.firstOrNull { it.displayId == p.id }
                     if (view != null) detectGreenAndBounce(view, p)
                 }
@@ -565,7 +565,15 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 pendingRegions?.let { tryFulfillPendingLayout() }
                 // 连接初期（单屏默认）：DISPLAYS 首次到达时视图还没建——
                 // 默认订阅第一块屏并立即建渲染区，否则永远灰屏
-                if (regionViews.isEmpty() && pendingRegions == null && list.isNotEmpty()) {
+                if (recycledSingle && list.isNotEmpty()) {
+                    recycledSingle = false
+                    val first = list.first().id
+                    subscribedIds = listOf(first)
+                    resetPipelines()
+                    rebuildRegionViews()
+                    session?.selectDisplay(first)
+                    session?.requestKeyframe(first)
+                } else if (regionViews.isEmpty() && pendingRegions == null && list.isNotEmpty()) {
                     if (layoutConfig.kind != LayoutKind.SINGLE) {
                         // 重连/换通道后恢复之前的布局（画中画/分屏）
                         applyLayout(layoutConfig)
@@ -722,17 +730,31 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
         mainHandler.postDelayed({
             if (results.get() >= 2) {
-                Log.w(TAG, "GREEN detected (pixel forensics), auto-bounce display=" + p.id +
-                    " check#" + p.greenChecks)
-                val d = p.decoder
-                if (d != null) {
-                    p.decoder = null
-                    d.release()
-                    maybeStartDecoder(p)
-                    session?.requestKeyframe(p.id)
-                }
+                Log.w(TAG, "GREEN detected (pixel forensics), recover display=" + p.id +
+                    " check#" + p.greenChecks + " recoveries=" + greenRecoveries)
+                recoverFromGreen()
             }
         }, 400)
+    }
+
+    private var greenRecoveries = 0
+    private var recycledSingle = false
+
+    /** 绿屏自动恢复（慢路径，最多两次）：RECYCLE host 编码池 + 按当前布局重建。
+     *  只 bounce 解码器救不了——坏流来自 host 侧编码会话污染。 */
+    private fun recoverFromGreen() {
+        val s = session ?: return
+        if (greenRecoveries >= 2) {
+            Log.w(TAG, "green recoveries exhausted — leaving manual (long-press)")
+            return
+        }
+        greenRecoveries++
+        s.sendRecycle()
+        if (layoutConfig.kind == LayoutKind.SINGLE) {
+            recycledSingle = true
+        } else {
+            pendingRegions = regionSizes(layoutConfig)
+        }
     }
 
     /** 把子视图内坐标换算为窗口坐标（本地光标用） */
@@ -1279,6 +1301,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private fun applyLayout(cfg: LayoutConfig) {
         val s = session ?: return
         layoutConfig = cfg
+        greenRecoveries = 0
         if (cfg.kind == LayoutKind.SINGLE) {
             pendingRegions = null
             val first = displays.firstOrNull()?.id
@@ -1299,8 +1322,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             return
         }
         pendingRegions = regionSizes(cfg)
-        // 先让 host 整体回收编码器池（防坏流），回收后的 DISPLAYS 触发补建
-        s.sendRecycle()
+        // 快路径：不回收，直接补建（RECYCLE 全量回收要 2-3 秒，只在绿屏时才走——见 recoverFromGreen）
+        tryFulfillPendingLayout()
         updateConfigButton(); updateOverlay()
     }
 

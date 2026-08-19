@@ -76,7 +76,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
             if attempt == 0 {
                 NSLog("[hyperdisplay] waiting for display %u to appear in SCShareableContent...", displayID)
             }
-            try await Task.sleep(nanoseconds: 250_000_000)
+            try await Task.sleep(nanoseconds: 100_000_000)
         }
         throw HostError("virtual display \(displayID) never appeared in SCShareableContent")
     }
