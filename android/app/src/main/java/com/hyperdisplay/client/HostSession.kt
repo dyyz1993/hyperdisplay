@@ -301,7 +301,16 @@ class HostSession private constructor(
                         pendingAcks.remove(seq)
                     }
                     TYPE_PONG -> {
-                        if (!threadLinkUp) {
+                        // 尾字节（老 host 无此字节则按 known）：host 是否仍认得本来源。
+                        // USB 桥接按连接分配 UDP 源端口，host 按 ip:port 记账——端口漂移/
+                        // 客户端被剪枝后，PONG 仍在回但视频早已停供。见 unknown 立即
+                        // 重 HELLO（带设备档案，host 会重建/重订阅虚拟屏），静默自愈不闪 UI。
+                        val known = buf.size < 6 || (buf[5].toInt() and 0xFF) != 0
+                        if (!known && threadLinkUp) {
+                            Log.w(TAG, "host forgot this session (unknown pong) — re-HELLO")
+                            sendHello()
+                        }
+                        if (known && !threadLinkUp) {
                             threadLinkUp = true
                             listener.onLinkEvent(true)
                         }

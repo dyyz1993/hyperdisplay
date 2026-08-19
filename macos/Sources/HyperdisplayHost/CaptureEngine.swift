@@ -17,6 +17,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private var statusCounts: [Int: Int] = [:]
     private var loggedEvents = 0
     private(set) var buffersSeen: UInt64 = 0
+    /// 最近一次收到任意 SCK 事件（含 idle）的时间：供停流看门狗判断流是否静默
+    private(set) var lastEventAt: Date?
 
     /// 把最近一帧重新送编码（配合 force keyframe），用于客户端中途加入/重连时
     /// 静态桌面不出新帧的场景——否则 PLI 永远等不到新源帧。
@@ -55,6 +57,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         try await stream.startCapture()
         lock.lock()
         self.stream = stream
+        lastEventAt = Date() // 起始锚点：刚启动时 idle 事件可能要几十 ms 才到
         lock.unlock()
         NSLog("[hyperdisplay] capture started for display %u (%dx%d@%d)", displayID, width, height, fps)
     }
@@ -94,6 +97,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         lock.lock()
         statusCounts[statusRaw, default: 0] += 1
+        lastEventAt = Date()
         if let pixelBuffer {
             lastFrame = pixelBuffer
             buffersSeen &+= 1

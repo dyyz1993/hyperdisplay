@@ -128,7 +128,7 @@ func addressString(_ addr: sockaddr_in) -> String {
             _ = getnameinfo(sa, socklen_t(MemoryLayout<sockaddr_in>.size), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
         }
     }
-    return String(cString: host)
+    return "\(String(cString: host)):\(CFSwapInt16BigToHost(addr.sin_port))"
 }
 
 // MARK: - 每块虚拟屏一路独立的 采集→编码→发送 会话
@@ -147,6 +147,7 @@ final class DisplayStream {
     private var lastKeyframeRequestAt = Date.distantPast
     private var starting = false
     private(set) var started = false
+    private var lastCaptureRestartAt = Date.distantPast
     private(set) var effectiveFps = 0
     private var encodedSnapshot: UInt64 = 0
     var idleSince: Date?          // 无订阅者起始时间（自动回收用）
@@ -180,17 +181,54 @@ final class DisplayStream {
         self.udp = udp
     }
 
+    private func wireCapture(_ capture: CaptureEngine) {
+        capture.onFrame = { [weak self] pixelBuffer in
+            self?.encoder?.encode(pixelBuffer: pixelBuffer)
+        }
+    }
+
+    /// SCK 停流看门狗：macOS 26 虚拟屏上 SCStream 会偶发永久静默（连 idle 事件都停发，
+    /// 实测会话开始 30s 内即可发生），客户端将冻在最后一帧且永不自愈。
+    /// 有订阅者但 2.5s 零事件 → 只重建采集流（编码器会话不动——重开 VideoToolbox
+    /// 会触发华为硬解绿屏），重启后等 idle 帧填充缓存再补关键帧（客户端仍显示
+    /// 旧帧，无黑闪）。
+    func restartCaptureIfNeeded(now: Date) {
+        guard started, !starting, let oldCapture = capture else { return }
+        guard host?.addressesOfSubscribers(of: display.displayID).isEmpty == false else { return }
+        guard let lastEvent = oldCapture.lastEventAt else { return }
+        let silent = now.timeIntervalSince(lastEvent)
+        guard silent > 2.5, now.timeIntervalSince(lastCaptureRestartAt) > 5 else { return }
+        lastCaptureRestartAt = now
+        NSLog("[hyperdisplay] capture watchdog: display \(display.displayID) silent \(Int(silent))s — restarting capture")
+        oldCapture.stop()
+        let capture = CaptureEngine()
+        wireCapture(capture)
+        self.capture = capture
+        let display = self.display
+        let scale = captureScale
+        let scaledW = max(640, Int(Double(display.pixelWidth) * scale))
+        let scaledH = max(480, Int(Double(display.pixelHeight) * scale))
+        let fps = self.fps
+        Task.detached { [weak self] in
+            do {
+                try await capture.start(displayID: display.displayID, width: scaledW, height: scaledH, fps: fps)
+                try await Task.sleep(nanoseconds: 300_000_000) // 等 idle 事件填充 lastFrame
+                await MainActor.run { self?.requestKeyframeAndReplay() }
+            } catch {
+                NSLog("[hyperdisplay] capture restart failed for display \(display.displayID): \(error)")
+            }
+        }
+    }
+
     func startIfNeeded() {
         guard !started, !starting else { return }
         starting = true
 
         let capture = CaptureEngine()
+        wireCapture(capture)
+        self.capture = capture
         let display = self.display
         let fps = self.fps
-        capture.onFrame = { [weak self] pixelBuffer in
-            self?.encoder?.encode(pixelBuffer: pixelBuffer)
-        }
-        self.capture = capture
 
         let encoder = VideoEncoder(
             onConfig: { [weak self] config in
@@ -554,14 +592,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 if let profile = deviceProfiles[deviceId] {
                     if let existing = streams.first(where: { $0.value.display.pixelWidth == profile.w && $0.value.display.pixelHeight == profile.h })?.key {
                         NSLog("[hyperdisplay] device \(deviceId) reconnected → reusing display \(existing) (\(profile.w)x\(profile.h))")
-                        _ = existing
                     } else if let id = createDisplay(width: profile.w, height: profile.h, name: profile.name) {
                         NSLog("[hyperdisplay] device \(deviceId) reconnected → recreated \(profile.name) \(profile.w)x\(profile.h) id=\(id)")
-                    }
-                    // 直接订阅档案屏：客户端单屏默认选 displays.first()（默认屏），
-                    // 不会主动挑档案屏——服务端代选，一步到位
-                    if let target = streams.first(where: { $0.value.display.pixelWidth == profile.w && $0.value.display.pixelHeight == profile.h })?.key {
-                        setSubscriptions(key: key, ids: [target])
                     }
                 } else {
                     // 新档案直接存 16 对齐尺寸（与 createDisplay 建屏口径一致，重连匹配恒命中）
@@ -570,8 +602,17 @@ final class HostApp: NSObject, NSApplicationDelegate {
                     deviceProfiles[deviceId] = (aw, ah, "Hyperdisplay 设备 \(deviceId % 10000)")
                 }
             }
-            let existing = clients[key]?.displayIds
-            let targets = (existing?.isEmpty == false) ? existing! : Set([displayOrder.first].compactMap { $0 })
+            // 目标屏：档案屏优先（剪枝后重入会也能回到自己的屏——setSubscriptions 对
+            // 不存在的客户端是空操作，不能依赖它），其次既有订阅，最后默认屏
+            var targets: Set<CGDirectDisplayID> = []
+            if deviceId != 0, let profile = deviceProfiles[deviceId],
+               let t = streams.first(where: { $0.value.display.pixelWidth == profile.w && $0.value.display.pixelHeight == profile.h })?.key {
+                targets = [t]
+            } else if let e = clients[key]?.displayIds, !e.isEmpty {
+                targets = e
+            } else if let first = displayOrder.first {
+                targets = [first]
+            }
             clientsLock.lock()
             clients[key] = Client(addr: addr, displayIds: targets, lastSeen: Date())
             clientsLock.unlock()
@@ -648,8 +689,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
             }
 
         case .ping(let seq):
+            clientsLock.lock()
+            let known = clients[key]?.displayIds.isEmpty == false
+            clientsLock.unlock()
             var a = addr
-            udp?.send(to: &a, Wire.pong(seq: seq))
+            udp?.send(to: &a, Wire.pong(seq: seq, known: known))
 
         case .recycle:
             // 客户端要换布局：整体回收流/屏（VideoToolbox 会话经反复建销会产出
@@ -757,6 +801,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 if stream.idleSince == nil { stream.idleSince = now }
             } else {
                 stream.idleSince = nil
+                stream.restartCaptureIfNeeded(now: now)
             }
         }
         // 闲置回收：60s 无人订阅且还留有其他屏 → 销毁（含初始配置屏——

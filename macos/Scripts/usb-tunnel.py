@@ -22,6 +22,10 @@ UDP_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 5277
 
 def serve(conn, peer):
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # 2800x1840 关键帧 ≈ 220KB / 200 分片在 8ms 突发到达：默认接收缓冲（~78KB）
+    # 会被冲爆、内核静默丢片，客户端永远凑不齐帧也不发 NACK（首片即丢）。
+    # 4MB 足够整帧落地，由 sendall 向 USB 侧匀速排空。
+    udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
     udp.bind(("127.0.0.1", 0))
     print(f"tunnel client {peer} udp_src={udp.getsockname()[1]}", flush=True)
 

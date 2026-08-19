@@ -138,8 +138,14 @@ enum Wire {
         Data(header(.inputAck, seq: seq))
     }
 
-    static func pong(seq: UInt32) -> Data {
-        Data(header(.pong, seq: seq))
+    static func pong(seq: UInt32, known: Bool) -> Data {
+        // 尾字节 known 标志：host 是否仍认得这个来源（有活跃订阅）。USB 桥接每条 TCP
+        // 连接独立 UDP 源端口，客户端身份按 ip:port 记账——端口漂移/误剪枝后，
+        // 无条件回 PONG 会让客户端永远以为会话健在、实则早已无人供流（冻屏）。
+        // 客户端见 unknown 即重发 HELLO 重新入会。
+        var d = Data(header(.pong, seq: seq))
+        d.append(known ? 1 : 0)
+        return d
     }
 
     // MARK: client→host
