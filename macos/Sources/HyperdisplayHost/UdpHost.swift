@@ -55,7 +55,11 @@ final class UdpHost {
 
     private func receiveLoop() {
         var buffer = [UInt8](repeating: 0, count: 65_536)
+        var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
         while true {
+            // poll 等待代替非阻塞盲收——否则空闲时整核空转（实测曾吃满 100% CPU）
+            let rc = poll(&pfd, 1, 500)
+            if rc <= 0 { continue }
             var from = sockaddr_in()
             var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
             let n = withUnsafeMutablePointer(to: &from) { fromPtr -> Int in
@@ -63,7 +67,7 @@ final class UdpHost {
                     recvfrom(fd, &buffer, buffer.count, 0, saPtr, &fromLen)
                 }
             }
-            if n <= 0 { continue } // EAGAIN / EINTR / ECONNREFUSED 均忽略，继续收
+            if n <= 0 { continue } // EAGAIN / EINTR / ECONNREFUSED 均忽略
             let data = Data(bytes: buffer, count: n)
             if let packet = Wire.parse(data) {
                 onPacket?(packet, from)
