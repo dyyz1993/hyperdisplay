@@ -265,6 +265,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             setText(prefs.getString("host", ""))
             textSize = 16f
         }
+        val codeInput = EditText(this).apply {
+            hint = "配对码（Mac 菜单栏 ◧ 里查看，6 位数字）"
+            setText(if (prefs.getInt("pairingCode", 0) > 0) prefs.getInt("pairingCode", 0).toString() else "")
+            textSize = 16f
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        }
         val button = Button(this).apply { text = "连接" }
         val scanButton = Button(this).apply { text = "扫码连接" }
         val findButton = Button(this).apply { text = "局域网发现" }
@@ -286,6 +292,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         box.addView(title)
         box.addView(subtitle)
         box.addView(input)
+        box.addView(codeInput)
         box.addView(button)
         box.addView(buttonRow)
         box.addView(statusText)
@@ -303,6 +310,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     return@setOnClickListener
                 }
                 prefs.edit().putString("host", text).apply()
+                saveCode(codeInput.text.toString().trim())
                 connect(host, port)
             } else {
                 smartConnect()
@@ -315,6 +323,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             statusText.text = "USB 隧道连接中…（需插线且 Mac 侧桥接在运行）"
             connect("127.0.0.1", 5280)
         }
+    }
+
+    private fun saveCode(text: String) {
+        text.toIntOrNull()?.let { getPreferences(MODE_PRIVATE).edit().putInt("pairingCode", it).apply() }
     }
 
     private fun parseEndpoint(text: String): Pair<String, Int>? {
@@ -339,7 +351,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     /** 建立会话（连接页与自动重连共用） */
     private fun openSession(host: String, port: Int) {
         disconnectSession()
-        val s = HostSession.create(host, port, sessionListener)
+        val code = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
+        val s = HostSession.create(host, port, sessionListener, code)
         if (s == null) {
             transport = Transport.WIFI
             showConnectView()
@@ -455,7 +468,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     ) { result ->
         val content = com.journeyapps.barcodescanner.ScanContract().parseResult(result.resultCode, result.data)?.contents
         if (content.isNullOrBlank()) return@registerForActivityResult
-        val cleaned = content.removePrefix("hyperdisplay://").trim()
+        var cleaned = content.removePrefix("hyperdisplay://").trim()
+        val hash = cleaned.indexOf('#')
+        if (hash >= 0) {
+            saveCode(cleaned.substring(hash + 1).trim())
+            cleaned = cleaned.substring(0, hash).trim()
+        }
         val (host, port) = parseEndpoint(cleaned) ?: run {
             statusText.text = "二维码内容无法识别：$content"
             return@registerForActivityResult

@@ -44,7 +44,7 @@ struct DisplayListEntry {
 }
 
 enum Packet {
-    case hello(proto: UInt8, clientWidth: UInt16, clientHeight: UInt16)
+    case hello(proto: UInt8, clientWidth: UInt16, clientHeight: UInt16, code: UInt32)
     case keyframeReq(displayId: UInt16)
     case nack(displayId: UInt16, frameId: UInt32, indices: [UInt16])
     case inputMove(displayId: UInt16, seq: UInt32, x: Float32, y: Float32)
@@ -251,7 +251,9 @@ enum Wire {
         switch type {
         case PacketType.hello.rawValue:
             guard body >= 5 else { return nil }
-            return .hello(proto: u8(0), clientWidth: u16(1), clientHeight: u16(3))
+            // code 为配对码（旧客户端不带 → 0 → 拒绝）；body>=9 才有
+            let code: UInt32 = body >= 9 ? u32(5) : 0
+            return .hello(proto: u8(0), clientWidth: u16(1), clientHeight: u16(3), code: code)
         case PacketType.keyframeReq.rawValue:
             guard body >= 2 else { return nil }
             return .keyframeReq(displayId: u16(0))

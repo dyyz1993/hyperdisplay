@@ -379,6 +379,16 @@ final class HostApp: NSObject, NSApplicationDelegate {
     private var displaySerial = 0
     private var loggedInputClients = Set<String>()
     private var didIdleReset = false
+    /// 配对码：阻止局域网内任意设备连接（不校验则任何人都可看屏+控鼠标）
+    let pairingCode: UInt32 = {
+        let defaults = UserDefaults.standard
+        if let saved = defaults.object(forKey: "hyperdisplay.pairingCode") as? UInt32 {
+            return saved
+        }
+        let generated = UInt32.random(in: 100_000...999_999)
+        defaults.set(generated, forKey: "hyperdisplay.pairingCode")
+        return generated
+    }()
     private let bonjour = BonjourAdvertiser()
     private let qrPanel = QRPanelController()
 
@@ -510,7 +520,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
         clientsLock.unlock()
 
         switch packet {
-        case .hello(let proto, let cw, let ch):
+        case .hello(let proto, let cw, let ch, let code):
+            guard code == pairingCode else {
+                NSLog("[hyperdisplay] HELLO from \(addressString(addr)) REJECTED (bad pairing code)")
+                return
+            }
             let existing = clients[key]?.displayIds
             let targets = (existing?.isEmpty == false) ? existing! : Set([displayOrder.first].compactMap { $0 })
             clientsLock.lock()
@@ -804,6 +818,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
         menu.setSubmenu(removeSub, for: remove)
 
         menu.addItem(.separator())
+        menu.addItem(withTitle: "配对码: \(pairingCode)（客户端首次连接需输入）", action: nil, keyEquivalent: "")
         let qrItem = menu.addItem(withTitle: "显示连接二维码…", action: #selector(showQR), keyEquivalent: "")
         qrItem.target = self
         let port = udp?.port ?? config.port
@@ -844,7 +859,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
             guard let ip = line.split(whereSeparator: { $0 == "（" }).first else { return nil }
             return (String(ip), port)
         }
-        qrPanel.show(ipPortList: list.isEmpty ? [("?.?.?.?:\(port)", port)] : list, port: port)
+        qrPanel.show(ipPortList: list.isEmpty ? [("?.?.?.?:\(port)", port)] : list, port: port, code: pairingCode)
     }
 
     @objc private func requestScreenPerm() {

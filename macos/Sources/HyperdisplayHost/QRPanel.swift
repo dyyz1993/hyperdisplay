@@ -7,7 +7,7 @@ import CoreImage.CIFilterBuiltins
 final class QRPanelController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
 
-    func show(ipPortList: [(String, Int)], port: Int) {
+    func show(ipPortList: [(String, Int)], port: Int, code: UInt32) {
         close()
         let size = NSSize(width: 420, height: 560)
         let window = NSWindow(
@@ -27,7 +27,7 @@ final class QRPanelController: NSObject, NSWindowDelegate {
         stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
 
         let primary = ipPortList.first?.0 ?? "?"
-        let payload = "hyperdisplay://\(primary)"
+        let payload = "hyperdisplay://\(primary)#\(code)"
         if let image = Self.qrImage(string: payload, side: 320) {
             let imageView = NSImageView(image: image)
             stack.addArrangedSubview(imageView)
