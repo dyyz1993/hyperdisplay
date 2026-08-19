@@ -383,6 +383,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
     /// 设备档案：deviceId → (宽, 高, 名称, 上次位置)。重连时按档案复建同一块屏
     /// （同分辨率同名），macOS 会把窗口按原摆放恢复——「这台设备就是这块显示器」。
     private var deviceProfiles: [UInt32: (w: Int, h: Int, name: String)] = [:]
+    /// 上次建屏失败时刻：1s 退避，防客户端（弱网重连风暴）把主线程打成重试死循环
+    private var lastCreateFailAt: Date?
     private var lastDeviceDisplays: [UInt32: (w: Int, h: Int)] = [:]
     /// 配对码：阻止局域网内任意设备连接（不校验则任何人都可看屏+控鼠标）
     let pairingCode: UInt32 = {
@@ -482,11 +484,20 @@ final class HostApp: NSObject, NSApplicationDelegate {
             NSLog("[hyperdisplay] display limit (8) reached")
             return nil
         }
+        // 失败退避：上次失败 1s 内直接放弃（曾因手机弱网重连风暴以 3ms 间隔刷爆主线程）
+        if let last = lastCreateFailAt, Date().timeIntervalSince(last) < 1.0 { return nil }
+        // CGVirtualDisplay 会拒绝非 16 对齐尺寸（手机原生 2131x1080 → id=0），
+        // 统一对齐后再建；档案匹配/记录均用对齐值，保证重连恒定命中
+        let w = max(640, (width + 15) & ~15)
+        let h = max(480, (height + 15) & ~15)
         // EDID serial：默认屏恒 1；设备档案屏 = 1000 + 设备指纹低 16 位（同一设备重连恒定）
         // → macOS 视作「同一台显示器回来了」：排列位置与窗口归属自动还原
         let serial: UInt32 = (name.hasPrefix("Hyperdisplay 设备") && currentDeviceId != 0)
             ? 1000 + UInt32(currentDeviceId % 65536) : 1
-        guard let vd = VirtualDisplay(width: width, height: height, refreshRate: Double(config.fps), serial: serial) else { return nil }
+        guard let vd = VirtualDisplay(width: w, height: h, refreshRate: Double(config.fps), serial: serial) else {
+            lastCreateFailAt = Date()
+            return nil
+        }
         guard let udp else { return nil }
         // 多流并发时按预算均分码率：两路 6M 在 2.4GHz 上合计超带宽必丢包；
         // 均分后合计不变，AIMD 仍可按各自实测丢片率微调
@@ -499,7 +510,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
         streams[vd.displayID] = stream
         displayOrder.append(vd.displayID)
         if currentDeviceId != 0 {
-            deviceProfiles[currentDeviceId] = (width, height, name)
+            deviceProfiles[currentDeviceId] = (w, h, name) // 记对齐值，与屏实际尺寸/匹配口径一致
         }
         return vd.displayID
     }
@@ -553,7 +564,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
                         setSubscriptions(key: key, ids: [target])
                     }
                 } else {
-                    deviceProfiles[deviceId] = (Int(cw), Int(ch), "Hyperdisplay 设备 \(deviceId % 10000)")
+                    // 新档案直接存 16 对齐尺寸（与 createDisplay 建屏口径一致，重连匹配恒命中）
+                    let aw = max(640, (Int(cw) + 15) & ~15)
+                    let ah = max(480, (Int(ch) + 15) & ~15)
+                    deviceProfiles[deviceId] = (aw, ah, "Hyperdisplay 设备 \(deviceId % 10000)")
                 }
             }
             let existing = clients[key]?.displayIds
