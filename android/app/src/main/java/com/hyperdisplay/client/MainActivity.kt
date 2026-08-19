@@ -338,6 +338,13 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         showSessionView()
         s.start()
         mainHandler.post(statsTick)
+        // 前台服务最后启动（会话已成立）：先启后停会触发
+        // ForegroundServiceDidNotStartInTimeException（启动被 stopService 取消）
+        if (Build.VERSION.SDK_INT >= 26) {
+            startForegroundService(android.content.Intent(this, SessionService::class.java))
+        } else {
+            startService(android.content.Intent(this, SessionService::class.java))
+        }
     }
 
     /** USB 链路探测：完整握手（连上 + 发 HELLO + 等任意回包）。
@@ -820,6 +827,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 val pl = pipelineOf(did)
                 pl.surface = surface
                 maybeStartDecoder(pl)
+                session?.requestKeyframe(did) // 新 surface 需要一帧 IDR 立即点亮
             }
             view.onSurfaceDestroyed = { did ->
                 synchronized(pipelineLock) {
@@ -919,6 +927,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val pl = pipelineOf(did)
             pl.surface = surface
             maybeStartDecoder(pl)
+            session?.requestKeyframe(did)
         }
         view.onSurfaceDestroyed = { did ->
             synchronized(pipelineLock) {
@@ -1411,6 +1420,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     // MARK: 生命周期收尾
 
     private fun disconnectSession() {
+        stopService(android.content.Intent(this, SessionService::class.java))
         mainHandler.removeCallbacks(statsTick)
         synchronized(pipelineLock) {
             for (p in pipelines.values) p.decoder?.release()
