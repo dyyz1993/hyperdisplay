@@ -596,10 +596,21 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                         // 重连/换通道后恢复之前的布局（画中画/分屏）
                         applyLayout(layoutConfig)
                     } else {
-                        if (subscribedIds.isEmpty()) {
-                            subscribedIds = listOf(list.first().id)
+                        val m = Resources.getSystem().displayMetrics
+                        val dw = maxOf(m.widthPixels, m.heightPixels)
+                        val dh = minOf(m.widthPixels, m.heightPixels)
+                        val first = list.first()
+                        val deviceAspect = dw.toFloat() / dh
+                        val screenAspect = first.width.toFloat() / first.height
+                        if (kotlin.math.abs(deviceAspect - screenAspect) < 0.08f || subscribedIds.isNotEmpty()) {
+                            if (subscribedIds.isEmpty()) subscribedIds = listOf(first.id)
+                            rebuildRegionViews()
+                        } else {
+                            // 默认屏与设备比例不符（如手机 2340×1080 vs 默认 1920×1200）：
+                            // 自动按设备原生尺寸建屏——像素 1:1 无变形（这才是副屏的正确形态）
+                            pendingRegions = listOf(dw to dh)
+                            tryFulfillPendingLayout()
                         }
-                        rebuildRegionViews()
                     }
                 }
                 updateConfigButton()

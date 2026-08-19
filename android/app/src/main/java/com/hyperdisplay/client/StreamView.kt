@@ -27,7 +27,35 @@ class StreamView(context: Context) : SurfaceView(context), SurfaceHolder.Callbac
     fun updateStreamSize(w: Int, h: Int) {
         streamWidth = w.toFloat()
         streamHeight = h.toFloat()
-        holder.setFixedSize(w, h) // SurfaceView 缓冲 = 流原生分辨率，缩放交给合成器
+        holder.setFixedSize(w, h)
+        fitAspect()
+    }
+
+    /** 视图贴合流宽高比（居中，父容器余量露黑边）——SurfaceView 缓冲会被
+     *  合成器拉伸到视图大小，视图不贴合比例画面必然变形（手机上实测过）。 */
+    private fun fitAspect() {
+        if (streamWidth <= 0 || streamHeight <= 0) return
+        val parent = parent as? android.view.ViewGroup ?: return
+        post {
+            val pw = parent.width.toFloat()
+            val ph = parent.height.toFloat()
+            if (pw <= 0 || ph <= 0) return@post
+            val scale = minOf(pw / streamWidth, ph / streamHeight)
+            val tw = (streamWidth * scale).toInt()
+            val th = (streamHeight * scale).toInt()
+            val lp = layoutParams as? android.view.ViewGroup.MarginLayoutParams ?: return@post
+            if (lp.width != tw || lp.height != th) {
+                lp.width = tw
+                lp.height = th
+                lp.setMargins(((pw - tw) / 2).toInt(), ((ph - th) / 2).toInt(), 0, 0)
+                layoutParams = lp
+            }
+        }
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        fitAspect()
     }
 
     fun contentRect(): RectF? {
