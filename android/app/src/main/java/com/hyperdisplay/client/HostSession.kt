@@ -189,8 +189,9 @@ class HostSession private constructor(
                 listener.onLinkEvent(false)
                 sendHello()
             }
-            if (!threadLinkUp && pongAge < 4000 && now - lastPongAt > 2500) {
-                // 未连通时低频重试 HELLO
+            if (!threadLinkUp && now - lastPongAt > 2500) {
+                // 未连通时持续重试 HELLO（host 重启/换网络后必须能无限重连，
+                // 此前的 pongAge<4000 上限会导致断开 4 秒后永远不再尝试）
                 sendHello()
                 lastPongAt = now
             }

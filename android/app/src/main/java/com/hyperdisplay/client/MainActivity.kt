@@ -563,6 +563,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     }
 
     private val decorViews = mutableListOf<View>()
+    private val regionWrappers = mutableListOf<FrameLayout>()
 
     /** 可拖分割线：拖动实时预览两区大小，松手按新比例重建虚拟屏 */
     @SuppressLint("ClickableViewAccessibility")
@@ -619,6 +620,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     @SuppressLint("ClickableViewAccessibility")
     private fun rebuildRegionViews() {
         val container = sessionRoot ?: return
+        for (v in regionWrappers) container.removeView(v)
+        regionWrappers.clear()
         for (v in regionViews) container.removeView(v)
         regionViews.clear()
         for (v in decorViews) container.removeView(v)
@@ -635,6 +638,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         fun makeView(id: Int): StreamView {
             val view = StreamView(this)
             view.displayId = id
+            // 半透明表面 + 黑色垫底：首帧到达前显示黑（加载态）而非显存残色（绿）
+            view.holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
             view.onSurfaceReady = { did, surface ->
                 val pl = pipelineOf(did)
                 pl.surface = surface
@@ -656,10 +661,16 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
 
         fun place(v: StreamView, w: Int, h: Int, x: Int, y: Int) {
+            val wrap = FrameLayout(this@MainActivity)
+            wrap.addView(View(this@MainActivity).apply { setBackgroundColor(Color.BLACK) },
+                FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            wrap.addView(v, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             val lp = FrameLayout.LayoutParams(w, h, Gravity.TOP or Gravity.START)
             lp.leftMargin = x
             lp.topMargin = y
-            container.addView(v, lp)
+            container.addView(wrap, lp)
+            regionWrappers.add(wrap)
             regionViews.add(v)
         }
 

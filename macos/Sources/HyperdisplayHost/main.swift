@@ -173,9 +173,9 @@ final class DisplayStream {
         self.fps = fps
         self.bitrate = bitrate
         self.targetBitrate = bitrate
-        // 带宽探测从低走高：先 8M 起步（或更低的目标），连续稳定再升——
-        // 避免一上来就满码率大关键帧在弱网送不完导致画面恢复振荡
-        self.currentBitrate = min(bitrate, 8_000_000)
+        // 带宽探测从低走高：4M 起步（首帧 IDR 体积减半，弱网加入更快），
+        // 连续稳定后 AIMD 逐档升回目标——帧率优先
+        self.currentBitrate = min(bitrate, 4_000_000)
         self.host = host
         self.udp = udp
     }
@@ -667,8 +667,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
         // 空闲自愈：最后一个客户端断开后全量重建（VideoToolbox 会话经反复建销会劣化——
         // 新会话产出 ffmpeg 可解但华为硬解输出全零的流；归零重建即恢复）
         if clientCount == 0 && !didIdleReset {
-            didIdleReset = true
-            fullIdleReset()
+            // 仅在管线就绪且有东西可回收时执行（避免启动竞态把初始屏清成 0）
+            if udp != nil && !displayOrder.isEmpty {
+                didIdleReset = true
+                fullIdleReset()
+            }
         } else if clientCount > 0 {
             didIdleReset = false
         }

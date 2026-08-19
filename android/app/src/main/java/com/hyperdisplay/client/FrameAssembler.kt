@@ -98,7 +98,10 @@ class FrameAssembler(private val callback: Callback) {
             }
             if (deliveredCurrent || isComplete()) return
             val idle = System.currentTimeMillis() - lastFragmentAt
-            if (idle > 300) {
+            // 关键帧容忍 1s：大 IDR 靠 NACK 补片，300ms 就放弃会跟补片踩踏
+            // （放弃→重请求→新 IDR 又丢→再放弃…恢复拖成好几秒）；增量帧 300ms 不变
+            val patience = if (currentKeyframe) 1000 else 300
+            if (idle > patience) {
                 onAbandoned(currentFrameId)
                 if (currentKeyframe) {
                     nackMissing(currentFrameId)
