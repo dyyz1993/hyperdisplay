@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import HyperdisplayObjC
 
 // MARK: - 配置
 
@@ -1010,6 +1011,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
             stream.display.destroy()
         }
         streams.removeAll()
+        // 兜底：streams 之外若有漏网的显示器对象（理论上没有），一并清掉
+        hyperdisplayDestroyAllVirtualDisplays()
     }
 
     // MARK: 网卡地址（含 USB 网络共享虚拟网卡）
@@ -1050,6 +1053,19 @@ if args.contains("--check") {
 }
 
 let config = Config.parse(args)
+
+// 退出卫生（AGENTS.md 4.1-3）：SIGTERM/SIGINT（pkill/Ctrl-C）不走 NSApplication
+// 终止链，此前完全依赖 windowserver 进程死亡兜底——显示器 churn 的坏习惯来源。
+// 信号处理里直接调 shim 的全局清理（C 函数、内部 @synchronized 线程安全）。
+signal(SIGTERM) { _ in
+    hyperdisplayDestroyAllVirtualDisplays()
+    exit(0)
+}
+signal(SIGINT) { _ in
+    hyperdisplayDestroyAllVirtualDisplays()
+    exit(0)
+}
+
 let app = NSApplication.shared
 let delegate = HostApp(config: config)
 app.delegate = delegate
