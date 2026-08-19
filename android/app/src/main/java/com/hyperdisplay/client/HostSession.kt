@@ -98,6 +98,15 @@ class HostSession private constructor(
         threadLinkUp = false // 每条新会话从「未连通」开始（否则旧会话的 true 会吞掉新会话的 onLinkEvent）
         lastPongAt = System.currentTimeMillis()
         if (useTcpTunnel) {
+            // 独立心跳：TCP 读循环在有视频流时永不空闲，靠读超时触发 PING 会饿死
+            // （链路永远判定不通 → 反复重连闪屏）。启动即 HELLO+PING，之后每 1.5s 一个 PING。
+            sendHandler.postDelayed(object : Runnable {
+                override fun run() {
+                    if (!running) return
+                    send(buildPacket(TYPE_PING, pingSeq.getAndIncrement()))
+                    sendHandler.postDelayed(this, 1500)
+                }
+            }, 300)
             try {
                 val s = java.net.Socket()
                 s.tcpNoDelay = true

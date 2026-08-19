@@ -163,7 +163,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             }
             // USB 会话已死但没人处理（如重连时桥接还没恢复）：持续重试智能重连
             val s1 = session
-            if (transport == Transport.USB && !linkUp && s1 != null && !reconnecting) {
+            if (transport == Transport.USB && !linkUp && s1 != null && !reconnecting
+                && System.currentTimeMillis() - lastReconnectAt > 5000) {
                 mainHandler.post { scheduleSmartReconnect() }
             }
             // WiFi 期间每 10s 探测 USB，可用即自动升级（有线优先）
@@ -370,9 +371,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     }
 
     /** 自动重连（USB 断开时降级；恢复时优先升回 USB） */
+    private var lastReconnectAt = 0L
+
     private fun scheduleSmartReconnect() {
         if (reconnecting) return
         reconnecting = true
+        lastReconnectAt = System.currentTimeMillis()
         mainHandler.postDelayed({
             reconnecting = false
             probeUsb { usbOk ->
