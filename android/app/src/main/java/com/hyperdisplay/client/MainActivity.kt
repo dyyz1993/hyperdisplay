@@ -487,6 +487,18 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     // MARK: 会话回调
 
     private val sessionListener = object : HostSession.Listener {
+        override fun onCursor(displayId: Int, x: Float, y: Float) {
+            val lc = localCursor ?: return
+            if (displayId == 0) {
+                mainHandler.post { lc.hide() }
+                return
+            }
+            val view = regionViews.firstOrNull { it.displayId == displayId } ?: return
+            val v = view.streamToView(x, y) ?: return
+            val w = windowPos(view, v[0], v[1])
+            mainHandler.post { lc.moveTo(w[0], w[1]) }
+        }
+
         override fun onWelcome(displayId: Int, codec: Int, width: Int, height: Int, fps: Int) {
             mainHandler.post {
                 val p = pipelineOf(displayId)
@@ -1303,7 +1315,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     val w = windowPos(view, event.x, event.y)
                     lc.moveTo(w[0], w[1])
                 }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> lc.hide()
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> Unit // 常驻：抬手不隐藏，由 host 光标包驱动
             }
         }
         // 画中画处于选中（编辑）态时，第一次点其他区域=退出选中，不透传给 Mac

@@ -41,6 +41,15 @@ class StreamView(context: Context) : SurfaceView(context), SurfaceHolder.Callbac
         return RectF((vw - w) / 2f, (vh - h) / 2f, (vw + w) / 2f, (vh + h) / 2f)
     }
 
+    /** 流坐标 → 视图坐标；越界返回 null */
+    fun streamToView(sx: Float, sy: Float): FloatArray? {
+        val rect = contentRect() ?: return null
+        if (sx < 0 || sx > streamWidth || sy < 0 || sy > streamHeight) return null
+        return floatArrayOf(
+            rect.left + sx / streamWidth * rect.width(),
+            rect.top + sy / streamHeight * rect.height())
+    }
+
     fun viewToStream(x: Float, y: Float): FloatArray? {
         val rect = contentRect() ?: return null
         if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return null

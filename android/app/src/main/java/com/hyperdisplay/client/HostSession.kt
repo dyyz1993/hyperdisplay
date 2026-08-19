@@ -22,6 +22,7 @@ class HostSession private constructor(
     private val listener: Listener
 ) {
     interface Listener {
+        fun onCursor(displayId: Int, x: Float, y: Float) // did=0=光标离开虚拟屏（隐藏）
         fun onWelcome(displayId: Int, codec: Int, width: Int, height: Int, fps: Int)
         fun onConfig(displayId: Int, codec: Int, paramSets: ByteArray)
         fun onVideoFragment(displayId: Int, frameId: Int, fragIdx: Int, fragCount: Int, keyframe: Boolean, payload: ByteArray)
@@ -41,6 +42,7 @@ class HostSession private constructor(
         private const val TYPE_INPUT_ACK = 0x05
         private const val TYPE_PONG = 0x06
         private const val TYPE_DISPLAYS = 0x07
+        private const val TYPE_CURSOR = 0x08
         private const val TYPE_HELLO = 0x10
         private const val TYPE_KEYFRAME_REQ = 0x11
         private const val TYPE_INPUT = 0x12
@@ -270,6 +272,15 @@ class HostSession private constructor(
                             off += 9 + nameLen
                         }
                         if (ok) listener.onDisplays(list)
+                    }
+                    TYPE_CURSOR -> {
+                        // [displayId u16][x f32][y f32]
+                        if (buf.size >= 12) {
+                            val did = bb.getShort(5).toInt() and 0xFFFF
+                            val fx = Float.fromBits(bb.getInt(7))
+                            val fy = Float.fromBits(bb.getInt(11))
+                            listener.onCursor(did, fx, fy)
+                        }
                     }
                     TYPE_INPUT_ACK -> {
                         val seq = bb.getInt(1)

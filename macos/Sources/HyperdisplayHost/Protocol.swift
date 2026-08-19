@@ -26,7 +26,7 @@ import Foundation
 //   PING
 
 enum PacketType: UInt8 {
-    case welcome = 0x01, videoFrag = 0x02, config = 0x03, inputAck = 0x05, pong = 0x06, displays = 0x07
+    case welcome = 0x01, videoFrag = 0x02, config = 0x03, inputAck = 0x05, pong = 0x06, displays = 0x07, cursor = 0x08
     case hello = 0x10, keyframeReq = 0x11, input = 0x12, ping = 0x13
     case selectDisplay = 0x14, createDisplay = 0x15, destroyDisplay = 0x16, nack = 0x17, subscribeDisplays = 0x18
 }
@@ -121,6 +121,15 @@ enum Wire {
             d.appendLE(UInt8(name.count))
             d.append(name)
         }
+        return d
+    }
+
+    /// 光标位置（常驻本地光标用）。did=0 表示光标已离开虚拟屏（客户端隐藏）。
+    static func cursor(displayId: UInt16, x: Float, y: Float) -> Data {
+        var d = Data(header(.cursor, seq: 0))
+        d.appendLE(displayId)
+        d.appendLE(x)
+        d.appendLE(y)
         return d
     }
 

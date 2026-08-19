@@ -404,6 +404,13 @@ final class HostApp: NSObject, NSApplicationDelegate {
             self?.tick()
         }
         RunLoop.main.add(statsTimer, forMode: .common)
+
+        // 光标跟踪：把真光标位置推给订阅客户端（客户端绘制常驻本地光标——
+        // 系统光标已从采集画面隐藏，没有这个反馈虚拟屏上就完全没有光标）
+        let cursorTimer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+            self?.pushCursorPosition()
+        }
+        RunLoop.main.add(cursorTimer, forMode: .common)
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
@@ -696,6 +703,38 @@ final class HostApp: NSObject, NSApplicationDelegate {
             }
         }
         rebuildMenu(clientCount: clientCount)
+    }
+
+    private var lastCursorKey = ""
+
+    private func pushCursorPosition() {
+        guard let udp, let loc = CGEvent(source: nil)?.location else { return }
+        // 找光标所在的虚拟屏（CG 全局坐标与 CGDisplayBounds 同一空间）
+        for id in displayOrder {
+            guard let s = streams[id] else { continue }
+            let b = s.display.bounds
+            guard loc.x >= b.minX, loc.x < b.maxX, loc.y >= b.minY, loc.y < b.maxY else { continue }
+            let addresses = addressesOfSubscribers(of: id)
+            guard !addresses.isEmpty else { continue }
+            // CGDisplay 尺寸=显示坐标；流可能不同（保持 1:1 后相同）
+            let sx = Float((loc.x - b.minX) / b.width * CGFloat(s.display.pixelWidth))
+            let sy = Float((loc.y - b.minY) / b.height * CGFloat(s.display.pixelHeight))
+            let key = "\(id):\(Int(sx)),\(Int(sy))"
+            if key == lastCursorKey { return }
+            lastCursorKey = key
+            let pkt = Wire.cursor(displayId: UInt16(id & 0xFFFF), x: sx, y: sy)
+            for var addr in addresses { udp.send(to: &addr, pkt) }
+            return
+        }
+        // 光标不在任何虚拟屏上 → 通知客户端隐藏（只发一次）
+        if lastCursorKey != "off" {
+            lastCursorKey = "off"
+            let pkt = Wire.cursor(displayId: 0, x: 0, y: 0)
+            clientsLock.lock()
+            let all = clients.values.map { $0.addr }
+            clientsLock.unlock()
+            for var addr in all { udp.send(to: &addr, pkt) }
+        }
     }
 
     // MARK: 菜单栏
