@@ -717,6 +717,24 @@ final class HostApp: NSObject, NSApplicationDelegate {
             didIdleReset = true
             fullIdleReset()
             pushDisplays()
+
+        case .bye:
+            // 客户端主动退场（用户关 app / 切走超过宽限）：立刻摘除订阅，并把只剩
+            // 无人订阅的屏的闲置时钟回拨 10s——15s 阈值下 5s 后即回收，副屏退场、
+            // 窗口弹回主屏（用户在 Mac 上看得到）；5s 宽限兜住 USB↔WiFi 换通道的
+            // 先断后连。强杀/滑掉不发 BYE 的路径由 prune(6s)+GC(15s) 兜底。
+            NSLog("[hyperdisplay] client \(addressString(addr)) said bye")
+            clientsLock.lock()
+            clients.removeValue(forKey: key)
+            clientsLock.unlock()
+            let backdated = nowBackdated(seconds: 10)
+            for id in displayOrder {
+                guard let s = streams[id] else { continue }
+                if addressesOfSubscribers(of: id).isEmpty && streams.count > 1 {
+                    s.idleSince = backdated
+                }
+            }
+            pushDisplays()
         }
     }
 
@@ -819,18 +837,24 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 stream.restartCaptureIfNeeded(now: now)
             }
         }
-        // 闲置回收：60s 无人订阅且还留有其他屏 → 销毁（含初始配置屏——
+        // 闲置回收：15s 无人订阅且还留有其他屏 → 销毁（含初始配置屏——
         // 多块虚拟屏并存时用户会把窗口拖到「没人看」的那块上导致窗口丢失；
-        // 回收后窗口自动弹回主屏，桌面始终只留正在被观看的屏）
+        // 回收后窗口自动弹回主屏，桌面始终只留正在被观看的屏。
+        // 60s→15s：强杀/滑掉 app 不发 BYE 时，prune(6s)+本阈值让窗口尽快
+        // 回到主屏可见——「断开即恢复」）
         for id in displayOrder {
             guard let s = streams[id] else { continue }
             if let idle = s.idleSince,
-               now.timeIntervalSince(idle) > 60, streams.count > 1 {
-                NSLog("[hyperdisplay] recycling idle display \(id) (no subscribers 60s)")
+               now.timeIntervalSince(idle) > 15, streams.count > 1 {
+                NSLog("[hyperdisplay] recycling idle display \(id) (no subscribers 15s)")
                 destroyDisplay(id: id)
             }
         }
         rebuildMenu(clientCount: clientCount)
+    }
+
+    private func nowBackdated(seconds: TimeInterval) -> Date {
+        Date().addingTimeInterval(-seconds)
     }
 
     private var lastCursorKey = ""

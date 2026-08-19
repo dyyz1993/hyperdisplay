@@ -1593,9 +1593,39 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
+    /** 后台自动断开：切走/锁屏超过 10s 还没回来 → 断开会话（发 BYE，host 回收副屏、
+     *  窗口弹回 Mac 主屏可见）。10s 内回来不中断（保留「短暂切换不断流」的体验） */
+    private var bgDisconnectRunnable: Runnable? = null
+    private var autoDisconnectedByBg = false
+
     override fun onPause() {
         super.onPause()
-        // 副屏应用：切走/锁屏不主动断流（此前 onPause 直接断连，回来像「断开了」）
+        // 副屏应用：切走/锁屏不「立刻」断流（此前 onPause 直接断连，回来像「断开了」）；
+        // 但长时间离开（>10s，如切去打游戏）必须断：否则副屏窗口悬在无人可见的
+        // 虚拟屏上，Mac 主屏也看不到——「断开即恢复」由 BYE + host 回收完成
+        if (session != null && !isFinishing) {
+            val r = Runnable {
+                if (session != null && !isFinishing) {
+                    autoDisconnectedByBg = true
+                    Log.i(TAG, "background >10s — auto disconnect (bye)")
+                    disconnectSession()
+                }
+            }
+            bgDisconnectRunnable = r
+            mainHandler.postDelayed(r, 10_000)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        bgDisconnectRunnable?.let { mainHandler.removeCallbacks(it) }
+        bgDisconnectRunnable = null
+        // 后台自动断开过 → 无缝重连（EDID 档案屏：位置还原）
+        if (autoDisconnectedByBg) {
+            autoDisconnectedByBg = false
+            Log.i(TAG, "resumed after auto disconnect — reconnecting")
+            smartConnect()
+        }
     }
 
     private fun hideSystemBars() {

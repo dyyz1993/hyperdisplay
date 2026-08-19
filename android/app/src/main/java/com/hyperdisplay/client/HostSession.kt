@@ -66,6 +66,7 @@ class HostSession private constructor(
         private const val TYPE_NACK = 0x17
         private const val TYPE_SUBSCRIBE_DISPLAYS = 0x18
         private const val TYPE_RECYCLE = 0x19
+        private const val TYPE_BYE = 0x1A
         private const val DISPLAY_ID_BROADCAST = 0xFFFF
         private const val PROTO_VERSION = 1
         private const val RETRANSMIT_MS = 40L
@@ -324,6 +325,9 @@ class HostSession private constructor(
     }
 
     fun close() {
+        // 先发 BYE 再停机：host 收到即摘除订阅并加速回收副屏（窗口弹回 Mac 主屏）。
+        // 必须在 running=false 之前发（send 有 running 守卫）
+        send(buildPacket(TYPE_BYE, 0))
         running = false
         // 幂等：重连流程可能多次 close（自动降级/升级路径）
         if (!socket.isClosed) {

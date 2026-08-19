@@ -29,6 +29,7 @@ enum PacketType: UInt8 {
     case welcome = 0x01, videoFrag = 0x02, config = 0x03, inputAck = 0x05, pong = 0x06, displays = 0x07, cursor = 0x08
     case hello = 0x10, keyframeReq = 0x11, input = 0x12, ping = 0x13
     case selectDisplay = 0x14, createDisplay = 0x15, destroyDisplay = 0x16, nack = 0x17, subscribeDisplays = 0x18, recycle = 0x19
+    case bye = 0x1A
 }
 
 /// 0xFFFF 表示「全部显示屏」（KEYFRAME_REQ 专用）
@@ -56,6 +57,7 @@ enum Packet {
     case createDisplay(width: UInt16, height: UInt16, name: String)
     case destroyDisplay(id: UInt32)
     case recycle
+    case bye
 }
 
 enum Wire {
@@ -300,6 +302,8 @@ enum Wire {
             return .destroyDisplay(id: u32(0))
         case PacketType.recycle.rawValue:
             return .recycle
+        case PacketType.bye.rawValue:
+            return .bye
         case PacketType.input.rawValue:
             guard body >= 3 else { return nil }
             let displayId = u16(0)
