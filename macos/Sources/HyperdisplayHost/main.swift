@@ -160,7 +160,7 @@ final class DisplayStream {
     private(set) var targetBitrate: UInt32
     private(set) var currentBitrate: UInt32
     private(set) var captureScale = 1.0
-    private let bitrateFloor: UInt32 = 3_000_000
+    private let bitrateFloor: UInt32 = 2_000_000
     private var fragmentsSentTotal: UInt64 = 0
     private var nackFragmentsTotal: UInt64 = 0
     private var windowSentBase: UInt64 = 0
