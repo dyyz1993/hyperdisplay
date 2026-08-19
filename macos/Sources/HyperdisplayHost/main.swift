@@ -757,7 +757,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     private var lastCursorKey = ""
 
+    private var cursorTick = 0
     private func pushCursorPosition() {
+        cursorTick += 1
+        if cursorTick % 100 == 1 { NSLog("[hyperdisplay] cursor tick loc=\(CGEvent(source: nil)?.location ?? .zero)") }
         guard let udp, let loc = CGEvent(source: nil)?.location else { return }
         // 找光标所在的虚拟屏（CG 全局坐标与 CGDisplayBounds 同一空间）
         for id in displayOrder {
