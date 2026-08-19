@@ -95,6 +95,8 @@ class HostSession private constructor(
     private val pendingAcks = ConcurrentHashMap<Int, Pending>()
 
     private val thread = Thread({
+        threadLinkUp = false // 每条新会话从「未连通」开始（否则旧会话的 true 会吞掉新会话的 onLinkEvent）
+        lastPongAt = System.currentTimeMillis()
         if (useTcpTunnel) {
             try {
                 val s = java.net.Socket()
@@ -154,13 +156,6 @@ class HostSession private constructor(
                         val pkt = fbuf.copyOfRange(4, 4 + ln)
                         System.arraycopy(fbuf, 4 + ln, fbuf, 0, acc - 4 - ln)
                         acc -= 4 + ln
-                        tcpFrames[0]++
-                        if (tcpFrames[0] <= 6) {
-                            Log.i(TAG, "tcpframe#" + tcpFrames[0] + " type=" + (pkt[0].toInt() and 0xFF) + " len=" + ln)
-                        } else if ((pkt[0].toInt() and 0xFF) == 0x02 && tcpFrames[2] < 3) {
-                            Log.i(TAG, "firstvideofrag len=" + ln + " did=" +
-                                ((pkt[5].toInt() and 0xFF) or ((pkt[6].toInt() and 0xFF) shl 8)))
-                        }
                         when (pkt[0].toInt() and 0xFF) {
                             0x01 -> tcpFrames[1]++
                             0x02 -> tcpFrames[2]++
@@ -287,7 +282,10 @@ class HostSession private constructor(
 
     fun close() {
         running = false
-        socket.soTimeout = 1 // 立刻打断阻塞的 receive
+        // 幂等：重连流程可能多次 close（自动降级/升级路径）
+        if (!socket.isClosed) {
+            try { socket.soTimeout = 1 } catch (_: Exception) { }
+        }
         try { thread.join(500) } catch (_: InterruptedException) {}
         sendHandler.removeCallbacksAndMessages(null)
         sendThread.quitSafely()

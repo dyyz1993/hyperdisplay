@@ -95,6 +95,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     @Volatile private var linkUp = false
     private val mainHandler = Handler(Looper.getMainLooper())
+    private enum class Transport { USB, WIFI }
+    private var transport = Transport.WIFI
+    private var reconnecting = false
+    private var usbProbeCounter = 0
     private var renderFps = 0
     private var lastWatchdogKfAt = 0L
     private val statsTick = object : Runnable {
@@ -157,6 +161,25 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     }
                 }
             }
+            // USB 会话已死但没人处理（如重连时桥接还没恢复）：持续重试智能重连
+            val s1 = session
+            if (transport == Transport.USB && !linkUp && s1 != null && !reconnecting) {
+                mainHandler.post { scheduleSmartReconnect() }
+            }
+            // WiFi 期间每 10s 探测 USB，可用即自动升级（有线优先）
+            usbProbeCounter++
+            val s0 = session
+            if (usbProbeCounter >= 10) {
+                usbProbeCounter = 0
+                if (transport == Transport.WIFI && linkUp && s0 != null) {
+                    probeUsb { usbOk ->
+                        if (usbOk && transport == Transport.WIFI) {
+                            openSession("127.0.0.1", 5280)
+                            transport = Transport.USB
+                        }
+                    }
+                }
+            }
             updateOverlay()
             writeStatusFile()
             mainHandler.postDelayed(this, 1000)
@@ -171,8 +194,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         root = FrameLayout(this)
         setContentView(root)
         showConnectView()
-        intent.getStringExtra("host")?.trim()?.takeIf { it.isNotEmpty() }?.let { text ->
-            parseEndpoint(text)?.let { (host, port) -> connect(host, port) }
+        when (intent.getStringExtra("host")?.trim()?.lowercase()) {
+            "smart" -> smartConnect() // 自动选路：USB 优先，否则历史 WiFi
+            null, "" -> Unit
+            else -> intent.getStringExtra("host")!!.trim().let { text ->
+                parseEndpoint(text)?.let { (host, port) -> connect(host, port) }
+            }
         }
     }
 
@@ -237,13 +264,18 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         hostInput = input
 
         button.setOnClickListener {
+            // 智能连接：优先 USB（插线即用），否则用手输/历史 WiFi 主机
             val text = input.text.toString().trim()
-            val (host, port) = parseEndpoint(text) ?: run {
-                statusText.text = "地址格式不对，应形如 192.168.1.23:5277"
-                return@setOnClickListener
+            if (text.isNotEmpty()) {
+                val (host, port) = parseEndpoint(text) ?: run {
+                    statusText.text = "地址格式不对，应形如 192.168.1.23:5277"
+                    return@setOnClickListener
+                }
+                prefs.edit().putString("host", text).apply()
+                connect(host, port)
+            } else {
+                smartConnect()
             }
-            prefs.edit().putString("host", text).apply()
-            connect(host, port)
         }
         scanButton.setOnClickListener { launchQrScan() }
         findButton.setOnClickListener { showDiscoveryDialog() }
@@ -264,9 +296,22 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     }
 
     private fun connect(host: String, port: Int) {
-        statusText.text = "连接 $host:$port …"
+        if (host != "127.0.0.1") {
+            getPreferences(MODE_PRIVATE).edit().putString("host", "$host:$port").apply()
+            transport = Transport.WIFI
+        } else {
+            transport = Transport.USB
+        }
+        openSession(host, port)
+    }
+
+    /** 建立会话（连接页与自动重连共用） */
+    private fun openSession(host: String, port: Int) {
+        disconnectSession()
         val s = HostSession.create(host, port, sessionListener)
         if (s == null) {
+            transport = Transport.WIFI
+            showConnectView()
             statusText.text = "无法解析地址（仅支持数字 IPv4）"
             return
         }
@@ -274,6 +319,81 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         showSessionView()
         s.start()
         mainHandler.post(statsTick)
+    }
+
+    /** USB 链路探测：完整握手（连上 + 发 HELLO + 等任意回包）。
+     *  线断时 adbd 的监听 socket 仍在、connect 能成，但字节到不了 Mac——必须验回包。 */
+    private fun probeUsb(result: (Boolean) -> Unit) {
+        Thread {
+            var ok = false
+            try {
+                val s = java.net.Socket()
+                s.tcpNoDelay = true
+                val v6 = java.net.InetAddress.getByAddress(
+                    byteArrayOf(0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1))
+                s.connect(java.net.InetSocketAddress(v6, 5280), 1500)
+                s.soTimeout = 1500
+                val hello = byteArrayOf(0x10.toByte(), 0,0,0,0, 1, 0x20,3, 0xE8.toByte(),7)
+                s.getOutputStream().write(java.nio.ByteBuffer.allocate(4 + hello.size)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    .putInt(hello.size).put(hello).array())
+                s.getOutputStream().flush()
+                ok = s.getInputStream().read(ByteArray(64)) > 0
+                s.close()
+            } catch (_: Exception) { }
+            android.util.Log.i("UsbProbe", "result=$ok")
+            val r = ok
+            mainHandler.post { result(r) }
+        }.start()
+    }
+
+    /** 智能连接：有 USB 走 USB，否则走保存过的 WiFi 主机 */
+    private fun smartConnect() {
+        statusText.text = "探测 USB 连接…"
+        probeUsb { usbOk ->
+            if (usbOk) {
+                statusText.text = "USB 隧道可用"
+                openSession("127.0.0.1", 5280)
+                transport = Transport.USB
+            } else {
+                val saved = getPreferences(MODE_PRIVATE).getString("host", null)
+                val ep = saved?.let { parseEndpoint(it) }
+                if (ep != null) {
+                    statusText.text = "走 WiFi：${ep.first}:${ep.second}"
+                    openSession(ep.first, ep.second)
+                    transport = Transport.WIFI
+                } else {
+                    statusText.text = "USB 未连接且无历史主机——请扫码 / 局域网发现 / 输入 IP"
+                }
+            }
+        }
+    }
+
+    /** 自动重连（USB 断开时降级；恢复时优先升回 USB） */
+    private fun scheduleSmartReconnect() {
+        if (reconnecting) return
+        reconnecting = true
+        mainHandler.postDelayed({
+            reconnecting = false
+            probeUsb { usbOk ->
+                if (usbOk) {
+                    openSession("127.0.0.1", 5280)
+                    transport = Transport.USB
+                } else {
+                    val saved = getPreferences(MODE_PRIVATE).getString("host", null)
+                    val ep = saved?.let { parseEndpoint(it) }
+                    if (ep != null) {
+                        openSession(ep.first, ep.second)
+                        transport = Transport.WIFI
+                    } else {
+                        // 无历史主机：回到连接页让用户选（不留死会话）
+                        transport = Transport.WIFI
+                        showConnectView()
+                        statusText.text = "USB 已断开且无历史 WiFi 主机——请扫码 / 发现 / 输入 IP"
+                    }
+                }
+            }
+        }, 1200)
     }
 
     // MARK: 扫码
@@ -393,10 +513,15 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 // 连接初期（单屏默认）：DISPLAYS 首次到达时视图还没建——
                 // 默认订阅第一块屏并立即建渲染区，否则永远灰屏
                 if (regionViews.isEmpty() && pendingRegions == null && list.isNotEmpty()) {
-                    if (subscribedIds.isEmpty()) {
-                        subscribedIds = listOf(list.first().id)
+                    if (layoutConfig.kind != LayoutKind.SINGLE) {
+                        // 重连/换通道后恢复之前的布局（画中画/分屏）
+                        applyLayout(layoutConfig)
+                    } else {
+                        if (subscribedIds.isEmpty()) {
+                            subscribedIds = listOf(list.first().id)
+                        }
+                        rebuildRegionViews()
                     }
-                    rebuildRegionViews()
                 }
                 updateConfigButton()
             }
@@ -404,6 +529,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
         override fun onLinkEvent(connected: Boolean) {
             linkUp = connected
+            if (!connected && transport == Transport.USB && session != null) {
+                // USB 断开（拔线/桥接重启）：自动降级 WiFi 或升回恢复的 USB
+                mainHandler.post { scheduleSmartReconnect() }
+            }
             if (!connected) {
                 mainHandler.post {
                     synchronized(pipelineLock) {
@@ -1204,7 +1333,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val p = pipelines.values.firstOrNull()
             if (p != null && p.width > 0) "${p.width}x${p.height}" else "?"
         }
-        overlay.text = "$renderFps fps · $screens · $link · 长按修复画面"
+        val tr = if (transport == Transport.USB) "USB" else "WiFi"
+        overlay.text = "$renderFps fps · $screens · $tr · $link · 长按修复画面"
     }
 
     /** 状态落盘：锁屏/无屏环境下的可观测通道（adb pull 验证用） */
@@ -1215,7 +1345,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val pips = synchronized(pipelineLock) {
                 pipelines.values.joinToString(";") { "${it.id}:${it.width}x${it.height}:${it.renderedNow}" }
             }
-            val text = "link=$link fps=$renderFps layout=${layoutConfig.kind} subs=${subscribedIds.joinToString()} pipelines=$pips\n"
+            val text = "link=$link fps=$renderFps transport=$transport layout=${layoutConfig.kind} subs=${subscribedIds.joinToString()} pipelines=$pips\n"
             java.io.File(dir, "status.txt").writeText(text)
         } catch (_: Exception) { }
     }

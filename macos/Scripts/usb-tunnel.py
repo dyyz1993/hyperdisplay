@@ -5,6 +5,9 @@
       --> 本桥接 --> UDP 127.0.0.1:5277 (hyperdisplay host)，回程同理。
 
 帧格式: [len u32 LE][payload]（与 app 的 TCP 模式一致）
+架构: 每条 TCP 连接配一个独立 UDP 套接字（独立源端口），
+      host 的回包天然按源端口路由回各自连接——探测与正式会话可并存，
+      不存在旧实现「单连接互相抢占回程」的问题。
 用法: python3 usb-tunnel.py [tcp_port] [host_udp_port]   # 默认 5280 5277
 前置: adb reverse tcp:<tcp_port> tcp:<tcp_port>
 """
@@ -16,18 +19,23 @@ import threading
 TCP_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 5280
 UDP_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 5277
 
-udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-udp.bind(("127.0.0.1", 0))  # 源端口固定，host 会把回包发回这里
-UDP_SRC = udp.getsockname()[1]
 
-tcp_conn = None
-tcp_lock = threading.Lock()
+def serve(conn, peer):
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind(("127.0.0.1", 0))
+    print(f"tunnel client {peer} udp_src={udp.getsockname()[1]}", flush=True)
 
+    def udp_to_tcp():
+        try:
+            while True:
+                data, _ = udp.recvfrom(65536)
+                conn.sendall(struct.pack("<I", len(data)) + data)
+        except Exception:
+            pass
 
-def tcp_to_udp(conn):
-    global tcp_conn
-    with tcp_lock:
-        tcp_conn = conn
+    t = threading.Thread(target=udp_to_tcp, daemon=True)
+    t.start()
+
     try:
         buf = b""
         while True:
@@ -37,56 +45,29 @@ def tcp_to_udp(conn):
             buf += chunk
             while len(buf) >= 4:
                 (ln,) = struct.unpack("<I", buf[:4])
-                if ln == 0 or ln > 65536:
-                    print("bad frame len", ln)
+                if ln <= 0 or ln > 65536:
+                    print(f"bad frame len {ln}", flush=True)
                     return
                 if len(buf) < 4 + ln:
                     break
                 payload = buf[4:4 + ln]
                 buf = buf[4 + ln:]
-                stats[0] += 1
-                if payload and payload[0] == 0x12:
-                    stats[1] += 1
                 udp.sendto(payload, ("127.0.0.1", UDP_PORT))
+    except Exception:
+        pass
     finally:
-        with tcp_lock:
-            tcp_conn = None
+        udp.close()
         conn.close()
+        t.join(timeout=1)
+        print(f"tunnel client {peer} closed", flush=True)
 
-
-def udp_to_tcp():
-    while True:
-        data, _ = udp.recvfrom(65536)
-        stats[2] += 1
-        if data and data[0] == 0x02:
-            stats[3] += 1
-        with tcp_lock:
-            conn = tcp_conn
-        if conn is None:
-            continue
-        try:
-            conn.sendall(struct.pack("<I", len(data)) + data)
-        except Exception:
-            pass
-
-
-stats = [0, 0, 0, 0]  # [上行帧, INPUT帧, 下行帧, 视频分片帧]
-import threading as _t
-def _stat():
-    import time as _time
-    while True:
-        _time.sleep(3)
-        print(f"up={stats[0]} inputs={stats[1]} down={stats[2]} videofrags={stats[3]}", flush=True)
-_t.Thread(target=_stat, daemon=True).start()
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind(("127.0.0.1", TCP_PORT))
-server.listen(2)
-print(f"usb-tunnel: TCP :{TCP_PORT} <-> UDP 127.0.0.1:{UDP_PORT} (udp src port {UDP_SRC})")
+server.listen(4)
+print(f"usb-tunnel: TCP :{TCP_PORT} <-> UDP 127.0.0.1:{UDP_PORT} (per-connection UDP sockets)", flush=True)
 
-threading.Thread(target=udp_to_tcp, daemon=True).start()
 while True:
     conn, addr = server.accept()
-    print("tunnel client:", addr)
-    threading.Thread(target=tcp_to_udp, args=(conn,), daemon=True).start()
+    threading.Thread(target=serve, args=(conn, addr), daemon=True).start()
