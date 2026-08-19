@@ -13,7 +13,8 @@ static void ensureInit(void) {
 }
 
 CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t width, uint32_t height,
-                                                    double refreshRate, NSString *name) {
+                                                    double refreshRate, NSString *name,
+                                                    uint32_t serialNum) {
     ensureInit();
 
     CGVirtualDisplayDescriptor *descriptor = [[CGVirtualDisplayDescriptor alloc] init];
@@ -24,7 +25,9 @@ CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t width, uint32_t heig
     descriptor.sizeInMillimeters = CGSizeMake(600.0 * width / 1920.0, 340.0 * height / 1200.0);
     descriptor.vendorID = 0x1A2B;
     descriptor.productID = 0x0001;
-    descriptor.serialNum = (unsigned int)arc4random();
+    // EDID serial 恒定：macOS 按 (vendor,product,serial) 记忆显示器——排列位置、
+    // 窗口归属都挂在它上面。随机值 = 每次都是「新显示器」（位置乱、窗口不归位）。
+    descriptor.serialNum = serialNum;
 
     CGVirtualDisplay *display = [[CGVirtualDisplay alloc] initWithDescriptor:descriptor];
     if (display == nil) {

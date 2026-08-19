@@ -10,8 +10,8 @@ final class VirtualDisplay {
     let pixelWidth: Int
     let pixelHeight: Int
 
-    init?(width: Int, height: Int, refreshRate: Double = 60) {
-        let id = hyperdisplayCreateVirtualDisplay(UInt32(width), UInt32(height), refreshRate, "Hyperdisplay")
+    init?(width: Int, height: Int, refreshRate: Double = 60, serial: UInt32 = 1) {
+        let id = hyperdisplayCreateVirtualDisplay(UInt32(width), UInt32(height), refreshRate, "Hyperdisplay", serial)
         guard id != 0 else {
             NSLog("[hyperdisplay] CGVirtualDisplay creation failed (id=0)")
             return nil

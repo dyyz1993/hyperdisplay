@@ -9,7 +9,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// 创建一块虚拟显示器。成功返回 CGDirectDisplayID（>0），失败返回 0。
 /// 实例由 shim 内部持有，进程退出时全部自动销毁。
 CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t width, uint32_t height,
-                                                    double refreshRate, NSString *name);
+                                                    double refreshRate, NSString *name,
+                                                    uint32_t serialNum);
 
 /// 销毁一块由本进程创建的虚拟显示器。
 void hyperdisplayDestroyVirtualDisplay(CGDirectDisplayID displayID);

@@ -482,7 +482,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
             NSLog("[hyperdisplay] display limit (8) reached")
             return nil
         }
-        guard let vd = VirtualDisplay(width: width, height: height, refreshRate: Double(config.fps)) else { return nil }
+        // EDID serial：默认屏恒 1；设备档案屏 = 1000 + 设备指纹低 16 位（同一设备重连恒定）
+        // → macOS 视作「同一台显示器回来了」：排列位置与窗口归属自动还原
+        let serial: UInt32 = (name.hasPrefix("Hyperdisplay 设备") && currentDeviceId != 0)
+            ? 1000 + UInt32(currentDeviceId % 65536) : 1
+        guard let vd = VirtualDisplay(width: width, height: height, refreshRate: Double(config.fps), serial: serial) else { return nil }
         guard let udp else { return nil }
         // 多流并发时按预算均分码率：两路 6M 在 2.4GHz 上合计超带宽必丢包；
         // 均分后合计不变，AIMD 仍可按各自实测丢片率微调
