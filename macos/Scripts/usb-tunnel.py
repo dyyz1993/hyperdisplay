@@ -52,6 +52,7 @@ def serve(conn, peer):
                     break
                 payload = buf[4:4 + ln]
                 buf = buf[4 + ln:]
+                print(f"rx type={payload[0] if payload else -1} len={ln} first={payload[:16].hex()}", flush=True)
                 udp.sendto(payload, ("127.0.0.1", UDP_PORT))
     except Exception:
         pass

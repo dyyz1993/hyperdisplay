@@ -384,7 +384,11 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     byteArrayOf(0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1))
                 s.connect(java.net.InetSocketAddress(v6, 5280), 1500)
                 s.soTimeout = 1500
-                val hello = byteArrayOf(0x10.toByte(), 0,0,0,0, 1, 0x20,3, 0xE8.toByte(),7)
+                val code = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
+                // 报文 = [type][seq u32][proto u8][w u16][h u16][code u32]
+                val hello = java.nio.ByteBuffer.allocate(14).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    .put(0x10.toByte()).putInt(0).put(1.toByte()).putShort(800).putShort(600)
+                    .putInt(code).array()
                 s.getOutputStream().write(java.nio.ByteBuffer.allocate(4 + hello.size)
                     .order(java.nio.ByteOrder.LITTLE_ENDIAN)
                     .putInt(hello.size).put(hello).array())
