@@ -10,16 +10,26 @@ final class VirtualDisplay {
     let pixelWidth: Int
     let pixelHeight: Int
 
-    init?(width: Int, height: Int, refreshRate: Double = 60, serial: UInt32 = 1) {
-        let id = hyperdisplayCreateVirtualDisplay(UInt32(width), UInt32(height), refreshRate, "Hyperdisplay", serial)
+    /// - Parameters:
+    ///   - width/height: **逻辑尺寸**。hiDPI=2 时物理像素为 2 倍（1400x920 → 2800x1840）
+    ///   - hiDPI: 2 = macOS 2x 渲染（UI 常规大小 + 视网膜级文字锐度）；0 = 1x
+    init?(width: Int, height: Int, refreshRate: Double = 60, serial: UInt32 = 1, hiDPI: Int = 0) {
+        let id = hyperdisplayCreateVirtualDisplay(UInt32(width), UInt32(height), refreshRate, "Hyperdisplay", serial, UInt8(hiDPI))
         guard id != 0 else {
             NSLog("[hyperdisplay] CGVirtualDisplay creation failed (id=0)")
             return nil
         }
         self.displayID = id
-        self.pixelWidth = width
-        self.pixelHeight = height
-        NSLog("[hyperdisplay] virtual display created: id=\(id) \(width)x\(height) @\(refreshRate)Hz")
+        // 物理像素以系统回读为准（HiDPI 下 != 传入逻辑尺寸）
+        if let mode = CGDisplayCopyDisplayMode(id) {
+            self.pixelWidth = Int(mode.pixelWidth)
+            self.pixelHeight = Int(mode.pixelHeight)
+        } else {
+            self.pixelWidth = width
+            self.pixelHeight = height
+        }
+        let b = CGDisplayBounds(id)
+        NSLog("[hyperdisplay] virtual display created: id=\(id) logical=\(width)x\(height) bounds=\(Int(b.width))x\(Int(b.height)) pixels=\(pixelWidth)x\(pixelHeight) hidpi=\(hiDPI) @\(refreshRate)Hz")
     }
 
     deinit {

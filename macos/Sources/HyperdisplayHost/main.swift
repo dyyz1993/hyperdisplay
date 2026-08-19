@@ -526,8 +526,21 @@ final class HostApp: NSObject, NSApplicationDelegate {
         if let last = lastCreateFailAt, Date().timeIntervalSince(last) < 1.0 { return nil }
         // CGVirtualDisplay 会拒绝非 16 对齐尺寸（手机原生 2131x1080 → id=0），
         // 统一对齐后再建；档案匹配/记录均用对齐值，保证重连恒定命中
-        let w = max(640, (width + 15) & ~15)
-        let h = max(480, (height + 15) & ~15)
+        let w0 = max(640, (width + 15) & ~15)
+        let h0 = max(480, (height + 15) & ~15)
+        // 清晰度档位：物理长边 >2240（高密度面板原生）时等比降到 2240。
+        // 已实测 CGVirtualDisplay 无法生成 HiDPI 2x 模式（密度申报到 237DPI 也只有
+        // 1x 档，settings.hiDPI 同样无效）——2x 渲染不可达，清晰度只能靠像素档权衡：
+        // 2800 原生(文字 ~69% 常规大小) / 2240 高清(~86%，像素量 64% 原生) / 1920 标准。
+        // 默认 2240：文字明显更锐、大小仍舒适。
+        let w: Int, h: Int
+        if max(w0, h0) > 2240 {
+            let scale = 2240.0 / Double(max(w0, h0))
+            w = max(640, (Int(Double(w0) * scale) + 15) & ~15)
+            h = max(480, (Int(Double(h0) * scale) + 15) & ~15)
+        } else {
+            w = w0; h = h0
+        }
         // EDID serial：默认屏恒 1；设备档案屏 = 1000 + 设备指纹低 16 位（同一设备重连恒定）
         // → macOS 视作「同一台显示器回来了」：排列位置与窗口归属自动还原
         let serial: UInt32 = (name.hasPrefix("Hyperdisplay 设备") && currentDeviceId != 0)
@@ -596,22 +609,12 @@ final class HostApp: NSObject, NSApplicationDelegate {
                         NSLog("[hyperdisplay] device \(deviceId) reconnected → recreated \(profile.name) \(profile.w)x\(profile.h) id=\(id)")
                     }
                 } else {
-                    // 新档案存 16 对齐 + 舒适上限尺寸（与 createDisplay 建屏口径一致，重连匹配恒命中）。
-                    // 舒适上限：原生 2800 级面板（~252PPI）上 macOS 按原生像素渲染 → 菜单栏/
-                    // 图标/文字只有常规大小的 ~60%，用户观感"画面很小"。长边 >1920 时等比
-                    // 收缩到 1920：保持设备宽高比（客户端 aspect-fit 无拉伸），UI 回归正常
-                    // 大小，且关键帧体积/编码负载随之大降（2800x1840 → 1920x1264）。
+                    // 新档案存 16 对齐的原生尺寸（与建屏口径一致，重连匹配恒命中）。
+                    // 舒适度不靠降分辨率（那会牺牲清晰度），改由 createDisplay 的 HiDPI
+                    // 2x 渲染实现：UI 常规大小 + 原生像素锐度。
                     let aw = max(640, (Int(cw) + 15) & ~15)
                     let ah = max(480, (Int(ch) + 15) & ~15)
-                    let pw: Int, ph: Int
-                    if max(aw, ah) > 1920 {
-                        let scale = 1920.0 / Double(max(aw, ah))
-                        pw = max(640, (Int(Double(aw) * scale) + 15) & ~15)
-                        ph = max(480, (Int(Double(ah) * scale) + 15) & ~15)
-                    } else {
-                        pw = aw; ph = ah
-                    }
-                    deviceProfiles[deviceId] = (pw, ph, "Hyperdisplay 设备 \(deviceId % 10000)")
+                    deviceProfiles[deviceId] = (aw, ah, "Hyperdisplay 设备 \(deviceId % 10000)")
                 }
             }
             // 目标屏：档案屏优先（剪枝后重入会也能回到自己的屏——setSubscriptions 对

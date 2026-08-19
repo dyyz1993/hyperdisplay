@@ -14,7 +14,7 @@ static void ensureInit(void) {
 
 CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t width, uint32_t height,
                                                     double refreshRate, NSString *name,
-                                                    uint32_t serialNum) {
+                                                    uint32_t serialNum, uint8_t hiDPI) {
     ensureInit();
 
     CGVirtualDisplayDescriptor *descriptor = [[CGVirtualDisplayDescriptor alloc] init];
@@ -22,6 +22,8 @@ CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t width, uint32_t heig
     descriptor.name = name ?: @"Hyperdisplay";
     descriptor.maxPixelsWide = 16384;
     descriptor.maxPixelsHigh = 16384;
+    // 物理尺寸申报：实测对模式列表无影响（237DPI 也不生成 HiDPI 档——CGVirtualDisplay
+    // 无驱动支持，2x 渲染不可达），保持大屏口径即可
     descriptor.sizeInMillimeters = CGSizeMake(600.0 * width / 1920.0, 340.0 * height / 1200.0);
     descriptor.vendorID = 0x1A2B;
     descriptor.productID = 0x0001;
@@ -39,7 +41,8 @@ CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t width, uint32_t heig
                                                                  refreshRate:refreshRate];
     CGVirtualDisplaySettings *settings = [[CGVirtualDisplaySettings alloc] init];
     settings.modes = @[ mode ];
-    settings.hiDPI = 0;
+    // hiDPI=2：mode 尺寸按逻辑坐标解释，物理像素翻倍（macOS 2x 渲染）
+    settings.hiDPI = hiDPI;
 
     if (![display applySettings:settings]) {
         return 0;
