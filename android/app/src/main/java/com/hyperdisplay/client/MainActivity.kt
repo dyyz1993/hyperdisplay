@@ -57,6 +57,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         var stallDecoderRef: VideoDecoder? = null
         var stallInputBase = 0L
         var stallOutputBase = 0
+        var deadTicks = 0 // csd 已到但零渲染的持续秒数（华为坏会话自动恢复用）
     }
 
     private val pipelines = LinkedHashMap<Int, DisplayPipeline>()
@@ -147,6 +148,22 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 } else {
                     p.stallDecoderRef = null
                     p.stallTicks = 0
+                }
+            }
+            // 坏解码器自动恢复：csd 已到但持续 6 秒零渲染（华为硬解坏会话=绿屏）——
+            // 自动重建一次；若重建后仍死则不再自动（避免循环），留给长按手动修复
+            for (p in snapshot) {
+                val d = p.decoder
+                if (d != null && p.csd != null && p.renderedNow == 0) {
+                    p.deadTicks++
+                    if (p.deadTicks == 6) {
+                        Log.w(TAG, "dead decoder (0 renders with csd), auto-bounce display=" + p.id)
+                        p.decoder = null
+                        d.release()
+                        maybeStartDecoder(p)
+                    }
+                } else {
+                    p.deadTicks = 0
                 }
             }
             val s = session
