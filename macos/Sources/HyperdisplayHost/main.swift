@@ -714,11 +714,12 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 stream.idleSince = nil
             }
         }
-        // 闲置回收：协议创建的屏 60s 无人订阅且还留有其他屏 → 销毁
-        // （防止客户端异常退出/反复换布局后孤儿屏堆积、占满上限）
+        // 闲置回收：60s 无人订阅且还留有其他屏 → 销毁（含初始配置屏——
+        // 多块虚拟屏并存时用户会把窗口拖到「没人看」的那块上导致窗口丢失；
+        // 回收后窗口自动弹回主屏，桌面始终只留正在被观看的屏）
         for id in displayOrder {
             guard let s = streams[id] else { continue }
-            if !s.isInitialDisplay, let idle = s.idleSince,
+            if let idle = s.idleSince,
                now.timeIntervalSince(idle) > 60, streams.count > 1 {
                 NSLog("[hyperdisplay] recycling idle display \(id) (no subscribers 60s)")
                 destroyDisplay(id: id)
