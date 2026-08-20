@@ -23,9 +23,12 @@ object UsbProbe {
                 val prefs = context.getSharedPreferences(
                     "MainActivity", Context.MODE_PRIVATE)
                 val code = prefs.getInt("pairingCode", 0)
-                // 报文 = [type][seq u32][proto u8][w u16][h u16][code u32]
+                // 报文 = [type][seq u32][proto u8][w u16][h u16][code u32]。
+                // proto=0xFF 探针标记：host 只回应不注册订阅——普通 HELLO 会被 host
+                // 当真实客户端登记并订阅屏，充电状态变化触发的周期探测会把闲置回收
+                // 卡死（显示永远"有人订着"，2026-08-20 实测）
                 val hello = java.nio.ByteBuffer.allocate(14).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                    .put(0x10.toByte()).putInt(0).put(1.toByte()).putShort(800).putShort(600)
+                    .put(0x10.toByte()).putInt(0).put(0xFF.toByte()).putShort(800).putShort(600)
                     .putInt(code).array()
                 s.getOutputStream().write(java.nio.ByteBuffer.allocate(4 + hello.size)
                     .order(java.nio.ByteOrder.LITTLE_ENDIAN)

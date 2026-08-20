@@ -6,7 +6,9 @@ import HyperdisplayObjC
 // MARK: - 配置
 
 struct Config {
-    var displays: [(width: Int, height: Int)] = [(1920, 1200)]
+    /// 默认空：没人连接时一块屏都不留（HELLO 按需建屏）。显式 --display 仍可预建。
+    /// 此前默认 [(1920,1200)] + 初始屏不回收 = 空闲时 WindowServer 白挂 18MB 像素缓冲。
+    var displays: [(width: Int, height: Int)] = []
     var fps = 60
     var port: UInt16 = 5277
     /// nil = 按分辨率自动（约 5Mbps/百万像素，4–40M 区间）
@@ -628,8 +630,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
         return vd.displayID
     }
 
-    private func destroyDisplay(id: CGDirectDisplayID) {
-        guard streams[id] != nil, streams.count > 1 else { return } // 至少保留一块
+    /// allowLast=true：闲置回收允许清到零屏（菜单手动移除仍保留最后一块护栏）
+    private func destroyDisplay(id: CGDirectDisplayID, allowLast: Bool = false) {
+        guard streams[id] != nil, allowLast || streams.count > 1 else { return }
         streams[id]?.stop()
         streams[id]?.display.destroy()
         streamsLock.lock()
@@ -715,6 +718,13 @@ final class HostApp: NSObject, NSApplicationDelegate {
         case .hello(let proto, let cw, let ch, let code, let deviceId):
             guard code == pairingCode else {
                 NSLog("[hyperdisplay] HELLO from \(addressString(addr)) REJECTED (bad pairing code)")
+                return
+            }
+            if proto == 0xFF {
+                // 探针 HELLO（UsbProbe 链路检测）：只回声不注册——注册会订阅屏，
+                // 周期性充电探测会把闲置回收卡死（显示永远"有人订着"）
+                var a = addr
+                udp?.send(to: &a, Wire.pong(seq: 0, known: false))
                 return
             }
             currentDeviceId = deviceId
@@ -923,17 +933,17 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 stream.restartCaptureIfNeeded(now: now)
             }
         }
-        // 闲置回收：15s 无人订阅且还留有其他屏 → 销毁（含初始配置屏——
-        // 多块虚拟屏并存时用户会把窗口拖到「没人看」的那块上导致窗口丢失；
-        // 回收后窗口自动弹回主屏，桌面始终只留正在被观看的屏。
-        // 60s→15s：强杀/滑掉 app 不发 BYE 时，prune(6s)+本阈值让窗口尽快
-        // 回到主屏可见——「断开即恢复」）
+        // 闲置回收：15s 无人订阅 → 销毁（含初始配置屏——多块虚拟屏并存时用户会把
+        // 窗口拖到「没人看」的那块上导致窗口丢失；回收后窗口自动弹回主屏，桌面
+        // 始终只留正在被观看的屏。60s→15s：强杀/滑掉 app 不发 BYE 时，prune(6s)+
+        // 本阈值让窗口尽快回到主屏可见——「断开即恢复」）。
+        // 2026-08-20：连最后一块也回收——「没人连 = 零屏」是正确语义（WindowServer
+        // 不白挂像素缓冲）；HELLO 路径按设备档案按需重建，连接体验不变。
         for id in displayOrder {
             guard let s = streams[id] else { continue }
-            if let idle = s.idleSince,
-               now.timeIntervalSince(idle) > 15, streams.count > 1 {
+            if let idle = s.idleSince, now.timeIntervalSince(idle) > 15 {
                 NSLog("[hyperdisplay] recycling idle display \(id) (no subscribers 15s)")
-                destroyDisplay(id: id)
+                destroyDisplay(id: id, allowLast: true)
             }
         }
         rebuildMenu(clientCount: clientCount)
