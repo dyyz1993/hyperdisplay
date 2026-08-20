@@ -437,13 +437,25 @@ final class HostApp: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
 
     private var udp: UdpHost?
+    /// streams/displayOrder 只在主线程写；锁仅为 UDP 接收线程的高频包路径提供
+    /// 一致性快照读（ping/nack/input 在接收线程直接处理，避免逐包 async 主线程
+    /// ——那会在包洪峰下把 RunLoop Timer 全部饿死：tick/哨兵停摆、进程"假死"，
+    /// 2026-08-20 实测定位。写点仍全部主线程，读用快照，无嵌套锁风险。）
     private var streams: [CGDirectDisplayID: DisplayStream] = [:]
     private var displayOrder: [CGDirectDisplayID] = []
+    private let streamsLock = NSLock()
+
+    private func snapshotStreams() -> [CGDirectDisplayID: DisplayStream] {
+        streamsLock.lock(); defer { streamsLock.unlock() }
+        return streams
+    }
     private var clients: [String: Client] = [:]
     private let clientsLock = NSLock()
     private var permissionsGranted = false
     private var currentDeviceId: UInt32 = 0
     private var displaySerial = 0
+    /// 首次输入日志（接收线程写）：SET 锁不便宜但每客户端只写一次，可接受
+    private var loggedInputClientsLock = NSLock()
     private var loggedInputClients = Set<String>()
     private var didIdleReset = false
     /// 设备档案：deviceId → (宽, 高, 名称, 上次位置)。重连时按档案复建同一块屏
@@ -546,8 +558,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
             }
             displayHealth.onAlert = { [weak self] msg in
                 NSLog("[hyperdisplay] ⚠️ %@", msg)
-                let alerting = self?.displayHealth.colorSyncAlertActive == true
-                self?.statusItem.button?.title = alerting ? "◧⚠" : "◧"
+                self?.refreshStatusIcon()
                 self?.rebuildMenu()
             }
             displayHealth.start()
@@ -608,8 +619,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
             display: vd, fps: config.fps,
             bitrate: perStream,
             host: self, udp: udp)
+        streamsLock.lock()
         streams[vd.displayID] = stream
-        displayOrder.append(vd.displayID)
+        streamsLock.unlock()
         if currentDeviceId != 0 {
             deviceProfiles[currentDeviceId] = (w, h, name) // 记对齐值，与屏实际尺寸/匹配口径一致
         }
@@ -620,7 +632,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
         guard streams[id] != nil, streams.count > 1 else { return } // 至少保留一块
         streams[id]?.stop()
         streams[id]?.display.destroy()
+        streamsLock.lock()
         streams[id] = nil
+        streamsLock.unlock()
         displayOrder.removeAll { $0 == id }
         clientsLock.lock()
         for key in clients.keys {
@@ -632,8 +646,62 @@ final class HostApp: NSObject, NSApplicationDelegate {
     // MARK: 报文处理（UDP 接收线程 → 主线程分发）
 
     private func handlePacket(_ packet: Packet, from addr: sockaddr_in) {
-        DispatchQueue.main.async { [weak self] in
-            self?.handlePacketOnMain(packet, from: addr)
+        // 高频包（ping/nack/input/keyframeReq/bye 轻路径）在接收线程直接处理：
+        // 逐包 async 主线程会在包洪峰（多客户端×心跳×输入×NACK）下把主 RunLoop 的
+        // Timer 全部饿死——tick/哨兵/看门狗停摆、进程"假死"（2026-08-20 实测定位）。
+        // 这些 handler 只碰锁保护的 clients / streams 快照 / injector / udp 发送，
+        // 天然线程安全；会话变更类（HELLO/SELECT/SUBSCRIBE/RECYCLE/CREATE/DESTROY）
+        // 仍走主线程 async（低频、且要碰 CG/菜单）。
+        switch packet {
+        case .ping(let seq):
+            let key = clientKey(addr)
+            clientsLock.lock()
+            clients[key]?.lastSeen = Date()
+            let known = clients[key]?.displayIds.isEmpty == false
+            clientsLock.unlock()
+            var a = addr
+            udp?.send(to: &a, Wire.pong(seq: seq, known: known))
+        case .nack(let displayId, let frameId, let indices):
+            if let stream = snapshotStreams()[CGDirectDisplayID(displayId)] {
+                stream.handleNack(frameId: frameId, indices: indices, to: addr)
+            }
+        case .inputMove(let displayId, let seq, let x, let y):
+            if let stream = snapshotStreams()[CGDirectDisplayID(displayId)] {
+                loggedInputClientsLock.lock()
+                let first = loggedInputClients.insert(clientKey(addr)).inserted
+                loggedInputClientsLock.unlock()
+                if first {
+                    NSLog("[hyperdisplay] first input from \(addressString(addr)): move=(\(x), \(y)) display=\(displayId)")
+                }
+                stream.injector.move(x: Double(x), y: Double(y))
+                var a = addr
+                udp?.send(to: &a, Wire.inputAck(seq: seq))
+            }
+        case .inputButton(let displayId, let seq, let button, let down, let x, let y):
+            if let stream = snapshotStreams()[CGDirectDisplayID(displayId)] {
+                stream.injector.button(button, down: down != 0, x: Double(x), y: Double(y))
+                var a = addr
+                udp?.send(to: &a, Wire.inputAck(seq: seq))
+            }
+        case .inputWheel(let displayId, let seq, let dx, let dy, let x, let y):
+            if let stream = snapshotStreams()[CGDirectDisplayID(displayId)] {
+                stream.injector.wheel(dx: Double(dx), dy: Double(dy), x: Double(x), y: Double(y))
+                var a = addr
+                udp?.send(to: &a, Wire.inputAck(seq: seq))
+            }
+        case .keyframeReq(let displayId):
+            let snapshot = snapshotStreams()
+            if displayId == displayIdBroadcast {
+                for stream in snapshot.values {
+                    stream.requestKeyframeAndReplay()
+                }
+            } else if let stream = snapshot[CGDirectDisplayID(displayId)] {
+                stream.requestKeyframeAndReplay()
+            }
+        default:
+            DispatchQueue.main.async { [weak self] in
+                self?.handlePacketOnMain(packet, from: addr)
+            }
         }
     }
 
@@ -715,50 +783,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 clientsLock.unlock()
             }
 
-        case .keyframeReq(let displayId):
-            if displayId == displayIdBroadcast {
-                for stream in streams.values {
-                    stream.requestKeyframeAndReplay()
-                }
-            } else if let stream = streams[CGDirectDisplayID(displayId)] {
-                stream.requestKeyframeAndReplay()
-            }
-
-        case .nack(let displayId, let frameId, let indices):
-            if let stream = streams[CGDirectDisplayID(displayId)] {
-                stream.handleNack(frameId: frameId, indices: indices, to: addr)
-            }
-
-        case .inputMove(let displayId, let seq, let x, let y):
-            if let stream = streams[CGDirectDisplayID(displayId)] {
-                if loggedInputClients.insert(key).inserted {
-                    NSLog("[hyperdisplay] first input from \(addressString(addr)): move=(\(x), \(y)) display=\(displayId)")
-                }
-                stream.injector.move(x: Double(x), y: Double(y))
-                var a = addr
-                udp?.send(to: &a, Wire.inputAck(seq: seq))
-            }
-
-        case .inputButton(let displayId, let seq, let button, let down, let x, let y):
-            if let stream = streams[CGDirectDisplayID(displayId)] {
-                stream.injector.button(button, down: down != 0, x: Double(x), y: Double(y))
-                var a = addr
-                udp?.send(to: &a, Wire.inputAck(seq: seq))
-            }
-
-        case .inputWheel(let displayId, let seq, let dx, let dy, let x, let y):
-            if let stream = streams[CGDirectDisplayID(displayId)] {
-                stream.injector.wheel(dx: Double(dx), dy: Double(dy), x: Double(x), y: Double(y))
-                var a = addr
-                udp?.send(to: &a, Wire.inputAck(seq: seq))
-            }
-
-        case .ping(let seq):
-            clientsLock.lock()
-            let known = clients[key]?.displayIds.isEmpty == false
-            clientsLock.unlock()
-            var a = addr
-            udp?.send(to: &a, Wire.pong(seq: seq, known: known))
+        case .keyframeReq, .nack, .inputMove, .inputButton, .inputWheel, .ping:
+            break // 已在接收线程直接处理（见 handlePacket），主线程不再走
 
         case .recycle:
             // 客户端要换布局：整体回收流/屏（VideoToolbox 会话经反复建销会产出
@@ -852,7 +878,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
             streams[id]?.stop()
             streams[id]?.display.destroy()
         }
+        streamsLock.lock()
         streams.removeAll()
+        streamsLock.unlock()
         displayOrder.removeAll()
         for d in config.displays {
             let id = createDisplay(width: d.width, height: d.height, name: nextDisplayName())
@@ -1024,9 +1052,14 @@ final class HostApp: NSObject, NSApplicationDelegate {
         } else {
             menu.addItem(withTitle: "USB 隧道不可用（未找到 adb）", action: nil, keyEquivalent: "")
         }
-        // 显示器卫生状态行（DisplayHealth 哨兵）
+        // 显示器卫生状态行（DisplayHealth 哨兵，三级）
         if let cpu = displayHealth.lastColorSyncCPU {
-            let mark = displayHealth.colorSyncAlertActive ? "⚠️ 中毒——请注销会话（AGENTS 4.1.6）" : "正常"
+            let mark: String
+            switch displayHealth.level {
+            case .hot: mark = "⚠️ 中毒——请注销会话（AGENTS 4.1.6）"
+            case .warm: mark = "🔶 温和残留——建议今日收工时注销一次"
+            case .normal: mark = "正常"
+            }
             menu.addItem(withTitle: "ColorSync \(String(format: "%.0f", cpu))%：\(mark)", action: nil, keyEquivalent: "")
         }
         if clientCount >= 0 {
@@ -1071,6 +1104,14 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     // MARK: 登录自启（零点击链路：Mac 侧常驻，AGENTS.md §7.1）
 
+    private func refreshStatusIcon() {
+        switch displayHealth.level {
+        case .hot: statusItem.button?.title = "◧⚠"
+        case .warm: statusItem.button?.title = "◧🔶"
+        case .normal: statusItem.button?.title = "◧"
+        }
+    }
+
     private func loginItemTitle() -> String {
         let on = SMAppService.mainApp.status == .enabled
         return on ? "✓ 开机自动启动" : "开机自动启动"
@@ -1102,7 +1143,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
             stream.stop()
             stream.display.destroy()
         }
+        streamsLock.lock()
         streams.removeAll()
+        streamsLock.unlock()
         // 兜底：streams 之外若有漏网的显示器对象（理论上没有），一并清掉
         hyperdisplayDestroyAllVirtualDisplays()
     }

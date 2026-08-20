@@ -4,8 +4,12 @@ import CoreGraphics
 import HyperdisplayObjC
 
 /// 显示器健康监控（AGENTS §4.1 churn 卫生的运行时哨兵）：
-/// 1. **ColorSync 中毒探测**：`colorsync.displayservices` 持续高 CPU（>50% 连续 3 个
-///   采样）→ 告警并引导按 4.1.6 预案处置（注销，勿反复 kill）；CPU 回落 <1% 报痊愈。
+/// 1. **ColorSync 三级监控**：
+///   - 红色中毒：>50% 连续 3 采样（90s）→ 告警 + 处置预案（注销，勿反复 kill）
+///   - 黄色预警：>8% 持续 10 分钟 → 提示「建销余波/温和残留，建议今日收工时注销」。
+///     红色判据抓不到这个区间（实测中毒后余波可长期停在 10-20%，零日志无功能影响，
+///     但不归零）——黄色档让「不正常但能忍」可见、可决策，而不是静默。
+///   - 痊愈：<1% → 解除告警/预警
 /// 2. **孤儿屏检测**：windowserver 挂着我们的 EDID（vendor 0x1A2B）但 host 内部无
 ///   对应流（崩溃/竞态泄漏）→ 连续两个采样都在才回收（避免误杀建屏竞态中的屏）。
 /// 3. **churn 预算**：滑动窗口统计建屏次数，1 小时 >20 次告警（重连风暴/误回收信号，
@@ -15,14 +19,26 @@ final class DisplayHealthMonitor {
     static let vendorId: UInt32 = 0x1A2B   // 与 VirtualDisplayShim 的 EDID vendor 恒定一致
     private static let hotThreshold: Double = 50.0
     private static let hotStreakLimit = 3
+    private static let warmThreshold: Double = 8.0
+    private static let warmDurationLimit: TimeInterval = 600 // 10 分钟
     private static let creationBudgetPerHour = 20
+
+    enum ColorSyncLevel { case normal, warm, hot }
 
     private var timer: Timer?
     private var hotStreak = 0
+    private var warmSince: Date?
     private var creations: [Date] = []
     private var lastOrphans: [CGDirectDisplayID] = []
     private(set) var lastColorSyncCPU: Double?
     private(set) var colorSyncAlertActive = false
+    private(set) var colorSyncWarmActive = false
+
+    var level: ColorSyncLevel {
+        if colorSyncAlertActive { return .hot }
+        if colorSyncWarmActive { return .warm }
+        return .normal
+    }
 
     /// host 注入：当前合法 display id 集合（streams keys，主线程读）
     var expectedDisplayIds: () -> Set<CGDirectDisplayID> = { [] }
@@ -62,7 +78,10 @@ final class DisplayHealthMonitor {
     private func sampleColorSync() {
         guard let cpu = Self.processCPU(named: "colorsync.displayservices") else { return }
         lastColorSyncCPU = cpu
+        let now = Date()
         if cpu > Self.hotThreshold {
+            warmSince = nil
+            colorSyncWarmActive = false
             hotStreak += 1
             if hotStreak >= Self.hotStreakLimit && !colorSyncAlertActive {
                 colorSyncAlertActive = true
@@ -70,11 +89,28 @@ final class DisplayHealthMonitor {
                     format: "ColorSync 中毒：colorsync.displayservices 持续 %d%% CPU。按预案处置（AGENTS 4.1.6）：注销会话，未愈则重启；杀该进程无效，勿反复尝试。痊愈判据 CPU<1%%。",
                     Int(cpu)))
             }
+        } else if cpu > Self.warmThreshold {
+            hotStreak = 0
+            // 黄色档：>8% 持续 10 分钟才算（短暂余波正常，不骚扰）
+            if colorSyncAlertActive { return } // 红色未解除期间不降级打横幅
+            if warmSince == nil { warmSince = now }
+            if !colorSyncWarmActive,
+               let since = warmSince, now.timeIntervalSince(since) > Self.warmDurationLimit {
+                colorSyncWarmActive = true
+                onAlert?(String(
+                    format: "ColorSync 温和残留：%.0f%% CPU 已持续 10 分钟（无功能影响但未归零，疑似建销余波）。建议今日收工时注销一次清零；若升到 50%% 会转为中毒告警。",
+                    cpu))
+            }
         } else {
             hotStreak = 0
+            warmSince = nil
             if colorSyncAlertActive && cpu < 1.0 {
                 colorSyncAlertActive = false
                 onAlert?(String(format: "ColorSync 已痊愈（CPU %.1f%%）", cpu))
+            }
+            if colorSyncWarmActive && cpu < Self.warmThreshold {
+                colorSyncWarmActive = false
+                onAlert?(String(format: "ColorSync 残留已消退（CPU %.1f%%）", cpu))
             }
         }
     }
