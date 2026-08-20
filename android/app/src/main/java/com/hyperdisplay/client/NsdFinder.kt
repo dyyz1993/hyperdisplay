@@ -17,7 +17,7 @@ class NsdFinder(context: Context) {
         private const val SERVICE_TYPE = "_hyperdisplay._udp."
     }
 
-    class HostEntry(val name: String, val host: String, val port: Int) {
+    class HostEntry(val name: String, val host: String, val port: Int, val code: Int = 0) {
         override fun toString(): String = "$name ($host)"
     }
 
@@ -95,7 +95,10 @@ class NsdFinder(context: Context) {
                     synchronized(resolving) { resolving.remove(name) }
                     val host = info?.host?.hostAddress ?: return
                     val port = if ((info?.port ?: 0) > 0) info.port else 5277
-                    val entry = HostEntry(name, host, port)
+                    // TXT 携带配对码（单用户家用网络，AGENTS.md §7.4）：发现即得码，零点击
+                    val code = info?.attributes?.get("code")
+                        ?.let { bytes -> String(bytes, Charsets.UTF_8).toIntOrNull() } ?: 0
+                    val entry = HostEntry(name, host, port, code)
                     main.post {
                         found[name] = entry
                         onHost?.invoke(entry)

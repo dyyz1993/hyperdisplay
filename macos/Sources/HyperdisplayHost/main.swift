@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import ServiceManagement
 import HyperdisplayObjC
 
 // MARK: - 配置
@@ -148,6 +149,7 @@ final class DisplayStream {
     private var lastKeyframeRequestAt = Date.distantPast
     private var starting = false
     private(set) var started = false
+    private var captureStartedAt: Date?
     private var lastCaptureRestartAt = Date.distantPast
     private(set) var effectiveFps = 0
     private var encodedSnapshot: UInt64 = 0
@@ -193,12 +195,33 @@ final class DisplayStream {
     /// 有订阅者但 2.5s 零事件 → 只重建采集流（编码器会话不动——重开 VideoToolbox
     /// 会触发华为硬解绿屏），重启后等 idle 帧填充缓存再补关键帧（客户端仍显示
     /// 旧帧，无黑闪）。
+    /// 升级路径（2026-08-20 实测）：中毒系统（如 ColorSync 异常）下同一块屏重启
+    /// 采集流救不活，但换一块新屏立刻复活 → 90s 窗口内 3 次流重启即 fullIdleReset
+    /// （重建全部屏），10 分钟限频，防 churn。注意不能用"有帧到达"清零——每次
+    /// 重启后 SCK 常回光返照吐一两帧又死，帧计数永远到不了阈值。
+    private var captureRestartTimes: [Date] = []
+    private var lastIdleResetEscalationAt: Date?
+
     func restartCaptureIfNeeded(now: Date) {
         guard started, !starting, let oldCapture = capture else { return }
         guard host?.addressesOfSubscribers(of: display.displayID).isEmpty == false else { return }
-        guard let lastEvent = oldCapture.lastEventAt else { return }
-        let silent = now.timeIntervalSince(lastEvent)
-        guard silent > 2.5, now.timeIntervalSince(lastCaptureRestartAt) > 5 else { return }
+        // lastEventAt == nil：流起手就没吐过任何事件（SCK 起手即死），拿启动时刻当
+        // 静默参照——否则看门狗对这种流永远失明
+        let neverDelivered = oldCapture.lastEventAt == nil
+        guard let reference = oldCapture.lastEventAt ?? captureStartedAt else { return }
+        let silent = now.timeIntervalSince(reference)
+        guard silent > (neverDelivered ? 10 : 2.5), now.timeIntervalSince(lastCaptureRestartAt) > 5 else { return }
+        captureRestartTimes.append(now)
+        captureRestartTimes.removeAll { now.timeIntervalSince($0) > 90 }
+        if captureRestartTimes.count >= 3,
+           lastIdleResetEscalationAt.map({ now.timeIntervalSince($0) > 600 }) ?? true {
+            let restarts = captureRestartTimes.count
+            lastIdleResetEscalationAt = now
+            captureRestartTimes.removeAll()
+            NSLog("[hyperdisplay] capture stuck through \(restarts) restarts on display \(display.displayID) — escalating to full idle reset")
+            host?.escalateToIdleReset()
+            return
+        }
         lastCaptureRestartAt = now
         NSLog("[hyperdisplay] capture watchdog: display \(display.displayID) silent \(Int(silent))s — restarting capture")
         oldCapture.stop()
@@ -214,7 +237,10 @@ final class DisplayStream {
             do {
                 try await capture.start(displayID: display.displayID, width: scaledW, height: scaledH, fps: fps)
                 try await Task.sleep(nanoseconds: 300_000_000) // 等 idle 事件填充 lastFrame
-                await MainActor.run { self?.requestKeyframeAndReplay() }
+                await MainActor.run {
+                    self?.captureStartedAt = Date()
+                    self?.requestKeyframeAndReplay()
+                }
             } catch {
                 NSLog("[hyperdisplay] capture restart failed for display \(display.displayID): \(error)")
             }
@@ -287,6 +313,7 @@ final class DisplayStream {
                 try await capture.start(displayID: display.displayID, width: scaledW, height: scaledH, fps: fps)
                 await MainActor.run {
                     self?.started = true
+                    self?.captureStartedAt = Date()
                     self?.starting = false
                     self?.sendWelcome(codec: codec)
                     self?.requestKeyframeAndReplay()
@@ -437,6 +464,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
     }()
     private let bonjour = BonjourAdvertiser()
     private let qrPanel = QRPanelController()
+    private let usbTunnel = UsbTunnelController()
+    private let displayHealth = DisplayHealthMonitor()
 
     init(config: Config) {
         self.config = config
@@ -502,7 +531,26 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 if let id { streams[id]?.isInitialDisplay = true }
             }
             let hostName = Host.current().localizedName ?? "Mac"
-            _ = bonjour.start(name: "Hyperdisplay (\(hostName))", port: udp.port)
+            _ = bonjour.start(name: "Hyperdisplay (\(hostName))", port: udp.port,
+                              txt: ["code": String(pairingCode)])
+            // USB 隧道桥 + adb reverse 轮询（零点击：插线即用，AGENTS.md §7.1）
+            usbTunnel.onDeviceCountChange = { [weak self] in self?.rebuildMenu() }
+            usbTunnel.start(udpPort: udp.port)
+            // 显示器卫生哨兵（AGENTS §4.1 运行时版）：ColorSync 中毒 / 孤儿屏 / churn 预算
+            displayHealth.expectedDisplayIds = { [weak self] in
+                guard let self else { return [] }
+                return Set(self.streams.keys)
+            }
+            displayHealth.onOrphanDisplays = { ids in
+                for id in ids { hyperdisplayDestroyVirtualDisplay(id) }
+            }
+            displayHealth.onAlert = { [weak self] msg in
+                NSLog("[hyperdisplay] ⚠️ %@", msg)
+                let alerting = self?.displayHealth.colorSyncAlertActive == true
+                self?.statusItem.button?.title = alerting ? "◧⚠" : "◧"
+                self?.rebuildMenu()
+            }
+            displayHealth.start()
             NSLog("[hyperdisplay] host listening on UDP \(udp.port); \(streams.count) virtual display(s)")
         } catch {
             NSLog("[hyperdisplay] \(error)")
@@ -550,6 +598,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
             lastCreateFailAt = Date()
             return nil
         }
+        displayHealth.recordCreation() // churn 预算统计（AGENTS 4.1.2 运行时版）
         guard let udp else { return nil }
         // 多流并发时按预算均分码率：两路 6M 在 2.4GHz 上合计超带宽必丢包；
         // 均分后合计不变，AIMD 仍可按各自实测丢片率微调
@@ -791,6 +840,13 @@ final class HostApp: NSObject, NSApplicationDelegate {
     // MARK: 周期 tick：统计 + 客户端 prune
 
     /// 全量自愈：销毁全部流与虚拟屏，重建初始配置（编码器池归零）
+    /// 看门狗升级入口：采集流连续重启无效（中毒系统），全量重建屏+编码器池。
+    /// AGENTS 4.1.5：fullIdleReset 仅用于污染恢复——此处正是。客户端靠重 HELLO 自愈回订阅。
+    func escalateToIdleReset() {
+        guard !streams.isEmpty else { return }
+        fullIdleReset()
+    }
+
     private func fullIdleReset() {
         for id in displayOrder {
             streams[id]?.stop()
@@ -803,6 +859,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
             if let id { streams[id]?.isInitialDisplay = true }
         }
         NSLog("[hyperdisplay] idle reset: \(streams.count) fresh display(s), encoder pool recycled")
+        pushDisplays() // 必须广播新列表：客户端对账靠 DISPLAYS 触发，不推就冻死在死 id 上
         rebuildMenu()
     }
 
@@ -952,6 +1009,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
         menu.setSubmenu(removeSub, for: remove)
 
         menu.addItem(.separator())
+        let loginItem = menu.addItem(withTitle: loginItemTitle(), action: #selector(toggleLoginItem), keyEquivalent: "")
+        loginItem.target = self
         menu.addItem(withTitle: "配对码: \(pairingCode)（客户端首次连接需输入）", action: nil, keyEquivalent: "")
         let qrItem = menu.addItem(withTitle: "显示连接二维码…", action: #selector(showQR), keyEquivalent: "")
         qrItem.target = self
@@ -959,6 +1018,16 @@ final class HostApp: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "本机 UDP \(port)：", action: nil, keyEquivalent: "")
         for line in Self.allInterfaceAddresses(port: Int(port)) {
             menu.addItem(withTitle: "  \(line)", action: nil, keyEquivalent: "")
+        }
+        if usbTunnel.adbAvailable {
+            menu.addItem(withTitle: "USB 隧道 :\(UsbTunnelController.tcpPort)（\(usbTunnel.deviceCount) 台设备已配 reverse）", action: nil, keyEquivalent: "")
+        } else {
+            menu.addItem(withTitle: "USB 隧道不可用（未找到 adb）", action: nil, keyEquivalent: "")
+        }
+        // 显示器卫生状态行（DisplayHealth 哨兵）
+        if let cpu = displayHealth.lastColorSyncCPU {
+            let mark = displayHealth.colorSyncAlertActive ? "⚠️ 中毒——请注销会话（AGENTS 4.1.6）" : "正常"
+            menu.addItem(withTitle: "ColorSync \(String(format: "%.0f", cpu))%：\(mark)", action: nil, keyEquivalent: "")
         }
         if clientCount >= 0 {
             menu.addItem(withTitle: "客户端: \(clientCount) 个在线", action: nil, keyEquivalent: "")
@@ -1000,12 +1069,35 @@ final class HostApp: NSObject, NSApplicationDelegate {
         Permissions.requestScreenRecording()
     }
 
+    // MARK: 登录自启（零点击链路：Mac 侧常驻，AGENTS.md §7.1）
+
+    private func loginItemTitle() -> String {
+        let on = SMAppService.mainApp.status == .enabled
+        return on ? "✓ 开机自动启动" : "开机自动启动"
+    }
+
+    @objc private func toggleLoginItem() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            // ad-hoc 签名/非 /Applications 路径下 register 可能被系统拒绝：如实记录
+            NSLog("[hyperdisplay] login item toggle failed: \(error)")
+        }
+        rebuildMenu()
+    }
+
     @objc private func quit() {
         NSApp.terminate(nil)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         bonjour.stop()
+        usbTunnel.stop()
         for stream in streams.values {
             stream.stop()
             stream.display.destroy()
@@ -1063,6 +1155,17 @@ signal(SIGTERM) { _ in
 }
 signal(SIGINT) { _ in
     hyperdisplayDestroyAllVirtualDisplays()
+    exit(0)
+}
+// SIGPIPE 忽略（双保险，socket 上另有 SO_NOSIGPIPE）：向已断开的隧道 TCP 连接写数据
+// 时内核发 SIGPIPE，默认动作是静默终止 host——2026-08-20 实测两次无崩溃报告的暴毙根因。
+signal(SIGPIPE, SIG_IGN)
+
+// 单实例锁：显示器创建虽已集中到 shim + createDisplay 护栏，但两个 host 进程并存
+// 仍意味着双份建销 churn（2026-08-20 调试实测踩过）。文件锁拿不到 = 已有实例，直接退出。
+let singleInstanceFd = open("/tmp/hyperdisplay.host.lock", O_CREAT | O_RDWR, 0o644)
+if singleInstanceFd < 0 || flock(singleInstanceFd, LOCK_EX | LOCK_NB) != 0 {
+    NSLog("[hyperdisplay] another host instance is running (lock held) — exiting")
     exit(0)
 }
 

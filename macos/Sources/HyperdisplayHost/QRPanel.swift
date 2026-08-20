@@ -17,6 +17,9 @@ final class QRPanelController: NSObject, NSWindowDelegate {
         )
         window.title = "扫码 / 局域网连接"
         window.delegate = self
+        // 不能在关闭路径中途释放窗口最后一个强引用：关闭动画仍在飞行时 dealloc
+        // 会在 CA 事务提交时 SIGSEGV（2026-08-20 实测，崩溃在 _NSWindowTransformAnimation dealloc）
+        window.isReleasedWhenClosed = false
         window.center()
 
         let stack = NSStackView()
@@ -58,12 +61,14 @@ final class QRPanelController: NSObject, NSWindowDelegate {
     }
 
     func close() {
-        window?.close()
+        let w = window
         window = nil
+        w?.orderOut(nil) // 先摘引用再隐藏：dealloc 发生在动画事务之外
     }
 
     func windowWillClose(_ notification: Notification) {
-        window = nil
+        // 关闭动画可能仍在飞行：延迟到下一个 runloop 再放手
+        DispatchQueue.main.async { self.window = nil }
     }
 
     static func qrImage(string: String, side: CGFloat) -> NSImage? {

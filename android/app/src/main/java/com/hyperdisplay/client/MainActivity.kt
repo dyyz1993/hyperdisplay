@@ -226,8 +226,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         setContentView(root)
         showConnectView()
         when (intent.getStringExtra("host")?.trim()?.lowercase()) {
-            "smart" -> smartConnect() // 自动选路：USB 优先，否则历史 WiFi
-            null, "" -> Unit
+            "smart" -> smartConnect() // 自动选路：USB 优先，否则历史 WiFi / 自动发现
+            null, "" -> smartConnect() // 零点击基线（AGENTS.md §7.1）：打开 app 即自动连接
             else -> intent.getStringExtra("host")!!.trim().let { text ->
                 parseEndpoint(text)?.let { (host, port) -> connect(host, port) }
             }
@@ -348,6 +348,15 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         openSession(host, port)
     }
 
+    /** 发现结果直接连接：主机地址 + TXT 配对码一并记住（零点击，AGENTS.md §7） */
+    private fun connectEntry(e: NsdFinder.HostEntry) {
+        getPreferences(MODE_PRIVATE).edit()
+            .putString("host", "${e.host}:${e.port}")
+            .putInt("pairingCode", e.code)
+            .apply()
+        connect(e.host, e.port)
+    }
+
     /** 建立会话（连接页与自动重连共用） */
     private fun openSession(host: String, port: Int) {
         disconnectSession()
@@ -373,34 +382,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
-    /** USB 链路探测：完整握手（连上 + 发 HELLO + 等任意回包）。
-     *  线断时 adbd 的监听 socket 仍在、connect 能成，但字节到不了 Mac——必须验回包。 */
+    /** USB 链路探测（共享实现见 UsbProbe；注释保留原由） */
     private fun probeUsb(result: (Boolean) -> Unit) {
-        Thread {
-            var ok = false
-            try {
-                val s = java.net.Socket()
-                s.tcpNoDelay = true
-                val v6 = java.net.InetAddress.getByAddress(
-                    byteArrayOf(0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1))
-                s.connect(java.net.InetSocketAddress(v6, 5280), 1500)
-                s.soTimeout = 1500
-                val code = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
-                // 报文 = [type][seq u32][proto u8][w u16][h u16][code u32]
-                val hello = java.nio.ByteBuffer.allocate(14).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                    .put(0x10.toByte()).putInt(0).put(1.toByte()).putShort(800).putShort(600)
-                    .putInt(code).array()
-                s.getOutputStream().write(java.nio.ByteBuffer.allocate(4 + hello.size)
-                    .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                    .putInt(hello.size).put(hello).array())
-                s.getOutputStream().flush()
-                ok = s.getInputStream().read(ByteArray(64)) > 0
-                s.close()
-            } catch (_: Exception) { }
-            android.util.Log.i("UsbProbe", "result=$ok")
-            val r = ok
-            mainHandler.post { result(r) }
-        }.start()
+        UsbProbe.probe(this, result)
     }
 
     /** 智能连接：有 USB 走 USB，否则走保存过的 WiFi 主机 */
@@ -419,7 +403,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     openSession(ep.first, ep.second)
                     transport = Transport.WIFI
                 } else {
-                    statusText.text = "USB 未连接且无历史主机——请扫码 / 局域网发现 / 输入 IP"
+                    statusText.text = "USB 未连接且无历史主机——自动搜索局域网内的 Mac…"
+                    startAutoDiscovery()
                 }
             }
         }
@@ -505,6 +490,49 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         rebuildDiscoveryDialog()
     }
 
+    // MARK: 自动发现（零点击：唯一主机直接连，多台才弹列表，AGENTS.md §7.4）
+
+    private var autoDiscoveryArmed = false
+    private val autoDiscoveryTick = Runnable { settleAutoDiscovery() }
+
+    private fun startAutoDiscovery() {
+        autoDiscoveryArmed = true
+        statusText.text = "正在搜索局域网内的 Mac…（Mac 端 ◧ 未启动时会一直等，启动后自动连）"
+        nsdFinder.setCallbacks(
+            onStart = { },
+            onHost = {
+                // 去抖：发现结果稳定 1.2s 后再决断（避免第一台出现就抢连）
+                mainHandler.removeCallbacks(autoDiscoveryTick)
+                mainHandler.postDelayed(autoDiscoveryTick, 1200)
+            },
+            onStop = { error ->
+                if (autoDiscoveryArmed) {
+                    autoDiscoveryArmed = false
+                    statusText.text = error ?: "发现已停止——可扫码或手动输入 IP"
+                }
+            }
+        )
+        nsdFinder.startDiscovery()
+    }
+
+    private fun settleAutoDiscovery() {
+        if (!autoDiscoveryArmed) return
+        when (nsdFinder.currentHosts().size) {
+            0 -> mainHandler.postDelayed(autoDiscoveryTick, 1200) // host 未上线：继续等
+            1 -> {
+                autoDiscoveryArmed = false
+                nsdFinder.stopDiscovery()
+                val e = nsdFinder.currentHosts()[0]
+                statusText.text = "发现 ${e.name}（${e.host}），自动连接…"
+                connectEntry(e)
+            }
+            else -> {
+                autoDiscoveryArmed = false
+                showDiscoveryDialog() // 多台才需要人选
+            }
+        }
+    }
+
     private fun rebuildDiscoveryDialog() {
         discoveryDialog?.dismiss()
         val hosts = nsdFinder.currentHosts()
@@ -517,7 +545,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             .setTitle("局域网设备")
             .setItems(items) { _, which ->
                 nsdFinder.stopDiscovery()
-                hosts.getOrNull(which)?.let { connect(it.host, it.port) }
+                hosts.getOrNull(which)?.let { connectEntry(it) }
             }
             .setNegativeButton("取消") { d, _ ->
                 nsdFinder.stopDiscovery()
