@@ -210,9 +210,11 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     mainHandler.post { waitingOverlay.show(rootF) }
                 }
             }
-            // USB 会话已死但没人处理（如重连时桥接还没恢复）：持续重试智能重连
+            // 会话已死但没人处理：USB 死链走智能重连（先试 USB 再降 WiFi）；
+            // WiFi 死链同样必须重连（openSession 的失败路径不重试，躺平=永久等待页）。
+            // 双通道都由这里兜底，5s 节流防风暴。
             val s1 = session
-            if (transport == Transport.USB && !linkUp && s1 != null && !reconnecting
+            if (!linkUp && s1 != null && !reconnecting
                 && System.currentTimeMillis() - lastReconnectAt > 5000) {
                 mainHandler.post { scheduleSmartReconnect() }
             }
@@ -1498,17 +1500,33 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private fun tryFulfillPendingLayout() {
         val regions = pendingRegions ?: return
         val s = session ?: return
-        // 先按缺口补建（RECYCLE 后通常全缺；幂等，凑齐前每轮 DISPLAYS 重复检查）
-        for (size in regions.toSet()) {
-            val need = regions.count { it == size }
+        // 先按缺口补建（RECYCLE 后通常全缺；幂等，凑齐前每轮 DISPLAYS 重复检查）。
+        // 尺寸匹配必须「host 档位感知」：host 对长边 >2240 的请求会自动降到 2240 档
+        // （清晰度档位折中，HiDPI 2x 不可达），按原始请求找屏 = 永远差一块 → 无限
+        // CREATE 循环（churn 风暴）+ 渲染视图永远建不起来（2026-08-20 USB 卡顿根因）。
+        // 对齐口径：期待尺寸 = 与 host createDisplay 相同的 16 对齐 + 2240 降档。
+        fun tierAligned(w: Int, h: Int): Pair<Int, Int> {
+            var aw = maxOf(640, (w + 15) and 15.inv())
+            var ah = maxOf(480, (h + 15) and 15.inv())
+            val long = maxOf(aw, ah)
+            if (long > 2240) {
+                val scale = 2240.0 / long
+                aw = maxOf(640, ((aw * scale).toInt() + 15) and 15.inv())
+                ah = maxOf(480, ((ah * scale).toInt() + 15) and 15.inv())
+            }
+            return aw to ah
+        }
+        val wanted = regions.map { (w, h) -> tierAligned(w, h) }
+        for (size in wanted.toSet()) {
+            val need = wanted.count { it == size }
             val have = displays.count { (it.width to it.height) == size }
             repeat((need - have).coerceAtLeast(0)) {
-                s.createDisplay(size.first, size.second, "布局 ${'$'}{size.first}x${'$'}{size.second}")
+                s.createDisplay(size.first, size.second, "布局 ${size.first}x${size.second}")
             }
         }
         val matched = mutableListOf<Int>()
         val usedIds = mutableSetOf<Int>()
-        for (region in regions) {
+        for (region in wanted) {
             val found = displays.filter { (it.width to it.height) == region && it.id !in usedIds }
                 .minByOrNull { it.id }
             if (found != null) { matched.add(found.id); usedIds.add(found.id) }
