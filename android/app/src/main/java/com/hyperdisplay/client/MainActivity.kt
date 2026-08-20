@@ -40,6 +40,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var session: HostSession? = null
     private var statsOverlay: TextView? = null
     private var sessionRoot: FrameLayout? = null
+    private val waitingOverlay by lazy { WaitingOverlay(this) }
+    private var waitingSince = 0L
     private var switchingBanner: android.widget.LinearLayout? = null
     private var switchingBannerShow: Runnable? = null
     private val regionViews = mutableListOf<StreamView>()
@@ -185,6 +187,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             }
             val s = session
             if (s != null && linkUp) {
+                waitingSince = 0
+                if (waitingOverlay.parent != null) waitingOverlay.dismiss()
                 for (p in snapshot) {
                     if (p.decoder == null && p.csd == null) {
                         val now = System.currentTimeMillis()
@@ -193,6 +197,17 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                             s.requestKeyframe(p.id)
                         }
                     }
+                }
+            } else if (s != null && sessionRoot != null) {
+                // 断链等待 >3s 且还没恢复：全屏等待页（双通道动画 + 动态文案）。
+                // 3s 宽限是为了不给快闪断（WiFi 探测的瞬时失败）闪屏。
+                val now = System.currentTimeMillis()
+                if (waitingSince == 0L) waitingSince = now
+                if (now - waitingSince > 3000) {
+                    waitingOverlay.tryingUsb = true
+                    waitingOverlay.tryingWifi = true // 智能重连两条路都在试
+                    val rootF = root
+                    mainHandler.post { waitingOverlay.show(rootF) }
                 }
             }
             // USB 会话已死但没人处理（如重连时桥接还没恢复）：持续重试智能重连
@@ -1647,6 +1662,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     // MARK: 生命周期收尾
 
     private fun disconnectSession() {
+        waitingSince = 0
+        if (waitingOverlay.parent != null) waitingOverlay.dismiss()
         stopService(android.content.Intent(this, SessionService::class.java))
         mainHandler.removeCallbacks(statsTick)
         synchronized(pipelineLock) {
