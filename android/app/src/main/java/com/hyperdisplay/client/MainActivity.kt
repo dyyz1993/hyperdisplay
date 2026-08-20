@@ -40,6 +40,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var session: HostSession? = null
     private var statsOverlay: TextView? = null
     private var sessionRoot: FrameLayout? = null
+    private var switchingBanner: android.widget.LinearLayout? = null
+    private var switchingBannerShow: Runnable? = null
     private val regionViews = mutableListOf<StreamView>()
 
     private class DisplayPipeline(val id: Int) {
@@ -120,6 +122,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 pipelines.values.toList()
             }
             renderFps = total
+            // 新会话首帧落地 → 撤切换横幅（快切换时它根本没来得及浮现）
+            if (total > 0) cancelSwitchingBanner()
             for (p in snapshot) p.assembler?.stallCheck()
             // 解码器死亡检测：仅在「有输入提交但输出 3 秒不涨」时重建——
             // 静止桌面（内容驱动、无新帧）下输出冻结是合法状态，不能误杀
@@ -197,14 +201,15 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 && System.currentTimeMillis() - lastReconnectAt > 5000) {
                 mainHandler.post { scheduleSmartReconnect() }
             }
-            // WiFi 期间每 10s 探测 USB，可用即自动升级（有线优先）
+            // WiFi 期间周期探测 USB 兜底（30s；插线即时触发见 onResume 注册的 onPlugged）
             usbProbeCounter++
             val s0 = session
-            if (usbProbeCounter >= 10) {
+            if (usbProbeCounter >= 30) {
                 usbProbeCounter = 0
                 if (transport == Transport.WIFI && linkUp && s0 != null) {
                     probeUsb { usbOk ->
                         if (usbOk && transport == Transport.WIFI) {
+                            scheduleSwitchingBanner()
                             openSession("127.0.0.1", 5280)
                             transport = Transport.USB
                         }
@@ -360,6 +365,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     /** 建立会话（连接页与自动重连共用） */
     private fun openSession(host: String, port: Int) {
         disconnectSession()
+        // 快切换不浮现：延迟 1.5s 才显示横幅，首帧渲染即撤（见 pipeline 首帧回调处）
+        scheduleSwitchingBanner()
         val code = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
         val deviceId = HostSession.loadOrCreateDeviceId(this)
         val s = HostSession.create(host, port, sessionListener, code, deviceId)
@@ -385,6 +392,29 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     /** USB 链路探测（共享实现见 UsbProbe；注释保留原由） */
     private fun probeUsb(result: (Boolean) -> Unit) {
         UsbProbe.probe(this, result)
+    }
+
+    // MARK: 通道切换过渡横幅（快切换不浮现，慢 1.5s 后出现）
+
+    private fun scheduleSwitchingBanner() {
+        cancelSwitchingBanner()
+        val r = Runnable {
+            val b = switchingBanner ?: return@Runnable
+            b.visibility = android.view.View.VISIBLE
+            b.alpha = 0f
+            b.animate()?.alpha(1f)?.setDuration(200)?.start()
+        }
+        switchingBannerShow = r
+        mainHandler.postDelayed(r, 1500)
+    }
+
+    private fun cancelSwitchingBanner() {
+        switchingBannerShow?.let { mainHandler.removeCallbacks(it) }
+        switchingBannerShow = null
+        switchingBanner?.let {
+            it.animate().cancel()
+            it.visibility = android.view.View.GONE
+        }
     }
 
     /** 智能连接：有 USB 走 USB，否则走保存过的 WiFi 主机 */
@@ -760,6 +790,34 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         root.addView(container, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         sessionRoot = container
+
+        // 通道切换过渡横幅：屏幕中央半透明黑底「正在切换到 USB/WiFi…」。
+        // 快切换（<1.5s 出画面）不浮现——不打扰；慢了才出现，且半透明灰罩
+        // 压住冻住的旧画面，明确「在切换」而非「卡死」。
+        val banner = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(0xB3000000.toInt())
+            setPadding(48, 36, 48, 36)
+            visibility = android.view.View.GONE
+        }
+        banner.addView(android.widget.TextView(this).apply {
+            text = "正在切换通道…"
+            textSize = 18f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+        })
+        banner.addView(android.widget.TextView(this).apply {
+            text = "画面即将恢复"
+            textSize = 12f
+            setTextColor(0xFFAAAAAA.toInt())
+            gravity = Gravity.CENTER
+            setPadding(0, 10, 0, 0)
+        })
+        root.addView(banner, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT))
+        switchingBanner = banner
 
         val overlay = TextView(this).apply {
             text = "等待视频流…"
@@ -1628,6 +1686,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        UsbPlugReceiver.onPlugged = null // 防泄漏；后台拉起走通知路径
         // 副屏应用：切走/锁屏不「立刻」断流（此前 onPause 直接断连，回来像「断开了」）；
         // 但长时间离开（>10s，如切去打游戏）必须断：否则副屏窗口悬在无人可见的
         // 虚拟屏上，Mac 主屏也看不到——「断开即恢复」由 BYE + host 回收完成
@@ -1648,6 +1707,20 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         super.onResume()
         bgDisconnectRunnable?.let { mainHandler.removeCallbacks(it) }
         bgDisconnectRunnable = null
+        // 插线即探测（秒级升级）：轮询兜底要等最多 30s，事件触发只在会话存活时探测
+        UsbPlugReceiver.onPlugged = {
+            mainHandler.post {
+                if (session != null && transport == Transport.WIFI && linkUp && !reconnecting) {
+                    probeUsb { usbOk ->
+                        if (usbOk && session != null && transport == Transport.WIFI) {
+                            scheduleSwitchingBanner()
+                            openSession("127.0.0.1", 5280)
+                            transport = Transport.USB
+                        }
+                    }
+                }
+            }
+        }
         // 后台自动断开过 → 无缝重连（EDID 档案屏：位置还原）
         if (autoDisconnectedByBg) {
             autoDisconnectedByBg = false

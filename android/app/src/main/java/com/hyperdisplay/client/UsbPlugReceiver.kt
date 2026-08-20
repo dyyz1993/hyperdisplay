@@ -1,34 +1,30 @@
 package com.hyperdisplay.client
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 
 /**
- * 插线自动拉起（零点击，AGENTS.md §7.1）：
- * 任何供电接入（含 Mac USB）都触发本接收器——静默探测 USB 隧道，
- * 只有隧道握手成功（= 确实插在跑着 host 的 Mac 上）才提醒；
- * 插充电器时探测失败，零打扰。
- *
- * Android 10+ 后台禁止直接 startActivity，用 fullScreenIntent 通知：
- * 亮屏时是横幅点一下，息屏时直接全屏拉起。
+ * 传输切换触发器：插线（POWER_CONNECTED）立即触发 USB 探测回调——
+ * WiFi 会话期间等 10s 轮询太慢（平均 5s、最坏 10s），插线事件把升级
+ * 探测提速到秒级。轮询保留为兜底（接收器未注册/事件丢失时）。
+ * 拔线（DISCONNECTED）不在这里处理：会话死亡走 onLinkEvent 降级路径。
  */
 class UsbPlugReceiver : BroadcastReceiver() {
     companion object {
-        private const val CHANNEL = "usb_plug"
-        private const val NOTIFY_ID = 1001
+        @Volatile var onPlugged: (() -> Unit)? = null
     }
 
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Intent.ACTION_POWER_CONNECTED) return
-        val pending = goAsync()
-        UsbProbe.probe(context) { ok ->
-            if (ok) notifyUsbReady(context)
-            pending.finish()
+        when (intent.action) {
+            Intent.ACTION_POWER_CONNECTED -> {
+                // 前台已运行：只做升级探测回调（不弹通知）；未运行：通知拉起
+                if (onPlugged != null) {
+                    onPlugged?.invoke()
+                } else {
+                    notifyUsbReady(context)
+                }
+            }
         }
     }
 
@@ -37,15 +33,15 @@ class UsbPlugReceiver : BroadcastReceiver() {
             putExtra("host", "smart")
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         }
-        val pi = PendingIntent.getActivity(
+        val pi = android.app.PendingIntent.getActivity(
             context, 0, launch,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
         if (android.os.Build.VERSION.SDK_INT >= 26) {
-            nm.createNotificationChannel(NotificationChannel(
-                CHANNEL, "USB 连线", NotificationManager.IMPORTANCE_HIGH))
+            nm.createNotificationChannel(android.app.NotificationChannel(
+                "usb_plug", "USB 连线", android.app.NotificationManager.IMPORTANCE_HIGH))
         }
-        val n = Notification.Builder(context, CHANNEL)
+        val n = android.app.Notification.Builder(context, "usb_plug")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle("Mac 已连线")
             .setContentText("点按开始副屏")
@@ -53,6 +49,6 @@ class UsbPlugReceiver : BroadcastReceiver() {
             .setFullScreenIntent(pi, true)
             .setAutoCancel(true)
             .build()
-        nm.notify(NOTIFY_ID, n)
+        nm.notify(1001, n)
     }
 }
