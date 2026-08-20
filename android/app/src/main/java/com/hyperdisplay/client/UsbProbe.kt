@@ -16,8 +16,10 @@ object UsbProbe {
                 s.tcpNoDelay = true
                 val v6 = java.net.InetAddress.getByAddress(
                     byteArrayOf(0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1))
-                s.connect(java.net.InetSocketAddress(v6, 5280), 1500)
-                s.soTimeout = 1500
+                // 超时收紧（SLA：触发→见画面 ≤5s，目标 3s）：隧道在时握手是毫秒级，
+                // 半开连接（adbd 活着但 Mac 侧死）才吃满超时——尽快失败尽快降级
+                s.connect(java.net.InetSocketAddress(v6, 5280), 800)
+                s.soTimeout = 1000
                 // Activity.getPreferences 的实际文件名是 Activity 类名（getLocalClassName），
                 // 非 Activity 上下文要显式同名，否则读到 0 → HELLO 被拒
                 val prefs = context.getSharedPreferences(
