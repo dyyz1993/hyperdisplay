@@ -226,8 +226,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 if (transport == Transport.WIFI && linkUp && s0 != null) {
                     probeUsb { usbOk ->
                         if (usbOk && transport == Transport.WIFI) {
-                            scheduleSwitchingBanner()
-                            openSession("127.0.0.1", 5280)
+                            openSession("127.0.0.1", 5280, isSwitch = true)
                             transport = Transport.USB
                         }
                     }
@@ -379,11 +378,13 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         connect(e.host, e.port)
     }
 
-    /** 建立会话（连接页与自动重连共用） */
-    private fun openSession(host: String, port: Int) {
+    /** 建立会话（连接页与自动重连共用）。
+     *  isSwitch=true 才显示切换横幅：横幅语义是「正在换通道」，取消条件是首帧渲染。
+     *  初次连接/重连不该用它——host 不健康时永远等不到首帧，横幅挂死不撤
+     *  （2026-08-20 用户实测：开 app 一直"正在切换通道"）。初连用等待页语义。 */
+    private fun openSession(host: String, port: Int, isSwitch: Boolean = false) {
         disconnectSession()
-        // 快切换不浮现：延迟 1.5s 才显示横幅，首帧渲染即撤（见 pipeline 首帧回调处）
-        scheduleSwitchingBanner()
+        if (isSwitch) scheduleSwitchingBanner()
         val code = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
         val deviceId = HostSession.loadOrCreateDeviceId(this)
         val s = HostSession.create(host, port, sessionListener, code, deviceId)
@@ -420,6 +421,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             b.visibility = android.view.View.VISIBLE
             b.alpha = 0f
             b.animate()?.alpha(1f)?.setDuration(200)?.start()
+            // 兜底自动消失：首帧取消是主路径，但 host 不健康时永远等不到首帧——
+            // 横幅最多挂 10s，之后让位给会话视图自身的"等待视频流"状态
+            switchingBannerShow = null
+            mainHandler.postDelayed({ cancelSwitchingBanner() }, 10_000)
         }
         switchingBannerShow = r
         mainHandler.postDelayed(r, 1500)
@@ -468,13 +473,13 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             reconnecting = false
             probeUsb { usbOk ->
                 if (usbOk) {
-                    openSession("127.0.0.1", 5280)
+                    openSession("127.0.0.1", 5280, isSwitch = true)
                     transport = Transport.USB
                 } else {
                     val saved = getPreferences(MODE_PRIVATE).getString("host", null)
                     val ep = saved?.let { parseEndpoint(it) }
                     if (ep != null) {
-                        openSession(ep.first, ep.second)
+                        openSession(ep.first, ep.second, isSwitch = true)
                         transport = Transport.WIFI
                     } else {
                         // 无历史主机：回到连接页让用户选（不留死会话）
@@ -1748,8 +1753,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 if (session != null && transport == Transport.WIFI && linkUp && !reconnecting) {
                     probeUsb { usbOk ->
                         if (usbOk && session != null && transport == Transport.WIFI) {
-                            scheduleSwitchingBanner()
-                            openSession("127.0.0.1", 5280)
+                            openSession("127.0.0.1", 5280, isSwitch = true)
                             transport = Transport.USB
                         }
                     }
