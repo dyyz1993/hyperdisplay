@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 /// USB 隧道桥（内置，取代 Scripts/usb-start.sh + usb-tunnel.py + usb-watch.sh）：
 /// - TCP 127.0.0.1:5280 ↔ UDP 127.0.0.1:<udpPort> 帧互转。帧格式 [len u32 LE][payload]；
@@ -174,13 +175,25 @@ final class UsbTunnelController {
 
     // MARK: adb reverse 轮询
 
+    /// 无设备时退避：每 12 拍才真正跑一次（5s→60s）。adb devices 是一次进程 fork，
+    /// 闲时近零成本。SLA 不依赖轮询及时性：reverse 未注册时平板探测被立即拒绝 →
+    /// 秒降 WiFi 出画面（≤3s 达标），reverse 由闲时轮询补上后 30s 内自动升 USB。
+    /// （NSWorkspace 无 USB 设备通知，IOKit 监听过重，不做事件驱动。）
+    private var pollSkip = 0
+
     private func startPolling() {
         guard adbAvailable else {
             NSLog("[hyperdisplay] USB tunnel: 未找到 adb（装 platform-tools 或放 PATH），USB 有线模式不可用")
             return
         }
         pollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            DispatchQueue.global(qos: .utility).async { self?.registerReverse() }
+            guard let self else { return }
+            if self.deviceCount == 0 {
+                self.pollSkip += 1
+                if self.pollSkip < 12 { return }
+                self.pollSkip = 0
+            }
+            DispatchQueue.global(qos: .utility).async { self.registerReverse() }
         }
         DispatchQueue.global(qos: .utility).async { self.registerReverse() }
     }

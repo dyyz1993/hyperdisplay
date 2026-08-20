@@ -957,6 +957,12 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     private var cursorTick = 0
     private func pushCursorPosition() {
+        // 闲时零成本（AGENTS §7）：零客户端直接返回——20Hz 定时器照跑，但每次
+        // 只是一次空 guard（不查 CGEvent 不遍历屏），不阻碍 CPU 休眠
+        clientsLock.lock()
+        let noClients = clients.isEmpty
+        clientsLock.unlock()
+        if noClients { return }
         cursorTick += 1
         if cursorTick % 100 == 1 { NSLog("[hyperdisplay] cursor tick loc=\(CGEvent(source: nil)?.location ?? .zero)") }
         guard let udp, let loc = CGEvent(source: nil)?.location else { return }
