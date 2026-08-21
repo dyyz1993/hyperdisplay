@@ -247,17 +247,10 @@ final class DisplayStream {
         }
     }
 
-    func startIfNeeded() {
-        guard !started, !starting else { return }
-        starting = true
-
-        let capture = CaptureEngine()
-        wireCapture(capture)
-        self.capture = capture
-        let display = self.display
-        let fps = self.fps
-
-        let encoder = VideoEncoder(
+    /// 创建编码器（含 CONFIG 缓存/广播与分片平滑发送的完整接线）。
+    /// startIfNeeded 与 bounceEncoder 共用——闭包只引用 self，无本地捕获。
+    private func makeEncoder() -> VideoEncoder {
+        VideoEncoder(
             onConfig: { [weak self] config in
                 guard let self else { return }
                 let codec = self.encoder?.codec ?? .hevc
@@ -303,6 +296,48 @@ final class DisplayStream {
                 }
             }
         )
+    }
+
+    /// 只重建编码器会话（绿屏自愈的最后手段，客户端 ENCODER_RESET 触发）：
+    /// VideoToolbox 会话经会话切换风暴后可能产出全零流（华为硬解渲染为纯绿），
+    /// 客户端重建解码器无效——必须换掉 host 侧编码器。不碰 SCStream/屏（永生流安全）。
+    func bounceEncoder() {
+        guard started else { return }
+        NSLog("[hyperdisplay] bouncing encoder for display \(display.displayID)")
+        encoder?.stop()
+        let newEncoder = makeEncoder()
+        encoder = newEncoder
+        let scale = captureScale
+        let w = max(640, Int(Double(display.pixelWidth) * scale))
+        let h = max(480, Int(Double(display.pixelHeight) * scale))
+        let fps = self.fps
+        let bitrate = currentBitrate
+        let forceH264 = host?.config.forceH264 ?? false
+        Task.detached { [weak self] in
+            do {
+                let codec = try newEncoder.start(width: w, height: h, fps: fps, bitrate: bitrate, forceH264: forceH264)
+                await MainActor.run {
+                    // onConfig 已向订阅者广播新参数集；补 Welcome（含 codec）+ 关键帧
+                    self?.sendWelcome(codec: codec)
+                    self?.requestKeyframeAndReplay()
+                }
+            } catch {
+                NSLog("[hyperdisplay] encoder bounce failed: \(error)")
+            }
+        }
+    }
+
+    func startIfNeeded() {
+        guard !started, !starting else { return }
+        starting = true
+
+        let capture = CaptureEngine()
+        wireCapture(capture)
+        self.capture = capture
+        let display = self.display
+        let fps = self.fps
+
+        let encoder = makeEncoder()
         self.encoder = encoder
         let scale = captureScale
         let scaledW = max(640, Int(Double(display.pixelWidth) * scale))
@@ -819,6 +854,13 @@ final class HostApp: NSObject, NSApplicationDelegate {
             didIdleReset = true
             fullIdleReset()
             pushDisplays()
+
+        case .encoderReset(let displayId):
+            // 绿屏自愈最后手段（客户端检测到全零输出且本地解码器重建无效）：
+            // 只重建该屏的编码器会话——不碰 SCStream/屏（永生流架构下安全），
+            // 2026-08-21 拔线绿屏实测：客户端 2 次自救失败后走此路径
+            NSLog("[hyperdisplay] encoder reset requested for display \(displayId)")
+            streams[CGDirectDisplayID(displayId)]?.bounceEncoder()
 
         case .bye:
             // 客户端主动退场（用户关 app / 切走超过宽限）：立刻摘除订阅，并把只剩

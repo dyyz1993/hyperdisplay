@@ -438,6 +438,13 @@ class HostSession private constructor(
         send(buildPacket(TYPE_RECYCLE, 0))
     }
 
+    /** 请求 host 只重建该屏的编码器会话（绿屏自愈；不动屏/流——永生流架构） */
+    fun sendEncoderReset(displayId: Int) {
+        val body = java.nio.ByteBuffer.allocate(2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .putShort(displayId.toShort()).array()
+        send(buildPacket(0x1B, 0, body))
+    }
+
     fun sendSubscribeDisplays(ids: List<Int>) {
         val body = ByteBuffer.allocate(1 + ids.size * 4).order(ByteOrder.LITTLE_ENDIAN)
             .put(ids.size.toByte())

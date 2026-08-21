@@ -914,8 +914,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var greenRecoveries = 0
     private var recycledSingle = false
 
-    /** 绿屏自动恢复（慢路径，最多两次）：RECYCLE host 编码池 + 按当前布局重建。
-     *  只 bounce 解码器救不了——坏流来自 host 侧编码会话污染。 */
+    /** 绿屏自动恢复（最多两次）：ENCODER_RESET 让 host 只重建编码器会话。
+     *  只 bounce 解码器救不了——坏流来自 host 侧编码会话污染；也不能用 RECYCLE
+     *  （全量重建会销毁永生屏 → 新 SCStream 在本 macOS 构建上必死 → 黑屏）。 */
     private fun recoverFromGreen() {
         val s = session ?: return
         if (greenRecoveries >= 2) {
@@ -923,11 +924,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             return
         }
         greenRecoveries++
-        s.sendRecycle()
-        if (layoutConfig.kind == LayoutKind.SINGLE) {
-            recycledSingle = true
-        } else {
-            pendingRegions = regionSizes(layoutConfig)
+        val id = subscribedIds.firstOrNull() ?: pipelines.keys.firstOrNull()
+        if (id != null) {
+            Log.w(TAG, "requesting host encoder reset for display=$id (green #$greenRecoveries)")
+            s.sendEncoderReset(id)
         }
     }
 
