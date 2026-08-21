@@ -446,8 +446,10 @@ final class DisplayStream {
     }
 
     /// 静止锐化入口（tick 每秒调）：内容静止 ≥0.5s 且此前在动 → 重编码 IDR。
-    /// 运动末帧是低质量帧（码率被运动分摊），不重编码就糊着停在屏幕上；
-    /// 全质量 IDR 一次（LAN 画质优先策略下 ~200-400KB）换静止画面永久清晰。
+    /// 运动末帧是低质量帧（码率被运动分摊 + AIMD 可能已砍码率），不重编码就糊着
+    /// 停在屏幕上。锐化帧**无视 AIMD 直接用满目标码率**：静止单帧是一次性开销，
+    /// 不占持续带宽（LAN 带宽不稀缺原则，AGENTS §7.5）——修「停止后 10s 才恢复」
+    /// 的根因（旧逻辑锐化帧沿用被砍码率 + AIMD 12s/步爬回）。
     /// 限频：每次运动周期只锐化一次。
     func refineIfSettled(now: Date) {
         guard let last = lastContentFrameAt else { return }
@@ -456,8 +458,20 @@ final class DisplayStream {
             refinementWasMoving = true
         } else if still > 0.5 && refinementWasMoving {
             refinementWasMoving = false
-            NSLog("[hyperdisplay] refinement IDR for display \(display.displayID) (settled after motion)")
+            let saved = currentBitrate
+            if saved < targetBitrate {
+                encoder?.applyBitrate(targetBitrate) // 满码率编码这一帧
+            }
+            NSLog("[hyperdisplay] refinement IDR for display \(display.displayID) (settled; bitrate \(saved/1000)k->\(targetBitrate/1000)k)")
             requestKeyframeAndReplay()
+            if saved < targetBitrate {
+                // 1.2s 后恢复 AIMD 状态（IDR 已编码完；applyBitrate 自带 IDR 请求，
+                // 这里只还原平均码率供后续运动帧使用）
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                    guard let self, self.currentBitrate == self.targetBitrate else { return }
+                    self.encoder?.applyBitrate(saved)
+                }
+            }
         }
     }
 
@@ -518,10 +532,10 @@ final class DisplayStream {
             // 当前分辨率始终与虚拟屏 1:1。
         } else if lost == 0 {
             goodWindows += 1
-            if goodWindows >= 6 { // 12 秒连续零丢片才升级，防止弱网下升降振荡
-                goodWindows = 0
+            if goodWindows >= 2 { // 4 秒连续零丢片即大步回升（画质优先；旧 12s/25% 太吝啬，
+                goodWindows = 0     // 曾致「滚动后糊 10s+」——运动砍掉的码率爬不回来）
                 if currentBitrate < targetBitrate {
-                    currentBitrate = min(targetBitrate, currentBitrate * 5 / 4)
+                    currentBitrate = min(targetBitrate, currentBitrate * 3 / 2)
                     encoder?.applyBitrate(currentBitrate)
                     NSLog("[hyperdisplay] quality: stable, bitrate->\(currentBitrate/1000)kbps display=\(display.displayID)")
                 }
