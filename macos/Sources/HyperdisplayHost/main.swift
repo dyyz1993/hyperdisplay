@@ -560,6 +560,7 @@ final class DisplayStream {
 final class HostApp: NSObject, NSApplicationDelegate {
     let config: Config
     private var statusItem: NSStatusItem!
+    private var statusBarIcon: NSImage?
 
     private var udp: UdpHost?
     /// streams/displayOrder 只在主线程写；锁仅为 UDP 接收线程的高频包路径提供
@@ -611,7 +612,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "◧"
+        loadStatusBarIcon()
+        setStatusItemState("Hyperdisplay")
         rebuildMenu()
 
         Permissions.requestAccessibility(prompt: false)
@@ -644,11 +646,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
             let screen = Permissions.hasScreenRecording()
             let ax = Permissions.hasAccessibility()
             if !screen || !ax {
-                statusItem.button?.title = screen ? "◧⚠" : "⧉⚠"
+                setStatusItemState(screen ? "需要辅助功能权限" : "需要屏幕录制与辅助功能权限", marker: "!")
                 return
             }
             permissionsGranted = true
-            statusItem.button?.title = "◧"
+            setStatusItemState("Hyperdisplay")
         }
         if udp == nil {
             startPipeline()
@@ -1189,9 +1191,36 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     // MARK: 菜单栏
 
+    private func loadStatusBarIcon() {
+        guard let url = Bundle.main.url(forResource: "HyperdisplayMenuBar", withExtension: "png"),
+              let image = NSImage(contentsOf: url) else {
+            return
+        }
+        image.isTemplate = true
+        image.size = NSSize(width: 18, height: 18)
+        statusBarIcon = image
+    }
+
+    private func setStatusItemState(_ toolTip: String, marker: String? = nil) {
+        guard let button = statusItem?.button else { return }
+        button.toolTip = toolTip
+        if let statusBarIcon {
+            button.image = statusBarIcon
+            button.imageScaling = .scaleProportionallyDown
+            button.imagePosition = marker == nil ? .imageOnly : .imageLeft
+            button.title = marker ?? ""
+        } else {
+            button.image = nil
+            button.title = marker ?? "◧"
+        }
+    }
+
     func rebuildMenu(clientCount: Int = -1) {
         let menu = NSMenu()
-        menu.addItem(withTitle: "Hyperdisplay — Mac 虚拟扩展屏", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "Hyperdisplay — Mac 虚拟扩展屏", action: nil, keyEquivalent: "")
+        header.image = statusBarIcon
+        header.image?.size = NSSize(width: 16, height: 16)
+        menu.addItem(header)
 
         if !Permissions.hasScreenRecording() || !Permissions.hasAccessibility() {
             menu.addItem(.separator())
@@ -1315,9 +1344,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     private func refreshStatusIcon() {
         switch displayHealth.level {
-        case .hot: statusItem.button?.title = "◧⚠"
-        case .warm: statusItem.button?.title = "◧🔶"
-        case .normal: statusItem.button?.title = "◧"
+        case .hot: setStatusItemState("ColorSync 异常：请注销会话", marker: "!")
+        case .warm: setStatusItemState("ColorSync 有残留", marker: "·")
+        case .normal: setStatusItemState("Hyperdisplay")
         }
     }
 

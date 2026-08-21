@@ -57,7 +57,8 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 macOS host 必须以 `Hyperdisplay.app` 运行，而不是直接把 release 二进制交给用户：
 `.app` 是包含 host 可执行文件、`Info.plist`、图标和签名的应用包，系统按 bundle id 记录
-屏幕录制/辅助功能权限，菜单栏 host 和登录自启也依赖这个形态。`.build/release/HyperdisplayHost`
+屏幕录制/辅助功能权限，菜单栏 host 和登录自启也依赖这个形态。顶部栏使用单色模板 icon，
+权限或 ColorSync 异常时在 icon 旁显示状态标记。`.build/release/HyperdisplayHost`
 只保留给 `--check` 等开发自检。品牌源文件在 `branding/`，macOS 图标由
 `macos/Scripts/generate-icon.sh` 生成并由 `make-app.sh` 自动放入 `Contents/Resources`。
 

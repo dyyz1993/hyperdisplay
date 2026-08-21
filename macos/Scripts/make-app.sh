@@ -6,8 +6,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/build/Hyperdisplay.app"
 ICON="$ROOT/Resources/Hyperdisplay.icns"
+MENUBAR_ICON="$ROOT/Resources/HyperdisplayMenuBar.png"
 
-if [[ ! -f "$ICON" ]]; then
+if [[ ! -f "$ICON" || ! -f "$MENUBAR_ICON" ]]; then
     "$ROOT/Scripts/generate-icon.sh"
 fi
 
@@ -17,6 +18,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/.build/release/HyperdisplayHost" "$APP/Contents/MacOS/Hyperdisplay"
 cp "$ICON" "$APP/Contents/Resources/Hyperdisplay.icns"
+cp "$MENUBAR_ICON" "$APP/Contents/Resources/HyperdisplayMenuBar.png"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
