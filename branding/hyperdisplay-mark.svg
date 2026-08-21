@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Hyperdisplay mark</title>
+  <desc id="desc">Two connected display panels forming a forward-moving bridge.</desc>
+  <defs>
+    <linearGradient id="bridge" x1="210" y1="190" x2="820" y2="830" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#28D7FF"/>
+      <stop offset="0.52" stop-color="#4E9BFF"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="210" y1="190" x2="820" y2="830" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F5FBFF"/>
+      <stop offset="1" stop-color="#B8D9FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Full-bleed background keeps the macOS and Android icons legible at 16 px. -->
+  <rect width="1024" height="1024" rx="224" fill="#111827"/>
+  <rect x="36" y="36" width="952" height="952" rx="196" fill="none" stroke="#26354D" stroke-width="20"/>
+
+  <!-- Primary display -->
+  <rect x="150" y="218" width="514" height="426" rx="74" fill="#17243A" stroke="url(#panel)" stroke-width="38"/>
+  <path d="M238 772h338" stroke="url(#panel)" stroke-width="38" stroke-linecap="round"/>
+  <path d="M407 644v128" stroke="url(#panel)" stroke-width="38" stroke-linecap="round"/>
+
+  <!-- Extended display, offset to show the product idea without using a literal laptop/tablet. -->
+  <rect x="494" y="380" width="380" height="316" rx="64" fill="#20213E" stroke="url(#bridge)" stroke-width="38"/>
+
+  <!-- The bridge is the distinctive small-size silhouette. -->
+  <path d="M526 508h188" stroke="url(#bridge)" stroke-width="52" stroke-linecap="round"/>
+  <path d="M714 508l76 0" stroke="#8B5CF6" stroke-width="52" stroke-linecap="round"/>
+  <circle cx="790" cy="508" r="26" fill="#F7F5FF"/>
+</svg>

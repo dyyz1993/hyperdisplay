@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="512" viewBox="0 0 1800 512" role="img" aria-labelledby="title desc">
+  <title id="title">Hyperdisplay</title>
+  <desc id="desc">Hyperdisplay connected-display logo.</desc>
+  <defs>
+    <linearGradient id="bridge" x1="90" y1="60" x2="420" y2="450" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#28D7FF"/>
+      <stop offset="0.52" stop-color="#4E9BFF"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(0 0) scale(.5)">
+    <rect width="1024" height="1024" rx="224" fill="#111827"/>
+    <rect x="36" y="36" width="952" height="952" rx="196" fill="none" stroke="#26354D" stroke-width="20"/>
+    <rect x="150" y="218" width="514" height="426" rx="74" fill="#17243A" stroke="#E9F7FF" stroke-width="38"/>
+    <path d="M238 772h338M407 644v128" stroke="#C9E6FF" stroke-width="38" stroke-linecap="round"/>
+    <rect x="494" y="380" width="380" height="316" rx="64" fill="#20213E" stroke="url(#bridge)" stroke-width="38"/>
+    <path d="M526 508h264" stroke="url(#bridge)" stroke-width="52" stroke-linecap="round"/>
+    <circle cx="790" cy="508" r="26" fill="#F7F5FF"/>
+  </g>
+  <text x="580" y="317" fill="#111827" font-family="SF Pro Display, -apple-system, BlinkMacSystemFont, sans-serif" font-size="132" font-weight="700" letter-spacing="-4">Hyperdisplay</text>
+</svg>

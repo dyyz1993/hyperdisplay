@@ -5,12 +5,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/build/Hyperdisplay.app"
+ICON="$ROOT/Resources/Hyperdisplay.icns"
+
+if [[ ! -f "$ICON" ]]; then
+    "$ROOT/Scripts/generate-icon.sh"
+fi
 
 swift build -c release --package-path "$ROOT"
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/.build/release/HyperdisplayHost" "$APP/Contents/MacOS/Hyperdisplay"
+cp "$ICON" "$APP/Contents/Resources/Hyperdisplay.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -27,6 +33,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <string>Hyperdisplay</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>Hyperdisplay.icns</string>
+    <key>CFBundleIconName</key>
+    <string>Hyperdisplay</string>
     <key>CFBundleShortVersionString</key>
     <string>0.1.0</string>
     <key>CFBundleVersion</key>

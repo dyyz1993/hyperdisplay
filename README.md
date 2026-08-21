@@ -55,6 +55,12 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 # 也可 adb 直连（自动化/测试）：am start -n com.hyperdisplay.client/.MainActivity -e host <ip>:<port>
 ```
 
+macOS host 必须以 `Hyperdisplay.app` 运行，而不是直接把 release 二进制交给用户：
+`.app` 是包含 host 可执行文件、`Info.plist`、图标和签名的应用包，系统按 bundle id 记录
+屏幕录制/辅助功能权限，菜单栏 host 和登录自启也依赖这个形态。`.build/release/HyperdisplayHost`
+只保留给 `--check` 等开发自检。品牌源文件在 `branding/`，macOS 图标由
+`macos/Scripts/generate-icon.sh` 生成并由 `make-app.sh` 自动放入 `Contents/Resources`。
+
 默认 UDP 端口 `5277`。host 退出 → 全部虚拟屏自动销毁。
 
 ## 里程碑

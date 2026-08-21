@@ -25,8 +25,11 @@ struct Config {
 
     static func autoBitrate(width: Int, height: Int) -> UInt32 {
         let megapixels = Double(width * height) / 1_000_000
-        // 3.5Mbps/百万像素：office 文字够清晰，同时把大关键帧压小（WiFi 丢片率随突发size升）
-        return UInt32(min(28, max(4, megapixels * 3.5))) * 1_000_000
+        // 画质优先（2026-08-21 用户定稿：局域网带宽不稀缺）：10Mbps/MP，
+        // 8–60M 区间。旧 3.5Mbps/MP 是省带宽思维——运动帧糊、静止锐化 IDR
+        // 被码率窗压小（109KB 不够锐）。提_base 后 IDR 自然变大（1s 窗上限
+        // = 2×base，400KB IDR 轻松容纳），AIMD 仍按丢片率兜底下调。
+        return UInt32(min(60, max(8, megapixels * 10))) * 1_000_000
     }
 
     static func parse(_ args: [String]) -> Config {
@@ -442,15 +445,16 @@ final class DisplayStream {
         capture?.replayLastFrame()
     }
 
-    /// 静止锐化入口（tick 每秒调）：内容静止 ≥0.9s 且此前在动 → 重编码 IDR。
+    /// 静止锐化入口（tick 每秒调）：内容静止 ≥0.5s 且此前在动 → 重编码 IDR。
     /// 运动末帧是低质量帧（码率被运动分摊），不重编码就糊着停在屏幕上；
-    /// 全质量 IDR 一次（~200KB）换静止画面永久清晰。限频：每次运动周期只锐化一次。
+    /// 全质量 IDR 一次（LAN 画质优先策略下 ~200-400KB）换静止画面永久清晰。
+    /// 限频：每次运动周期只锐化一次。
     func refineIfSettled(now: Date) {
         guard let last = lastContentFrameAt else { return }
         let still = now.timeIntervalSince(last)
-        if still < 0.4 {
+        if still < 0.3 {
             refinementWasMoving = true
-        } else if still > 0.9 && refinementWasMoving {
+        } else if still > 0.5 && refinementWasMoving {
             refinementWasMoving = false
             NSLog("[hyperdisplay] refinement IDR for display \(display.displayID) (settled after motion)")
             requestKeyframeAndReplay()
