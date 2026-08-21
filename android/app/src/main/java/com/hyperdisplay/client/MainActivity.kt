@@ -1429,6 +1429,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     Log.i(TAG, "tier switch -> $label ${tw}x$th (host will re-exec)")
                     s.sendSetTier(did, tw, th)
                     scheduleSwitchingBanner()
+                    scheduleFastReconnectAfterTierSwitch()
                 }
             }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
@@ -1704,6 +1705,30 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     }
 
     // MARK: 状态
+
+    /** 档位切换后的快速重连：host 自重载约 2.3s 回来，这里从 2.5s 起每 0.7s 探一次
+     *  隧道、直连 USB（不走 smartReconnect 的 1.2s 延迟 + WiFi 绕路 + 重试退避——
+     *  那套为意外断链设计，在已知断流场景下拖出 10s+，实测档位切换 13s 的主因）。
+     *  探测成功即 openSession；正常恢复后 statsTick 的横幅/等待逻辑接管。 */
+    private fun scheduleFastReconnectAfterTierSwitch() {
+        var attempts = 0
+        val probe = object : Runnable {
+            override fun run() {
+                attempts++
+                if (linkUp || attempts > 14) return // 已恢复或超时（~12s）→ 交给常规重连
+                probeUsb { ok ->
+                    if (ok && !linkUp) {
+                        Log.i(TAG, "fast reconnect after tier switch (attempt $attempts)")
+                        openSession("127.0.0.1", 5280, isSwitch = true)
+                        transport = Transport.USB
+                    } else if (!linkUp) {
+                        mainHandler.postDelayed(this, 700)
+                    }
+                }
+            }
+        }
+        mainHandler.postDelayed(probe, 2500)
+    }
 
     private fun updateOverlay() {
         val overlay = statsOverlay ?: return
