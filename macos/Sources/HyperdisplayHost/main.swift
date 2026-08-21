@@ -664,18 +664,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
         // 统一对齐后再建；档案匹配/记录均用对齐值，保证重连恒定命中
         let w0 = max(640, (width + 15) & ~15)
         let h0 = max(480, (height + 15) & ~15)
-        // 清晰度档位：物理长边 >1920 时等比降到 1920 档。
-        // HiDPI 2x 不可达（实测），只能像素档权衡：2240 档文字 ~86% 常规大小——
-        // 用户实测偏小费眼；1920 档 = 100% 常规大小，且像素量 64% 带来更高帧率/
-        // 更低延迟（2026-08-21 定稿：舒适度优先，牺牲少量锐度）。
-        let w: Int, h: Int
-        if max(w0, h0) > 1920 {
-            let scale = 1920.0 / Double(max(w0, h0))
-            w = max(640, (Int(Double(w0) * scale) + 15) & ~15)
-            h = max(480, (Int(Double(h0) * scale) + 15) & ~15)
-        } else {
-            w = w0; h = h0
-        }
+        // 舒适上限只对「无自定义档位」的默认路径生效（调用方 newProfileDefault 已
+        // 压过 1920）；用户显式选的档位（SET_TIER 落盘，含 2240 锐利档）原样生效——
+        // 在这里二次压档会把锐利档吃掉，实测用户切档"无变化"的根因（2026-08-21）
+        let w = w0, h = h0
         // EDID serial：默认屏恒 1；设备档案屏 = 1000 + 设备指纹低 16 位（同一设备重连恒定）
         // → macOS 视作「同一台显示器回来了」：排列位置与窗口归属自动还原
         let serial: UInt32 = (name.hasPrefix("Hyperdisplay 设备") && currentDeviceId != 0)
@@ -826,9 +818,20 @@ final class HostApp: NSObject, NSApplicationDelegate {
                         deviceProfiles[deviceId] = (tw, th, "Hyperdisplay 设备 \(deviceId % 10000)")
                         NSLog("[hyperdisplay] device \(deviceId) using saved tier \(tw)x\(th)")
                     } else {
-                        let aw = max(640, (Int(cw) + 15) & ~15)
-                        let ah = max(480, (Int(ch) + 15) & ~15)
-                        deviceProfiles[deviceId] = (aw, ah, "Hyperdisplay 设备 \(deviceId % 10000)")
+                        // 默认档（用户从未选过档位）：长边 >1920 压到 1920（舒适默认）。
+                        // 注意必须在这里压——createDisplay 不再做二次压档（用户显式
+                        // 档位须原样生效，见 createDisplay 注释）
+                        let aw0 = max(640, (Int(cw) + 15) & ~15)
+                        let ah0 = max(480, (Int(ch) + 15) & ~15)
+                        let dw: Int, dh: Int
+                        if max(aw0, ah0) > 1920 {
+                            let scale = 1920.0 / Double(max(aw0, ah0))
+                            dw = max(640, (Int(Double(aw0) * scale) + 15) & ~15)
+                            dh = max(480, (Int(Double(ah0) * scale) + 15) & ~15)
+                        } else {
+                            dw = aw0; dh = ah0
+                        }
+                        deviceProfiles[deviceId] = (dw, dh, "Hyperdisplay 设备 \(deviceId % 10000)")
                     }
                 }
             }
