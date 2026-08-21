@@ -636,7 +636,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             // csd 完整性防御：CONFIG 走不可靠通道，坏参数集会毁掉之后所有解码器重建
             if (paramSets.size < 20 || paramSets[0] != 0x00.toByte() || paramSets[1] != 0x00.toByte()
                 || paramSets[2] != 0x00.toByte() || paramSets[3] != 0x01.toByte()) {
-                Log.w(TAG, "dropping malformed csd for display=$displayId len=${'$'}{paramSets.size}")
+                Log.w(TAG, "dropping malformed csd for display=$displayId len=${paramSets.size}")
                 return
             }
             val p = pipelineOf(displayId)

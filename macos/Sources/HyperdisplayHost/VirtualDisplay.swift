@@ -9,6 +9,9 @@ final class VirtualDisplay {
     let displayID: CGDirectDisplayID
     let pixelWidth: Int
     let pixelHeight: Int
+    /// 建屏时刻：起流沉降期判断（建屏瞬间起流的 SCK 概率性永不投递问题）
+    let createdAt = Date()
+    var age: TimeInterval { Date().timeIntervalSince(createdAt) }
 
     /// - Parameters:
     ///   - width/height: **逻辑尺寸**。hiDPI=2 时物理像素为 2 倍（1400x920 → 2800x1840）

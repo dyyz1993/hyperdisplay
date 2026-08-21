@@ -161,6 +161,10 @@ final class DisplayStream {
     private var keyframeFragments: [UInt32: [Data]] = [:]
     private var keyframeOrder: [UInt32] = []
     private let fragLock = NSLock()
+    /// 最近的 CONFIG 报文（编码参数集）：encoder 启动时只广播一次，之后接入的
+    /// 订阅者必须补发——没有参数集解码器无法初始化，完整 IDR 也会被客户端丢弃
+    /// （2026-08-21 端到端定位：IDR 258/258 片组装成功仍黑屏的根因）
+    private var lastConfigPacket: Data?
 
     // MARK: 自适应画质（帧率优先：丢片时先降码率、重灾降采集分辨率；静止/恢复时回升）
     private(set) var targetBitrate: UInt32
@@ -188,7 +192,11 @@ final class DisplayStream {
 
     private func wireCapture(_ capture: CaptureEngine) {
         capture.onFrame = { [weak self] pixelBuffer in
-            self?.encoder?.encode(pixelBuffer: pixelBuffer)
+            // 订阅门控：无人看时不编码（永生流方案下流不停，靠这里省编码开销）
+            guard let self,
+                  !(self.host?.addressesOfSubscribers(of: self.display.displayID).isEmpty ?? true)
+            else { return }
+            self.encoder?.encode(pixelBuffer: pixelBuffer)
         }
     }
 
@@ -215,36 +223,26 @@ final class DisplayStream {
         guard silent > (neverDelivered ? 10 : 2.5), now.timeIntervalSince(lastCaptureRestartAt) > 5 else { return }
         captureRestartTimes.append(now)
         captureRestartTimes.removeAll { now.timeIntervalSince($0) > 90 }
-        if captureRestartTimes.count >= 3,
-           lastIdleResetEscalationAt.map({ now.timeIntervalSince($0) > 600 }) ?? true {
-            let restarts = captureRestartTimes.count
-            lastIdleResetEscalationAt = now
-            captureRestartTimes.removeAll()
-            NSLog("[hyperdisplay] capture stuck through \(restarts) restarts on display \(display.displayID) — escalating to full idle reset")
-            host?.escalateToIdleReset()
-            return
+        if captureRestartTimes.count >= 3 {
+            // 一屏一流永生：不再升级 fullIdleReset（销毁永生屏 = 之后新流必死）。
+            // 只记录，交给同流 restart 继续尝试。
+            NSLog("[hyperdisplay] capture stuck through \(captureRestartTimes.count) restarts on display \(display.displayID) (immortal-stream mode: no escalation)")
+            captureRestartTimes.removeLast()
         }
         lastCaptureRestartAt = now
         NSLog("[hyperdisplay] capture watchdog: display \(display.displayID) silent \(Int(silent))s — restarting capture")
-        oldCapture.stop()
-        let capture = CaptureEngine()
-        wireCapture(capture)
-        self.capture = capture
-        let display = self.display
-        let scale = captureScale
-        let scaledW = max(640, Int(Double(display.pixelWidth) * scale))
-        let scaledH = max(480, Int(Double(display.pixelHeight) * scale))
-        let fps = self.fps
+        // 单流永生：同一条 SCStream 重启。新建流在本构建上必死（每进程仅首条可投递）
+        let capture = oldCapture
         Task.detached { [weak self] in
             do {
-                try await capture.start(displayID: display.displayID, width: scaledW, height: scaledH, fps: fps)
+                try await capture.restart()
                 try await Task.sleep(nanoseconds: 300_000_000) // 等 idle 事件填充 lastFrame
                 await MainActor.run {
                     self?.captureStartedAt = Date()
                     self?.requestKeyframeAndReplay()
                 }
             } catch {
-                NSLog("[hyperdisplay] capture restart failed for display \(display.displayID): \(error)")
+                NSLog("[hyperdisplay] capture restart failed for display \(self?.display.displayID ?? 0): \(error)")
             }
         }
     }
@@ -264,8 +262,12 @@ final class DisplayStream {
                 guard let self else { return }
                 let codec = self.encoder?.codec ?? .hevc
                 let did = UInt16(self.display.displayID & 0xFFFF)
+                let pkt = Wire.config(codec: codec.rawValue, displayId: did, frameId: self.frameId, paramSets: config)
+                fragLock.lock()
+                self.lastConfigPacket = pkt
+                fragLock.unlock()
                 for var addr in self.host?.addressesOfSubscribers(of: self.display.displayID) ?? [] {
-                    self.udp.send(to: &addr, Wire.config(codec: codec.rawValue, displayId: did, frameId: self.frameId, paramSets: config))
+                    self.udp.send(to: &addr, pkt)
                 }
             },
             onFrame: { [weak self] keyframe, payload in
@@ -340,6 +342,15 @@ final class DisplayStream {
         starting = false
         encodedSnapshot = 0
         effectiveFps = 0
+    }
+
+    /// 补发缓存的 CONFIG 给指定客户端（新订阅者错过 encoder 启动广播）。
+    /// 没有参数集解码器无法初始化——完整 IDR 也会被客户端丢弃（黑屏根因）。
+    func sendConfigReplay(to addr: inout sockaddr_in) {
+        fragLock.lock()
+        let pkt = lastConfigPacket
+        fragLock.unlock()
+        if let pkt { udp.send(to: &addr, pkt) }
     }
 
     func sendWelcome(codec: VideoEncoder.Codec? = nil) {
@@ -624,6 +635,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
         streamsLock.lock()
         streams[vd.displayID] = stream
         streamsLock.unlock()
+        displayOrder.append(vd.displayID) // DISPLAYS 列表源；丢失 = 客户端收不到屏列表 = 黑屏（2026-08-21 定位回归）
         if currentDeviceId != 0 {
             deviceProfiles[currentDeviceId] = (w, h, name) // 记对齐值，与屏实际尺寸/匹配口径一致
         }
@@ -649,6 +661,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
     // MARK: 报文处理（UDP 接收线程 → 主线程分发）
 
     private func handlePacket(_ packet: Packet, from addr: sockaddr_in) {
+        // 临时诊断：非 PING 报文记录（定位客户端路径致 SCK 静默的毒报文）
+        if case .ping = packet {} else {
+            NSLog("[hyperdisplay] pkt \(packet) from \(addressString(addr))")
+        }
         // 高频包（ping/nack/input/keyframeReq/bye 轻路径）在接收线程直接处理：
         // 逐包 async 主线程会在包洪峰（多客户端×心跳×输入×NACK）下把主 RunLoop 的
         // Timer 全部饿死——tick/哨兵/看门狗停摆、进程"假死"（2026-08-20 实测定位）。
@@ -828,9 +844,12 @@ final class HostApp: NSObject, NSApplicationDelegate {
         guard streams[displayId] != nil else { return }
         clientsLock.lock()
         clients[key]?.displayIds.insert(displayId)
+        let addr = clients[key]?.addr
         clientsLock.unlock()
         streams[displayId]?.startIfNeeded()
         streams[displayId]?.sendWelcome()
+        // 参数集补发：晚加入的订阅者没有它，解码器永远起不来（黑屏根因）
+        if var a = addr { streams[displayId]?.sendConfigReplay(to: &a) }
     }
 
     /// 单屏/分屏模式的订阅集整体切换
@@ -857,7 +876,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
     }
 
     private func displayListEntries() -> [DisplayListEntry] {
-        displayOrder.compactMap { id in
+        let entries = displayOrder.compactMap { (id: CGDirectDisplayID) -> DisplayListEntry? in
             guard let s = streams[id] else { return nil }
             return DisplayListEntry(
                 id: UInt32(id),
@@ -865,6 +884,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 height: UInt16(s.display.pixelHeight),
                 name: "屏 \(displayOrder.firstIndex(of: id).map { $0 + 1 } ?? 0) · \(s.display.pixelWidth)×\(s.display.pixelHeight)")
         }
+        return entries
     }
 
     func addressesOfSubscribers(of displayId: CGDirectDisplayID) -> [sockaddr_in] {
@@ -911,14 +931,15 @@ final class HostApp: NSObject, NSApplicationDelegate {
         if !stale.isEmpty {
             NSLog("[hyperdisplay] pruned \(stale.count) stale client(s)")
         }
-        // 空闲自愈：最后一个客户端断开后全量重建（VideoToolbox 会话经反复建销会劣化——
-        // 新会话产出 ffmpeg 可解但华为硬解输出全零的流；归零重建即恢复）
+        // 一屏一流永生（2026-08-21 定稿）：本 macOS 构建的 SCK 每进程仅第一条
+        // SCStream 可投递（受控实验：对象释放/旧屏销毁后新流仍全静默）。因此：
+        // - 断开不回收屏、不停流——只靠"无订阅者→无编码"自然闲置（静态桌面零帧）
+        // - 重连复用同屏同流（watchdog 走同流 restart）
+        // - fullIdleReset 禁用（会销毁永生屏 → 之后新流必死）
+        // 代价：空闲时 WindowServer 挂一块屏（~18-26MB）。Apple 修复 SCK 后
+        // 恢复惰性建屏/闲置回收语义。
         if clientCount == 0 && !didIdleReset {
-            // 仅在管线就绪且有东西可回收时执行（避免启动竞态把初始屏清成 0）
-            if udp != nil && !displayOrder.isEmpty {
-                didIdleReset = true
-                fullIdleReset()
-            }
+            didIdleReset = true // 什么都不做：保留永生屏
         } else if clientCount > 0 {
             didIdleReset = false
         }
@@ -926,24 +947,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
             stream.sampleStats()
             stream.adaptQuality(now: now)
             if addressesOfSubscribers(of: stream.display.displayID).isEmpty {
-                if stream.started { stream.stop() }
+                // 无人订阅：编码输入自然归零（订阅门控见 wireCapture），不 stop
                 if stream.idleSince == nil { stream.idleSince = now }
             } else {
                 stream.idleSince = nil
                 stream.restartCaptureIfNeeded(now: now)
-            }
-        }
-        // 闲置回收：15s 无人订阅 → 销毁（含初始配置屏——多块虚拟屏并存时用户会把
-        // 窗口拖到「没人看」的那块上导致窗口丢失；回收后窗口自动弹回主屏，桌面
-        // 始终只留正在被观看的屏。60s→15s：强杀/滑掉 app 不发 BYE 时，prune(6s)+
-        // 本阈值让窗口尽快回到主屏可见——「断开即恢复」）。
-        // 2026-08-20：连最后一块也回收——「没人连 = 零屏」是正确语义（WindowServer
-        // 不白挂像素缓冲）；HELLO 路径按设备档案按需重建，连接体验不变。
-        for id in displayOrder {
-            guard let s = streams[id] else { continue }
-            if let idle = s.idleSince, now.timeIntervalSince(idle) > 15 {
-                NSLog("[hyperdisplay] recycling idle display \(id) (no subscribers 15s)")
-                destroyDisplay(id: id, allowLast: true)
             }
         }
         rebuildMenu(clientCount: clientCount)
