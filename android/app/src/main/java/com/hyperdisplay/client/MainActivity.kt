@@ -1748,7 +1748,15 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             if (p != null && p.width > 0) "${p.width}x${p.height}" else "?"
         }
         val tr = if (transport == Transport.USB) "USB" else "WiFi"
-        overlay.text = "$renderFps fps · $screens · $tr · $link · 长按修复画面"
+        // 窗口模式提示（系统分屏等）：app 窗口明显小于物理屏时，流被缩小渲染、
+        // 有效清晰度打折——明确告知而非默默降质（分辨率不跟随窗口变：切换成本 5s，
+        // 拖动分屏线会灾难化；SurfaceView 自适应缩放 + 解码器重绑已自动处理布局）
+        val dm = Resources.getSystem().displayMetrics
+        val rw = root.width; val rh = root.height
+        val windowed = rw > 0 && rh > 0 &&
+            (rw < dm.widthPixels * 85 / 100 || rh < dm.heightPixels * 85 / 100)
+        val winMark = if (windowed) " · 窗口模式(画质降低)" else ""
+        overlay.text = "$renderFps fps · $screens · $tr · $link$winMark · 长按修复画面"
     }
 
     /** 状态落盘：锁屏/无屏环境下的可观测通道（adb pull 验证用） */
