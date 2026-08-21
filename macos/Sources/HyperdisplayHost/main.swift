@@ -201,10 +201,14 @@ final class DisplayStream {
 
     private func wireCapture(_ capture: CaptureEngine) {
         capture.onFrame = { [weak self] pixelBuffer in
-            // 订阅门控：无人看时不编码（永生流方案下流不停，靠这里省编码开销）
-            guard let self,
-                  !(self.host?.addressesOfSubscribers(of: self.display.displayID).isEmpty ?? true)
-            else { return }
+            guard let self else { return }
+            // 采集侧新鲜像素 = 真实内容活跃（静止锐化的唯一时间戳来源；编码侧
+            // 重编码帧不算——见 makeEncoder 注释）。放在订阅门控之前：无人订阅时
+            // 内容活跃与否的追踪也不该停（重新订阅后锐化检测需要正确基线）。
+            self.lastContentFrameAt = Date()
+            if self.host?.addressesOfSubscribers(of: self.display.displayID).isEmpty ?? true {
+                return // 订阅门控：无人看时不编码（永生流方案下流不停，靠这里省编码开销）
+            }
             self.encoder?.encode(pixelBuffer: pixelBuffer)
         }
     }
@@ -275,7 +279,10 @@ final class DisplayStream {
             onFrame: { [weak self] keyframe, payload in
                 guard let self else { return }
                 self.frameId &+= 1
-                self.lastContentFrameAt = Date() // 静止锐化：内容活跃时刻
+                // 注意：不在此更新 lastContentFrameAt——编码产出的帧包含 replay 回放
+                // 和 applyBitrate 触发的 IDR（同一画面的重编码，非新内容）。时间戳
+                // 由采集侧（wireCapture 的新鲜帧）更新，否则锐化/AIMD 的重编码帧
+                // 会互相重新武装对方 → 码率战争死循环（2026-08-21 实测三连修）
                 let addresses = self.host?.addressesOfSubscribers(of: self.display.displayID) ?? []
                 let did = UInt16(self.display.displayID & 0xFFFF)
                 let frags = Wire.videoFrags(displayId: did, frameId: self.frameId, keyframe: keyframe, payload: payload)
@@ -458,20 +465,19 @@ final class DisplayStream {
             refinementWasMoving = true
         } else if still > 0.5 && refinementWasMoving {
             refinementWasMoving = false
-            // 防自触发循环：锐化 IDR 的编码会更新 lastContentFrameAt（replay 也走
-            // onFrame），不清空 = 系统把锐化帧误当新运动 → 无限锐化循环（实测
-            // 每 ~10s 一次 + 码率反复横跳 → 触发华为硬解绿屏）。清空后只有真实的
-            // 新采集内容才会重新武装检测。
-            lastContentFrameAt = nil
             let saved = currentBitrate
             if saved < targetBitrate {
                 encoder?.applyBitrate(targetBitrate) // 满码率编码这一帧
             }
             NSLog("[hyperdisplay] refinement IDR for display \(display.displayID) (settled; bitrate \(saved/1000)k->\(targetBitrate/1000)k)")
             requestKeyframeAndReplay()
-            if saved < targetBitrate {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-                    guard let self, self.currentBitrate == self.targetBitrate else { return }
+            // 防自触发循环：IDR 编码/replay 都会更新 lastContentFrameAt（立即清空会被
+            // 自己的回放帧填回，实测循环仍存）。1.5s 后（IDR 已编码送达）再清空 +
+            // 还原码率——此后只有真实新采集内容才会重新武装锐化检测。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self else { return }
+                self.lastContentFrameAt = nil
+                if saved < self.targetBitrate, self.currentBitrate == self.targetBitrate {
                     self.encoder?.applyBitrate(saved)
                 }
             }
