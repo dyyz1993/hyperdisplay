@@ -618,6 +618,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 let id = createDisplay(width: d.width, height: d.height, name: nextDisplayName())
                 if let id { streams[id]?.isInitialDisplay = true }
             }
+            // 落盘档位预建（档位切换提速的核心）：exec 重载后 windowserver 消化
+            // 建销 churn，重建一屏要 5.7s（实测）；若等客户端 HELLO 才建则与重连
+            // 串行 = 切换总时长 13s+。启动即按已知设备的落盘档位预建，5.7s 藏进
+            // 客户端重连窗口内并行，HELLO 到达时按尺寸直接复用。
+            restoreTierDisplays()
             let hostName = Host.current().localizedName ?? "Mac"
             _ = bonjour.start(name: "Hyperdisplay (\(hostName))", port: udp.port,
                               txt: ["code": String(pairingCode)])
@@ -1003,6 +1008,27 @@ final class HostApp: NSObject, NSApplicationDelegate {
         guard currentDeviceId != 0 else { return }
         let name = deviceProfiles[currentDeviceId]?.name ?? "Hyperdisplay 设备 \(currentDeviceId % 10000)"
         deviceProfiles[currentDeviceId] = (width, height, name)
+    }
+
+    /// 启动时按 UserDefaults 里的落盘档位预建设备档案屏（见 startPipeline 注释）。
+    /// 单用户场景设备数 ≤ 几台，全部预建（上限 4 块）。
+    private func restoreTierDisplays() {
+        let tierKeys = UserDefaults.standard.dictionaryRepresentation().keys
+            .filter { $0.hasPrefix("hyperdisplay.tier.") }
+            .prefix(4)
+        for key in tierKeys {
+            guard let devStr = key.dropFirst("hyperdisplay.tier.".count).split(separator: ".").last,
+                  let deviceId = UInt32(devStr),
+                  let saved = UserDefaults.standard.string(forKey: key),
+                  let tw = saved.split(separator: ",").first.flatMap({ Int($0) }),
+                  let th = saved.split(separator: ",").last.flatMap({ Int($0) }),
+                  tw >= 640, th >= 480 else { continue }
+            let name = "Hyperdisplay 设备 \(deviceId % 10000)"
+            deviceProfiles[deviceId] = (tw, th, name)
+            if createDisplay(width: tw, height: th, name: name) != nil {
+                NSLog("[hyperdisplay] pre-created tier display for device \(deviceId): \(tw)x\(th)")
+            }
+        }
     }
 
     /// 看门狗升级入口：采集流连续重启无效（中毒系统），全量重建屏+编码器池。
