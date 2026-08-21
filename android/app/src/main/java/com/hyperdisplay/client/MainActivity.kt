@@ -1429,6 +1429,14 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     Log.i(TAG, "tier switch -> $label ${tw}x$th (host will re-exec)")
                     s.sendSetTier(did, tw, th)
                     scheduleSwitchingBanner()
+                    // 主动断开不等网络 EOF：adb 隧道对端关闭的传播可滞后数秒，
+                    // 等它 = 僵尸会话冻屏（实测 fps=0 假 link=up）。发包后 400ms
+                    // 主动拆会话（并复位 linkUp，否则快速重连循环会被假状态骗退）
+                    mainHandler.postDelayed({
+                        Log.i(TAG, "tier switch: proactively dropping session")
+                        linkUp = false
+                        disconnectSession()
+                    }, 400)
                     scheduleFastReconnectAfterTierSwitch()
                 }
             }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
