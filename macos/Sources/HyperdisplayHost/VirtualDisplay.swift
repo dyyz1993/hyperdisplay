@@ -7,15 +7,20 @@ import HyperdisplayObjC
 /// 显示器实例由 shim 常驻持有；进程退出（含崩溃）时 windowserver 自动摘除全部虚拟屏。
 final class VirtualDisplay {
     let displayID: CGDirectDisplayID
-    var pixelWidth: Int
-    var pixelHeight: Int
+    /// 逻辑尺寸（点）：流输出/编码/UI 布局全用这个。2x 屏的 pixelWidth 是它的一倍
+    let logicalWidth: Int
+    let logicalHeight: Int
+    /// 物理像素（2x 屏 = 逻辑 × 2）。仅诊断/日志用
+    private(set) var pixelWidth: Int
+    private(set) var pixelHeight: Int
     /// 建屏时刻：起流沉降期判断（建屏瞬间起流的 SCK 概率性永不投递问题）
     let createdAt = Date()
     var age: TimeInterval { Date().timeIntervalSince(createdAt) }
 
     /// - Parameters:
-    ///   - width/height: **逻辑尺寸**。hiDPI=2 时物理像素为 2 倍（1400x920 → 2800x1840）
-    ///   - hiDPI: 2 = macOS 2x 渲染（UI 常规大小 + 视网膜级文字锐度）；0 = 1x
+    ///   - width/height: **逻辑尺寸**（2x 渲染时 UI 常规大小，物理像素 ×2）
+    ///   - hiDPI: 2 = 系统 2x 渲染（超采样：SCK 输出降到逻辑分辨率，文字更锐）；
+    ///            0 = 1x（遗留，2x 屏上模式切换才生效，新代码一律用 2）
     init?(width: Int, height: Int, refreshRate: Double = 60, serial: UInt32 = 1, hiDPI: Int = 0) {
         let id = hyperdisplayCreateVirtualDisplay(UInt32(width), UInt32(height), refreshRate, "Hyperdisplay", serial, UInt8(hiDPI))
         guard id != 0 else {
@@ -23,7 +28,8 @@ final class VirtualDisplay {
             return nil
         }
         self.displayID = id
-        // 物理像素以系统回读为准（HiDPI 下 != 传入逻辑尺寸）
+        self.logicalWidth = width
+        self.logicalHeight = height
         if let mode = CGDisplayCopyDisplayMode(id) {
             self.pixelWidth = Int(mode.pixelWidth)
             self.pixelHeight = Int(mode.pixelHeight)

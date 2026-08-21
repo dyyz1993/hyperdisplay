@@ -24,7 +24,8 @@ CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t width, uint32_t heig
     descriptor.maxPixelsHigh = 16384;
     // 物理尺寸申报：实测对模式列表无影响（237DPI 也不生成 HiDPI 档——CGVirtualDisplay
     // 无驱动支持，2x 渲染不可达），保持大屏口径即可
-    descriptor.sizeInMillimeters = CGSizeMake(600.0 * width / 1920.0, 340.0 * height / 1200.0);
+    // 密度申报：与极简复现工具完全一致（判责工具上默认 2x 渲染的变量对齐）
+    descriptor.sizeInMillimeters = CGSizeMake(600.0, 400.0);
     descriptor.vendorID = 0x1A2B;
     descriptor.productID = 0x0001;
     // EDID serial 恒定：macOS 按 (vendor,product,serial) 记忆显示器——排列位置、
@@ -41,8 +42,13 @@ CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t width, uint32_t heig
                                                                  refreshRate:refreshRate];
     CGVirtualDisplaySettings *settings = [[CGVirtualDisplaySettings alloc] init];
     settings.modes = @[ mode ];
-    // hiDPI=2：mode 尺寸按逻辑坐标解释，物理像素翻倍（macOS 2x 渲染）
-    settings.hiDPI = hiDPI;
+    // hiDPI 语义（2026-08-21 极简复现修正）：
+    //   0  = 显式 1x（老行为；1x 屏上 applySettings 换模式不生效）
+    //   2  = 不设该属性 → 系统 2x 渲染（逻辑 WxH → 物理 2Wx2H），且模式切换生效
+    //        （旧结论"HiDPI 2x 不可达"系显式 settings.hiDPI=2 只出 1x 档所致）
+    if (hiDPI == 0) {
+        settings.hiDPI = 0;
+    } // hiDPI==2：留空，系统默认即 2x
 
     if (![display applySettings:settings]) {
         return 0;

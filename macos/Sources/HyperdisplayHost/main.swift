@@ -309,10 +309,10 @@ final class DisplayStream {
             return
         }
         // 更新设备档案（重连时按新档位复用）
-        host?.updateDeviceProfile(displayId: display.displayID, width: pixelWidthSafe, height: pixelHeightSafe)
-        injector.updateMapping(bounds: display.bounds, streamWidth: Double(display.pixelWidth), streamHeight: Double(display.pixelHeight))
+        host?.updateDeviceProfile(displayId: display.displayID, width: display.logicalWidth, height: display.logicalHeight)
+        injector.updateMapping(bounds: display.bounds, streamWidth: Double(display.logicalWidth), streamHeight: Double(display.logicalHeight))
         let capture2 = capture
-        let newW = display.pixelWidth, newH = display.pixelHeight
+        let newW = display.logicalWidth, newH = display.logicalHeight
         let fps2 = fps
         Task.detached { [weak self] in
             // 顺序：先改流配置（采集新尺寸）再重建编码器
@@ -322,9 +322,6 @@ final class DisplayStream {
             }
         }
     }
-
-    private var pixelWidthSafe: Int { display.pixelWidth }
-    private var pixelHeightSafe: Int { display.pixelHeight }
 
     /// 只重建编码器会话（绿屏自愈的最后手段，客户端 ENCODER_RESET 触发）：
     /// VideoToolbox 会话经会话切换风暴后可能产出全零流（华为硬解渲染为纯绿），
@@ -336,8 +333,8 @@ final class DisplayStream {
         let newEncoder = makeEncoder()
         encoder = newEncoder
         let scale = captureScale
-        let w = max(640, Int(Double(display.pixelWidth) * scale))
-        let h = max(480, Int(Double(display.pixelHeight) * scale))
+        let w = max(640, Int(Double(display.logicalWidth) * scale))
+        let h = max(480, Int(Double(display.logicalHeight) * scale))
         let fps = self.fps
         let bitrate = currentBitrate
         let forceH264 = host?.config.forceH264 ?? false
@@ -368,8 +365,8 @@ final class DisplayStream {
         let encoder = makeEncoder()
         self.encoder = encoder
         let scale = captureScale
-        let scaledW = max(640, Int(Double(display.pixelWidth) * scale))
-        let scaledH = max(480, Int(Double(display.pixelHeight) * scale))
+        let scaledW = max(640, Int(Double(display.logicalWidth) * scale))
+        let scaledH = max(480, Int(Double(display.logicalHeight) * scale))
         injector.updateMapping(bounds: display.bounds, streamWidth: Double(scaledW), streamHeight: Double(scaledH))
 
         let bitrate = currentBitrate
@@ -420,8 +417,8 @@ final class DisplayStream {
         let c = codec ?? encoder?.codec ?? .hevc
         let did = UInt16(display.displayID & 0xFFFF)
         let scale = captureScale
-        let w = max(640, Int(Double(display.pixelWidth) * scale))
-        let h = max(480, Int(Double(display.pixelHeight) * scale))
+        let w = max(640, Int(Double(display.logicalWidth) * scale))
+        let h = max(480, Int(Double(display.logicalHeight) * scale))
         let data = Wire.welcome(codec: c.rawValue, displayId: did, width: w, height: h, fps: fps)
         for var addr in host?.addressesOfSubscribers(of: display.displayID) ?? [] {
             udp.send(to: &addr, data)
@@ -806,7 +803,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
             // 设备档案：优先复用既有同尺寸屏（连续性），否则建一块并记住
             if deviceId != 0 {
                 if let profile = deviceProfiles[deviceId] {
-                    if let existing = streams.first(where: { $0.value.display.pixelWidth == profile.w && $0.value.display.pixelHeight == profile.h })?.key {
+                    if let existing = streams.first(where: { $0.value.display.logicalWidth == profile.w && $0.value.display.logicalHeight == profile.h })?.key {
                         NSLog("[hyperdisplay] device \(deviceId) reconnected → reusing display \(existing) (\(profile.w)x\(profile.h))")
                     } else if let id = createDisplay(width: profile.w, height: profile.h, name: profile.name) {
                         NSLog("[hyperdisplay] device \(deviceId) reconnected → recreated \(profile.name) \(profile.w)x\(profile.h) id=\(id)")
@@ -844,7 +841,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
             // 不存在的客户端是空操作，不能依赖它），其次既有订阅，最后默认屏
             var targets: Set<CGDirectDisplayID> = []
             if deviceId != 0, let profile = deviceProfiles[deviceId],
-               let t = streams.first(where: { $0.value.display.pixelWidth == profile.w && $0.value.display.pixelHeight == profile.h })?.key {
+               let t = streams.first(where: { $0.value.display.logicalWidth == profile.w && $0.value.display.logicalHeight == profile.h })?.key {
                 targets = [t]
             } else if let e = clients[key]?.displayIds, !e.isEmpty {
                 targets = e
@@ -987,8 +984,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
             guard let s = streams[id] else { return nil }
             return DisplayListEntry(
                 id: UInt32(id),
-                width: UInt16(s.display.pixelWidth),
-                height: UInt16(s.display.pixelHeight),
+                width: UInt16(s.display.logicalWidth),
+                height: UInt16(s.display.logicalHeight),
                 name: "屏 \(displayOrder.firstIndex(of: id).map { $0 + 1 } ?? 0) · \(s.display.pixelWidth)×\(s.display.pixelHeight)")
         }
         return entries
