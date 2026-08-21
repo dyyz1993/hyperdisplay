@@ -39,6 +39,25 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     private var session: HostSession? = null
     private var statsOverlay: TextView? = null
+    private var chromeHandle: TextView? = null
+    private var chromeHideRunnable: Runnable? = null
+
+    /** 呼出状态条+配置按钮（6s 自动隐藏；配置面板打开期间不计时） */
+    private fun showChrome() {
+        statsOverlay?.visibility = android.view.View.VISIBLE
+        configButton?.visibility = android.view.View.VISIBLE
+        chromeHideRunnable?.let { mainHandler.removeCallbacks(it) }
+        val r = Runnable { hideChrome() }
+        chromeHideRunnable = r
+        mainHandler.postDelayed(r, 6000)
+    }
+
+    private fun hideChrome() {
+        // 配置面板挂在 root 上的场景不隐藏（用户正在操作）——简化判定：面板类弹窗
+        // 存在时 statsTick 的 6s 计时照走，但面板自身是 Dialog 生命周期不受影响
+        statsOverlay?.visibility = android.view.View.GONE
+        configButton?.visibility = android.view.View.GONE
+    }
     private var sessionRoot: FrameLayout? = null
     private val waitingOverlay by lazy { WaitingOverlay(this) }
     private var waitingSince = 0L
@@ -879,6 +898,22 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         root.addView(cfgBtn, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END))
         configButton = cfgBtn
+
+        // 状态条/配置默认隐藏（用户反馈挡视野）：顶部中央近隐形小把手点按呼出，
+        // 6s 无操作自动隐藏。把手 12dp 高、25% 透明，不占 Mac 菜单栏实际点击区
+        overlay.visibility = android.view.View.GONE
+        cfgBtn.visibility = android.view.View.GONE
+        val handle = TextView(this).apply {
+            text = "⌄"
+            textSize = 14f
+            setTextColor(0x40FFFFFF.toInt())
+            gravity = Gravity.CENTER
+            setPadding(24, 2, 24, 6)
+            setOnClickListener { showChrome() }
+        }
+        root.addView(handle, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+        chromeHandle = handle
 
         // 本地光标层（最顶层）：手指位置零延迟反馈
         val cursor = LocalCursorView(this)
