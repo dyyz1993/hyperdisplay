@@ -149,6 +149,12 @@ final class DisplayStream {
     let injector = InputInjector()
     private var frameId: UInt32 = 0
     private var lastKeyframeRequestAt = Date.distantPast
+    /// 静止锐化（2026-08-21）：内容驱动的编码下，画面停在哪帧就保持哪帧的质量——
+    /// 运动末尾的帧是低质量帧（码率被运动分摊），静止后不重编码就永远糊着。
+    /// 检测「动→静」转换（0.8s 无新帧）时重编码一帧全质量 IDR，客户端无感刷新
+    /// 为清晰画面（macOS 自带屏幕共享的同款行为）。
+    private var lastContentFrameAt: Date?
+    private var refinementWasMoving = false
     private var starting = false
     private(set) var started = false
     private var captureStartedAt: Date?
@@ -266,6 +272,7 @@ final class DisplayStream {
             onFrame: { [weak self] keyframe, payload in
                 guard let self else { return }
                 self.frameId &+= 1
+                self.lastContentFrameAt = Date() // 静止锐化：内容活跃时刻
                 let addresses = self.host?.addressesOfSubscribers(of: self.display.displayID) ?? []
                 let did = UInt16(self.display.displayID & 0xFFFF)
                 let frags = Wire.videoFrags(displayId: did, frameId: self.frameId, keyframe: keyframe, payload: payload)
@@ -433,6 +440,21 @@ final class DisplayStream {
         lastKeyframeRequestAt = Date()
         encoder?.requestKeyframe()
         capture?.replayLastFrame()
+    }
+
+    /// 静止锐化入口（tick 每秒调）：内容静止 ≥0.9s 且此前在动 → 重编码 IDR。
+    /// 运动末帧是低质量帧（码率被运动分摊），不重编码就糊着停在屏幕上；
+    /// 全质量 IDR 一次（~200KB）换静止画面永久清晰。限频：每次运动周期只锐化一次。
+    func refineIfSettled(now: Date) {
+        guard let last = lastContentFrameAt else { return }
+        let still = now.timeIntervalSince(last)
+        if still < 0.4 {
+            refinementWasMoving = true
+        } else if still > 0.9 && refinementWasMoving {
+            refinementWasMoving = false
+            NSLog("[hyperdisplay] refinement IDR for display \(display.displayID) (settled after motion)")
+            requestKeyframeAndReplay()
+        }
     }
 
     /// NACK：只重传缓存中的关键帧分片
@@ -1087,6 +1109,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
             } else {
                 stream.idleSince = nil
                 stream.restartCaptureIfNeeded(now: now)
+                stream.refineIfSettled(now: now) // 静止锐化：动→静转换时重编码全质量 IDR
             }
         }
         rebuildMenu(clientCount: clientCount)
