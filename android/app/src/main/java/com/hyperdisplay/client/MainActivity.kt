@@ -618,7 +618,18 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val view = regionViews.firstOrNull { it.displayId == displayId } ?: return
             val v = view.streamToView(x, y) ?: return
             val w = windowPos(view, v[0], v[1])
-            mainHandler.post { lc.moveTo(w[0], w[1]) }
+            mainHandler.post {
+                // 双写者仲裁（2026-08-21 卡顿根因）：触摸期间手指以零延迟驱动本地光标，
+                // host 推送（20Hz+网络滞后）无条件覆盖 = 光标被反复拽回 → 顿挫。
+                // 规则：250ms 内有手指回显且 host 位置就在附近（<48px）→ 手指权威，丢弃；
+                // host 位置远离（Mac 侧真实移动/换屏）→ 照常接管。
+                val now = System.currentTimeMillis()
+                if (now - lastCursorEchoAt < 250) {
+                    val dx = w[0] - lastCursorEchoX; val dy = w[1] - lastCursorEchoY
+                    if (dx * dx + dy * dy < 48f * 48f) return@post
+                }
+                lc.moveTo(w[0], w[1])
+            }
         }
 
         override fun onWelcome(displayId: Int, codec: Int, width: Int, height: Int, fps: Int) {
@@ -1340,6 +1351,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var moveStartRawY = 0f
     private var moveStartL = 0
     private var moveStartT = 0
+    // 光标双写者仲裁：手指回显的最后位置/时刻（handleTouch 写，onCursor 读）
+    private var lastCursorEchoAt = 0L
+    private var lastCursorEchoX = 0f
+    private var lastCursorEchoY = 0f
 
     /** 手指拖动整窗：纯偏移量（按下点与窗口的相对关系保持不变，不吸附、不跳动） */
     private fun movePipByTouch(root: FrameLayout, e: MotionEvent, sw: Int, sh: Int) {
@@ -1506,16 +1521,16 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val regions = pendingRegions ?: return
         val s = session ?: return
         // 先按缺口补建（RECYCLE 后通常全缺；幂等，凑齐前每轮 DISPLAYS 重复检查）。
-        // 尺寸匹配必须「host 档位感知」：host 对长边 >2240 的请求会自动降到 2240 档
-        // （清晰度档位折中，HiDPI 2x 不可达），按原始请求找屏 = 永远差一块 → 无限
-        // CREATE 循环（churn 风暴）+ 渲染视图永远建不起来（2026-08-20 USB 卡顿根因）。
-        // 对齐口径：期待尺寸 = 与 host createDisplay 相同的 16 对齐 + 2240 降档。
+        // 尺寸匹配必须「host 档位感知」：host 对长边 >1920 的请求会自动降到 1920 档
+        // （2026-08-21 舒适档定稿；HiDPI 2x 不可达），按原始请求找屏 = 永远差一块 →
+        // 无限 CREATE 循环（churn 风暴）+ 渲染视图永远建不起来（2026-08-20 根因）。
+        // 对齐口径：期待尺寸 = 与 host createDisplay 相同的 16 对齐 + 1920 降档。
         fun tierAligned(w: Int, h: Int): Pair<Int, Int> {
             var aw = maxOf(640, (w + 15) and 15.inv())
             var ah = maxOf(480, (h + 15) and 15.inv())
             val long = maxOf(aw, ah)
-            if (long > 2240) {
-                val scale = 2240.0 / long
+            if (long > 1920) {
+                val scale = 1920.0 / long
                 aw = maxOf(640, ((aw * scale).toInt() + 15) and 15.inv())
                 ah = maxOf(480, ((ah * scale).toInt() + 15) and 15.inv())
             }
@@ -1581,12 +1596,15 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     private fun handleTouch(displayId: Int, view: StreamView, event: MotionEvent) {
         val s = session ?: return
-        // 本地光标：手指位置零延迟反馈（远程画面不再含系统光标）
+        // 本地光标：手指位置零延迟反馈（远程画面不再含系统光标）。
+        // 记录回显位置/时刻供 onCursor 仲裁（防 host 滞后推送拽回，见 onCursor）
         val lc = localCursor
         if (lc != null) {
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
                     val w = windowPos(view, event.x, event.y)
+                    lastCursorEchoAt = System.currentTimeMillis()
+                    lastCursorEchoX = w[0]; lastCursorEchoY = w[1]
                     lc.moveTo(w[0], w[1])
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> Unit // 常驻：抬手不隐藏，由 host 光标包驱动

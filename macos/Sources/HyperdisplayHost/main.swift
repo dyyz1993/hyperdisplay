@@ -636,14 +636,13 @@ final class HostApp: NSObject, NSApplicationDelegate {
         // 统一对齐后再建；档案匹配/记录均用对齐值，保证重连恒定命中
         let w0 = max(640, (width + 15) & ~15)
         let h0 = max(480, (height + 15) & ~15)
-        // 清晰度档位：物理长边 >2240（高密度面板原生）时等比降到 2240。
-        // 已实测 CGVirtualDisplay 无法生成 HiDPI 2x 模式（密度申报到 237DPI 也只有
-        // 1x 档，settings.hiDPI 同样无效）——2x 渲染不可达，清晰度只能靠像素档权衡：
-        // 2800 原生(文字 ~69% 常规大小) / 2240 高清(~86%，像素量 64% 原生) / 1920 标准。
-        // 默认 2240：文字明显更锐、大小仍舒适。
+        // 清晰度档位：物理长边 >1920 时等比降到 1920 档。
+        // HiDPI 2x 不可达（实测），只能像素档权衡：2240 档文字 ~86% 常规大小——
+        // 用户实测偏小费眼；1920 档 = 100% 常规大小，且像素量 64% 带来更高帧率/
+        // 更低延迟（2026-08-21 定稿：舒适度优先，牺牲少量锐度）。
         let w: Int, h: Int
-        if max(w0, h0) > 2240 {
-            let scale = 2240.0 / Double(max(w0, h0))
+        if max(w0, h0) > 1920 {
+            let scale = 1920.0 / Double(max(w0, h0))
             w = max(640, (Int(Double(w0) * scale) + 15) & ~15)
             h = max(480, (Int(Double(h0) * scale) + 15) & ~15)
         } else {
