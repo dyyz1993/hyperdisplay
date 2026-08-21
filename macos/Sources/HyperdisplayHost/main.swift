@@ -192,9 +192,9 @@ final class DisplayStream {
         self.fps = fps
         self.bitrate = bitrate
         self.targetBitrate = bitrate
-        // 带宽探测从低走高：4M 起步（首帧 IDR 体积减半，弱网加入更快），
-        // 连续稳定后 AIMD 逐档升回目标——帧率优先
-        self.currentBitrate = min(bitrate, 4_000_000)
+        // 画质优先（AGENTS §7.5）：满码率直接启动——旧的 4M 缓升是为弱网首入设计，
+        // 在 LAN 策略下只会让加入后前几十秒画质无谓偏低；丢片由 AIMD 快速下调兜底
+        self.currentBitrate = bitrate
         self.host = host
         self.udp = udp
     }
