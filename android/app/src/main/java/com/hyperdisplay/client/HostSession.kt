@@ -445,6 +445,13 @@ class HostSession private constructor(
         send(buildPacket(0x1B, 0, body))
     }
 
+    /** 显示大小档位切换：host 落盘后自重启，客户端自动重连按新档建屏 */
+    fun sendSetTier(displayId: Int, w: Int, h: Int) {
+        val body = java.nio.ByteBuffer.allocate(6).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .putShort(displayId.toShort()).putShort(w.toShort()).putShort(h.toShort()).array()
+        send(buildPacket(0x1C, 0, body))
+    }
+
     fun sendSubscribeDisplays(ids: List<Int>) {
         val body = ByteBuffer.allocate(1 + ids.size * 4).order(ByteOrder.LITTLE_ENDIAN)
             .put(ids.size.toByte())

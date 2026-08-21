@@ -88,6 +88,27 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         NSLog("[hyperdisplay] capture restarted (same SCStream)")
     }
 
+    /// 档位切换：显示器模式已变（display.resize），流配置同步到新输出尺寸。
+    /// SCStream.updateConfiguration 是官方的动态重配置路径（真实显示器改分辨率
+    /// 即走此路径），不销毁流。
+    func reconfigure(width: Int, height: Int, fps: Int) async throws {
+        lock.lock()
+        let s = stream
+        lastEventAt = Date()
+        lock.unlock()
+        guard let s else { throw HostError("reconfigure on stopped engine") }
+        let cfg = SCStreamConfiguration()
+        cfg.width = width
+        cfg.height = height
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
+        cfg.queueDepth = 3
+        cfg.showsCursor = false
+        cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        cfg.capturesAudio = false
+        try await s.updateConfiguration(cfg)
+        NSLog("[hyperdisplay] capture reconfigured to %dx%d", width, height)
+    }
+
     func stop() {
         lock.lock()
         let s = stream

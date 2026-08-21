@@ -29,7 +29,7 @@ enum PacketType: UInt8 {
     case welcome = 0x01, videoFrag = 0x02, config = 0x03, inputAck = 0x05, pong = 0x06, displays = 0x07, cursor = 0x08
     case hello = 0x10, keyframeReq = 0x11, input = 0x12, ping = 0x13
     case selectDisplay = 0x14, createDisplay = 0x15, destroyDisplay = 0x16, nack = 0x17, subscribeDisplays = 0x18, recycle = 0x19
-    case bye = 0x1A, encoderReset = 0x1B
+    case bye = 0x1A, encoderReset = 0x1B, setTier = 0x1C
 }
 
 /// 0xFFFF 表示「全部显示屏」（KEYFRAME_REQ 专用）
@@ -58,6 +58,7 @@ enum Packet {
     case destroyDisplay(id: UInt32)
     case recycle
     case encoderReset(displayId: UInt16)
+    case setTier(displayId: UInt16, width: UInt16, height: UInt16)
     case bye
 }
 
@@ -306,6 +307,9 @@ enum Wire {
         case PacketType.encoderReset.rawValue:
             guard body >= 2 else { return nil }
             return .encoderReset(displayId: u16(0))
+        case PacketType.setTier.rawValue:
+            guard body >= 6 else { return nil }
+            return .setTier(displayId: u16(0), width: u16(2), height: u16(4))
         case PacketType.bye.rawValue:
             return .bye
         case PacketType.input.rawValue:

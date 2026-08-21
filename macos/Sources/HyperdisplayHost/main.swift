@@ -298,6 +298,34 @@ final class DisplayStream {
         )
     }
 
+    /// 档位切换（SET_TIER）：显示器模式原地改 → 流 updateConfiguration →
+    /// 编码器按新尺寸重建 → 全订阅者重广播（WELCOME 带新尺寸 + 新参数集 + 关键帧）。
+    /// 客户端解码器按新 WELCOME/CONFIG 自适应重建。
+    func applyTier(width: Int, height: Int, from addr: sockaddr_in) {
+        let w0 = max(640, (width + 15) & ~15)
+        let h0 = max(480, (height + 15) & ~15)
+        guard display.resize(width: w0, height: h0) else {
+            NSLog("[hyperdisplay] tier resize failed for display \(display.displayID)")
+            return
+        }
+        // 更新设备档案（重连时按新档位复用）
+        host?.updateDeviceProfile(displayId: display.displayID, width: pixelWidthSafe, height: pixelHeightSafe)
+        injector.updateMapping(bounds: display.bounds, streamWidth: Double(display.pixelWidth), streamHeight: Double(display.pixelHeight))
+        let capture2 = capture
+        let newW = display.pixelWidth, newH = display.pixelHeight
+        let fps2 = fps
+        Task.detached { [weak self] in
+            // 顺序：先改流配置（采集新尺寸）再重建编码器
+            try? await capture2?.reconfigure(width: newW, height: newH, fps: fps2)
+            await MainActor.run {
+                self?.bounceEncoder()
+            }
+        }
+    }
+
+    private var pixelWidthSafe: Int { display.pixelWidth }
+    private var pixelHeightSafe: Int { display.pixelHeight }
+
     /// 只重建编码器会话（绿屏自愈的最后手段，客户端 ENCODER_RESET 触发）：
     /// VideoToolbox 会话经会话切换风暴后可能产出全零流（华为硬解渲染为纯绿），
     /// 客户端重建解码器无效——必须换掉 host 侧编码器。不碰 SCStream/屏（永生流安全）。
@@ -787,12 +815,21 @@ final class HostApp: NSObject, NSApplicationDelegate {
                         NSLog("[hyperdisplay] device \(deviceId) reconnected → recreated \(profile.name) \(profile.w)x\(profile.h) id=\(id)")
                     }
                 } else {
-                    // 新档案存 16 对齐的原生尺寸（与建屏口径一致，重连匹配恒命中）。
-                    // 舒适度不靠降分辨率（那会牺牲清晰度），改由 createDisplay 的 HiDPI
-                    // 2x 渲染实现：UI 常规大小 + 原生像素锐度。
-                    let aw = max(640, (Int(cw) + 15) & ~15)
-                    let ah = max(480, (Int(ch) + 15) & ~15)
-                    deviceProfiles[deviceId] = (aw, ah, "Hyperdisplay 设备 \(deviceId % 10000)")
+                    // 新档案：优先用户选过的显示大小档位（UserDefaults 落盘，档位切换
+                    // 由 host 自重启生效——本构建 SCK 不支持任何在流改尺寸的路径），
+                    // 否则用客户端申报尺寸（16 对齐）
+                    let tierKey = "hyperdisplay.tier.\(deviceId)"
+                    if let saved = UserDefaults.standard.string(forKey: tierKey),
+                       let tw = saved.split(separator: ",").first.flatMap({ Int($0) }),
+                       let th = saved.split(separator: ",").last.flatMap({ Int($0) }),
+                       tw >= 640, th >= 480 {
+                        deviceProfiles[deviceId] = (tw, th, "Hyperdisplay 设备 \(deviceId % 10000)")
+                        NSLog("[hyperdisplay] device \(deviceId) using saved tier \(tw)x\(th)")
+                    } else {
+                        let aw = max(640, (Int(cw) + 15) & ~15)
+                        let ah = max(480, (Int(ch) + 15) & ~15)
+                        deviceProfiles[deviceId] = (aw, ah, "Hyperdisplay 设备 \(deviceId % 10000)")
+                    }
                 }
             }
             // 目标屏：档案屏优先（剪枝后重入会也能回到自己的屏——setSubscriptions 对
@@ -860,6 +897,27 @@ final class HostApp: NSObject, NSApplicationDelegate {
             // 2026-08-21 拔线绿屏实测：客户端 2 次自救失败后走此路径
             NSLog("[hyperdisplay] encoder reset requested for display \(displayId)")
             streams[CGDirectDisplayID(displayId)]?.bounceEncoder()
+
+        case .setTier(let displayId, let w, let h):
+            // 显示大小档位切换：落盘 + host 自重启（exec）。
+            // 本构建 SCK 实测三条在流路径全灭：模式切换（applySettings 不生效）、
+            // updateConfiguration（流死）、销毁重建（新流必死）——唯一可靠方式是
+            // 进程重载：退出清屏 → exec 自己 → 客户端自动重连 → 按落盘档位建屏。
+            NSLog("[hyperdisplay] tier change \(w)x\(h) — persisting and re-execing host")
+            if currentDeviceId != 0 {
+                UserDefaults.standard.set("\(w),\(h)", forKey: "hyperdisplay.tier.\(currentDeviceId)")
+            }
+            DispatchQueue.main.async {
+                hyperdisplayDestroyAllVirtualDisplays()
+                let exe = Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
+                var args = CommandLine.arguments
+                args[0] = exe
+                let cargs = args.map { strdup($0) }
+                defer { for p in cargs where p != nil { free(p) } }
+                _ = execv(exe, cargs)
+                // exec 失败（不该发生）：继续运行旧档位
+                NSLog("[hyperdisplay] re-exec failed: errno=\(errno) — continuing with old tier")
+            }
 
         case .bye:
             // 客户端主动退场（用户关 app / 切走超过宽限）：立刻摘除订阅，并把只剩
@@ -937,6 +995,13 @@ final class HostApp: NSObject, NSApplicationDelegate {
     // MARK: 周期 tick：统计 + 客户端 prune
 
     /// 全量自愈：销毁全部流与虚拟屏，重建初始配置（编码器池归零）
+    /// 档位切换后同步设备档案（重连按新档位复用）
+    func updateDeviceProfile(displayId: CGDirectDisplayID, width: Int, height: Int) {
+        guard currentDeviceId != 0 else { return }
+        let name = deviceProfiles[currentDeviceId]?.name ?? "Hyperdisplay 设备 \(currentDeviceId % 10000)"
+        deviceProfiles[currentDeviceId] = (width, height, name)
+    }
+
     /// 看门狗升级入口：采集流连续重启无效（中毒系统），全量重建屏+编码器池。
     /// AGENTS 4.1.5：fullIdleReset 仅用于污染恢复——此处正是。客户端靠重 HELLO 自愈回订阅。
     func escalateToIdleReset() {
@@ -1272,6 +1337,8 @@ signal(SIGPIPE, SIG_IGN)
 // 单实例锁：显示器创建虽已集中到 shim + createDisplay 护栏，但两个 host 进程并存
 // 仍意味着双份建销 churn（2026-08-20 调试实测踩过）。文件锁拿不到 = 已有实例，直接退出。
 let singleInstanceFd = open("/tmp/hyperdisplay.host.lock", O_CREAT | O_RDWR, 0o644)
+// exec 重载前释放锁（档位切换路径）：锁随 fd 存续，CLOEXEC 保证 exec 后可重新获取
+fcntl(singleInstanceFd, F_SETFD, FD_CLOEXEC)
 if singleInstanceFd < 0 || flock(singleInstanceFd, LOCK_EX | LOCK_NB) != 0 {
     NSLog("[hyperdisplay] another host instance is running (lock held) — exiting")
     exit(0)

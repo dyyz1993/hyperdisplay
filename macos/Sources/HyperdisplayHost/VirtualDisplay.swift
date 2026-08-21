@@ -7,8 +7,8 @@ import HyperdisplayObjC
 /// 显示器实例由 shim 常驻持有；进程退出（含崩溃）时 windowserver 自动摘除全部虚拟屏。
 final class VirtualDisplay {
     let displayID: CGDirectDisplayID
-    let pixelWidth: Int
-    let pixelHeight: Int
+    var pixelWidth: Int
+    var pixelHeight: Int
     /// 建屏时刻：起流沉降期判断（建屏瞬间起流的 SCK 概率性永不投递问题）
     let createdAt = Date()
     var age: TimeInterval { Date().timeIntervalSince(createdAt) }
@@ -42,6 +42,20 @@ final class VirtualDisplay {
     /// 显式销毁（不必等 deinit）
     func destroy() {
         hyperdisplayDestroyVirtualDisplay(displayID)
+    }
+
+    /// 原地改分辨率（模式切换，身份/位置/窗口归属不变）。成功后 pixelWidth/Height
+    /// 更新为系统回读值。显示大小档位切换专用——销毁重建会触发新 SCStream（必死）。
+    func resize(width: Int, height: Int) -> Bool {
+        guard hyperdisplayResizeVirtualDisplay(displayID, UInt32(width), UInt32(height)) else {
+            return false
+        }
+        if let mode = CGDisplayCopyDisplayMode(displayID) {
+            pixelWidth = Int(mode.pixelWidth)
+            pixelHeight = Int(mode.pixelHeight)
+        }
+        NSLog("[hyperdisplay] display \(displayID) resized to \(pixelWidth)x\(pixelHeight)")
+        return true
     }
 
     /// 该屏在全局桌面坐标系中的 frame（副屏原点可为负）

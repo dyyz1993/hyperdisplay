@@ -47,6 +47,7 @@ final class UsbTunnelController {
 
     private func startListener() {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
+        fcntl(fd, F_SETFD, FD_CLOEXEC) // 同上：exec 重载后 5280 必须可重绑
         guard fd >= 0 else { return }
         var one: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))

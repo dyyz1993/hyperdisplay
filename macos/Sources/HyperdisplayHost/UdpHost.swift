@@ -14,6 +14,7 @@ final class UdpHost {
     init(port: UInt16) throws {
         self.port = port
         fd = socket(AF_INET, SOCK_DGRAM, 0)
+        fcntl(fd, F_SETFD, FD_CLOEXEC) // exec 重载（档位切换）时必须释放端口，否则新进程只能绑 5278
         guard fd >= 0 else { throw HostError("socket() failed: \(String(cString: strerror(errno)))") }
 
         var yes: Int32 = 1

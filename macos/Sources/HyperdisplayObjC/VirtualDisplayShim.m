@@ -66,6 +66,27 @@ void hyperdisplayDestroyVirtualDisplay(CGDirectDisplayID displayID) {
     }
 }
 
+BOOL hyperdisplayResizeVirtualDisplay(CGDirectDisplayID displayID,
+                                      uint32_t width, uint32_t height) {
+    @synchronized (gDisplays) {
+        CGVirtualDisplay *display = gDisplays[@(displayID)];
+        if (display == nil || width == 0 || height == 0) {
+            return NO;
+        }
+        CGVirtualDisplayMode *mode = [[CGVirtualDisplayMode alloc] initWithWidth:width
+                                                                          height:height
+                                                                     refreshRate:60.0];
+        CGVirtualDisplaySettings *settings = [[CGVirtualDisplaySettings alloc] init];
+        settings.modes = @[ mode ];
+        // 档位切换 = 模式切换：同一显示器实例/EDID，windowserver 走模式变更路径
+        // （排列位置与窗口归属保留），绝不销毁重建（新 SCStream 必死）
+        if (![display applySettings:settings]) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
 void hyperdisplayDestroyAllVirtualDisplays(void) {
     @synchronized (gDisplays) {
         [gDisplays removeAllObjects];

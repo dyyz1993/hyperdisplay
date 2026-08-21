@@ -17,6 +17,12 @@ CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t width, uint32_t heig
 /// 销毁一块由本进程创建的虚拟显示器。
 void hyperdisplayDestroyVirtualDisplay(CGDirectDisplayID displayID);
 
+/// 原地修改分辨率（同一显示器的模式切换，EDID/身份不变）。
+/// 显示大小档位切换用——重建屏会触发新 SCStream（本 macOS 构建必死），
+/// 只能换模式。成功返回 true。
+BOOL hyperdisplayResizeVirtualDisplay(CGDirectDisplayID displayID,
+                                      uint32_t width, uint32_t height);
+
 /// 销毁全部（正常退出路径调用；异常退出由进程死亡兜底）。
 void hyperdisplayDestroyAllVirtualDisplays(void);
 

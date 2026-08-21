@@ -1403,6 +1403,37 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
         panel.addView(radio)
 
+        // 显示大小档位（2026-08-21）：切换 = host 记住档位并自重启（本 macOS 构建
+        // SCK 不支持任何在流改尺寸路径，实测三条全灭），平板自动重连后按新档建屏
+        panel.addView(TextView(this).apply {
+            text = "显示大小（切换会短暂断流约 3 秒）"
+            textSize = 13f
+            setPadding(0, 20, 0, 4)
+        })
+        val tiers = listOf("特大" to 1440, "大" to 1600, "标准" to 1920, "锐利" to 2240)
+        val tierRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val m = Resources.getSystem().displayMetrics
+        val natW = maxOf(m.widthPixels, m.heightPixels)
+        val natH = minOf(m.widthPixels, m.heightPixels)
+        tiers.forEach { (label, longEdge) ->
+            tierRow.addView(android.widget.Button(this).apply {
+                text = label
+                textSize = 13f
+                setOnClickListener {
+                    val s = session ?: return@setOnClickListener
+                    val did = subscribedIds.firstOrNull() ?: pipelines.keys.firstOrNull() ?: return@setOnClickListener
+                    val scale = longEdge.toFloat() / natW
+                    val tw = ((natW * scale).toInt() + 15) and 15.inv()
+                    val th = ((natH * scale).toInt() + 15) and 15.inv()
+                    statusText.text = ""
+                    Log.i(TAG, "tier switch -> $label ${tw}x$th (host will re-exec)")
+                    s.sendSetTier(did, tw, th)
+                    scheduleSwitchingBanner()
+                }
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        panel.addView(tierRow)
+
         // 参数区（随所选布局刷新）
         var frac = layoutConfig.fraction
         var sideLeft = layoutConfig.sideLeft
