@@ -458,6 +458,11 @@ final class DisplayStream {
             refinementWasMoving = true
         } else if still > 0.5 && refinementWasMoving {
             refinementWasMoving = false
+            // 防自触发循环：锐化 IDR 的编码会更新 lastContentFrameAt（replay 也走
+            // onFrame），不清空 = 系统把锐化帧误当新运动 → 无限锐化循环（实测
+            // 每 ~10s 一次 + 码率反复横跳 → 触发华为硬解绿屏）。清空后只有真实的
+            // 新采集内容才会重新武装检测。
+            lastContentFrameAt = nil
             let saved = currentBitrate
             if saved < targetBitrate {
                 encoder?.applyBitrate(targetBitrate) // 满码率编码这一帧
@@ -465,8 +470,6 @@ final class DisplayStream {
             NSLog("[hyperdisplay] refinement IDR for display \(display.displayID) (settled; bitrate \(saved/1000)k->\(targetBitrate/1000)k)")
             requestKeyframeAndReplay()
             if saved < targetBitrate {
-                // 1.2s 后恢复 AIMD 状态（IDR 已编码完；applyBitrate 自带 IDR 请求，
-                // 这里只还原平均码率供后续运动帧使用）
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                     guard let self, self.currentBitrate == self.targetBitrate else { return }
                     self.encoder?.applyBitrate(saved)
