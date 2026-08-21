@@ -199,13 +199,19 @@ final class UsbTunnelController {
         DispatchQueue.global(qos: .utility).async { self.registerReverse() }
     }
 
+    /// 已注册 reverse 的 serial 集合：不变时跳过 reverse 调用（每 5s 一次的
+    /// adb reverse fork 是纯浪费——reverse 只需在新 serial 出现时注册；设备重插
+    /// 后 serial 不变但 reverse 失效的场景由隧道探测失败→客户端重连路径兜底）
+    private var registeredSerials: Set<String> = []
+
     private func registerReverse() {
         guard let serials = Self.onlineDeviceSerials(adbPath: Self.locateAdb() ?? "") else { return }
-        for sn in serials {
-            // 幂等；设备重插后 reverse 失效，重注册必须无条件做
+        let newSerials = serials.filter { !registeredSerials.contains($0) }
+        for sn in newSerials {
             _ = Self.run(adbPath: Self.locateAdb() ?? "",
                          args: ["-s", sn, "reverse", "tcp:\(Self.tcpPort)", "tcp:\(Self.tcpPort)"])
         }
+        registeredSerials = Set(serials)
         if serials.count != deviceCount {
             deviceCount = serials.count
             DispatchQueue.main.async { [weak self] in self?.onDeviceCountChange?() }

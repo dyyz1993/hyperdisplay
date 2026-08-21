@@ -1752,15 +1752,24 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     }
 
     /** 状态落盘：锁屏/无屏环境下的可观测通道（adb pull 验证用） */
+    private var lastStatusText: String? = null
+
     private fun writeStatusFile() {
         try {
             val dir = getExternalFilesDir(null) ?: return
             val link = if (linkUp) "up" else "down"
+            // renderedNow 每秒都变会让"变化才写"退化成每秒写——归零该字段做指纹
             val pips = synchronized(pipelineLock) {
-                pipelines.values.joinToString(";") { "${it.id}:${it.width}x${it.height}:${it.renderedNow}" }
+                pipelines.values.joinToString(";") { "${it.id}:${it.width}x${it.height}" }
             }
-            val text = "link=$link fps=$renderFps transport=$transport layout=${layoutConfig.kind} subs=${subscribedIds.joinToString()} pipelines=$pips\n"
-            java.io.File(dir, "status.txt").writeText(text)
+            val text = "link=$link transport=$transport layout=${layoutConfig.kind} subs=${subscribedIds.joinToString()} pipelines=$pips\n"
+            val f = java.io.File(dir, "status.txt")
+            if (text == lastStatusText && f.exists()) return // 闪存友好：内容没变且文件在，不写盘
+            lastStatusText = text
+            val real = "link=$link fps=$renderFps transport=$transport layout=${layoutConfig.kind} subs=${subscribedIds.joinToString()} pipelines=${
+                synchronized(pipelineLock) { pipelines.values.joinToString(";") { "${it.id}:${it.width}x${it.height}:${it.renderedNow}" } }
+            }\n"
+            java.io.File(dir, "status.txt").writeText(real)
         } catch (_: Exception) { }
     }
 

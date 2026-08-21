@@ -287,9 +287,12 @@ final class DisplayStream {
                 let fragCount = frags.count
                 let perFragDelay: useconds_t = fragCount > 1 ? useconds_t(min(8000, 8_000_000 / 600)) / useconds_t(fragCount) : 0
                 for var addr in addresses {
+                    // USB 隧道客户端（127.0.0.1）：跳过 usleep 节流——TCP 缓冲自会平滑，
+                    // 节流只会在编码回调线程上白阻塞 + 增加延迟；WiFi 才需要防突发丢片
+                    let isTunnel = addr.sin_addr.s_addr == INADDR_LOOPBACK.bigEndian
                     for (index, frag) in frags.enumerated() {
                         self.udp.sendWithBackpressure(to: &addr, frag)
-                        if index < fragCount - 1 && perFragDelay > 60 {
+                        if !isTunnel && index < fragCount - 1 && perFragDelay > 60 {
                             usleep(perFragDelay)
                         }
                     }
