@@ -17,11 +17,11 @@ ASSETS=(
   "$DIST/Hyperdisplay-android.apk#Hyperdisplay-android.apk"
   "$DIST/SHA256SUMS#SHA256SUMS"
 )
-NOTES=()
+NOTES=""
 if [[ -f "$DIST/Hyperdisplay-macOS-arm64.dmg" ]]; then
   ASSETS=("$DIST/Hyperdisplay-macOS-arm64.dmg#Hyperdisplay-macOS-arm64.dmg" "${ASSETS[@]}")
 elif [[ "$MODE" == "--android-only" ]]; then
-  NOTES=(--notes "Android APK is available now. The macOS DMG will be added after Apple notarization.")
+  NOTES="Android APK is available now. The macOS DMG will be added after Apple notarization."
 else
   echo "release error: missing notarized Mac DMG; use --android-only for an explicitly Android-only release" >&2
   exit 1
@@ -35,9 +35,17 @@ if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
   exit 0
 fi
 
-gh release create "$TAG" \
-  "${ASSETS[@]}" \
-  --repo "$REPOSITORY" \
-  --title "Hyperdisplay $TAG" \
-  --generate-notes \
-  "${NOTES[@]}"
+if [[ -n "$NOTES" ]]; then
+  gh release create "$TAG" \
+    "${ASSETS[@]}" \
+    --repo "$REPOSITORY" \
+    --title "Hyperdisplay $TAG" \
+    --generate-notes \
+    --notes "$NOTES"
+else
+  gh release create "$TAG" \
+    "${ASSETS[@]}" \
+    --repo "$REPOSITORY" \
+    --title "Hyperdisplay $TAG" \
+    --generate-notes
+fi
