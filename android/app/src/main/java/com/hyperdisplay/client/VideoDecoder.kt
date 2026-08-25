@@ -19,6 +19,7 @@ class VideoDecoder(
     private val mime: String,
     private val width: Int,
     private val height: Int,
+    private val fps: Int,
     private val surface: Surface,
     private val csd0: ByteArray
 ) {
@@ -33,6 +34,7 @@ class VideoDecoder(
     private val running = AtomicBoolean(false)
     private val thread = Thread({ loop() }, "hyperdisplay-decoder")
     private var ptsIndex = 0L
+    private val frameDurationUs = 1_000_000L / fps.coerceAtLeast(1)
     @Volatile var renderedFrames: Int = 0
         private set
     @Volatile private var inputSubmitted = 0L
@@ -42,6 +44,9 @@ class VideoDecoder(
         val format = MediaFormat.createVideoFormat(mime, width, height).apply {
             setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(csd0))
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1 shl 21)
+            // 与 Host WELCOME 协商的节奏一致。之前 PTS 固定 33.3ms，即使 Host
+            // 已 60fps 采集，部分硬解仍会把流当 30fps 调度，滚动/动画会显得拖沓。
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps.coerceIn(1, 144))
             if (Build.VERSION.SDK_INT >= 30) {
                 try {
                     if (codec.codecInfo.getCapabilitiesForType(mime)
@@ -92,7 +97,7 @@ class VideoDecoder(
                         if (buf.remaining() >= frame.data.size) {
                             buf.put(frame.data)
                             // MediaCodec 依赖单调递增 PTS 释放输出缓冲；全零会被无限 hold
-                            val pts = ptsIndex * 33_333L
+                            val pts = ptsIndex * frameDurationUs
                             ptsIndex++
                             codec.queueInputBuffer(inIdx, 0, frame.data.size, pts,
                                 if (frame.keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)

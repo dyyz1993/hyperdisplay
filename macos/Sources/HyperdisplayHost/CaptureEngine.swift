@@ -8,6 +8,9 @@ import IOSurface
 /// SCShareableContent 里，start() 内部带轮询。
 final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     var onFrame: ((CVPixelBuffer) -> Void)?
+    /// 强制关键帧时重放最近 IOSurface；它不是新的桌面内容，不能拿来重新触发
+    /// “动→静”检测，否则静态锐化会把自己误判成持续运动。
+    var onReplayFrame: ((CVPixelBuffer) -> Void)?
     var onFailure: ((String) -> Void)?
 
     private var stream: SCStream?
@@ -35,7 +38,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         lock.unlock()
         if let frame {
             NSLog("[hyperdisplay] replaying last captured frame for forced keyframe")
-            onFrame?(frame)
+            (onReplayFrame ?? onFrame)?(frame)
         } else {
             NSLog("[hyperdisplay] replay requested but no buffered frame yet")
         }
@@ -57,8 +60,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         cfg.height = height
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
         cfg.queueDepth = 3
-        // 系统光标不进画面：光标反馈由客户端本地绘制（零延迟），
-        // 否则光标要经 采集→编码→传输→解码 一整圈（50-80ms），手感明显拖沓
+        // Cursor 单独走极轻量的坐标 UDP，并由 Android 在最上层绘制。SCK 对虚拟屏
+        // 的 showsCursor 并不稳定，且与叠加层同时启用会偶发双光标。
         cfg.showsCursor = false
         cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         cfg.capturesAudio = false
@@ -73,10 +76,9 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         NSLog("[hyperdisplay] capture started for display %u (%dx%d@%d)", displayID, width, height, fps)
     }
 
-    /// 同一流对象重启（stopCapture→startCapture）。
-    /// 本 macOS 构建的 SCK 守护进程：进程内第一条 SCStream 之后新建的流全部
-    /// 静默（对象正确释放也一样，2026-08-21 受控实验）。因此流一旦创建必须
-    /// 永生复用——看门狗/重连一律走 restart，绝不 new CaptureEngine。
+    /// 同一流对象重启（stopCapture→startCapture）。SCK 经 churn 后新建流偶发
+    /// 永久静默，而原流 stop→start 可恢复；因此当前显示器生命周期内看门狗
+    /// 始终复用原 SCStream，不升级为重建屏。
     func restart() async throws {
         lock.lock()
         let s = stream
@@ -88,27 +90,6 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         NSLog("[hyperdisplay] capture restarted (same SCStream)")
     }
 
-    /// 档位切换：显示器模式已变（display.resize），流配置同步到新输出尺寸。
-    /// SCStream.updateConfiguration 是官方的动态重配置路径（真实显示器改分辨率
-    /// 即走此路径），不销毁流。
-    func reconfigure(width: Int, height: Int, fps: Int) async throws {
-        lock.lock()
-        let s = stream
-        lastEventAt = Date()
-        lock.unlock()
-        guard let s else { throw HostError("reconfigure on stopped engine") }
-        let cfg = SCStreamConfiguration()
-        cfg.width = width
-        cfg.height = height
-        cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
-        cfg.queueDepth = 3
-        cfg.showsCursor = false
-        cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-        cfg.capturesAudio = false
-        try await s.updateConfiguration(cfg)
-        NSLog("[hyperdisplay] capture reconfigured to %dx%d", width, height)
-    }
-
     func stop() {
         lock.lock()
         let s = stream
@@ -117,14 +98,22 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         lock.unlock()
         guard let s else { return }
         s.stopCapture()
-        // 必须显式摘除输出：SCStream 强持有 output 回调，不摘则旧流对象永不释放
-        // （ARC 无 GC），进程内出现"僵尸流"后 SCK 的新流全部静默——每进程只有
-        // 第一条流能投递的根因（2026-08-21 受控实验定位）
+        // 必须显式摘除输出：SCStream 强持有 output 回调，不摘会留下僵尸流，
+        // 放大后续新流静默概率。
         try? s.removeStreamOutput(self, type: .screen)
     }
 
+    /// WindowServer 已经列出显示器后，ScreenCaptureKit 仍可能延后数秒才返回它。
+    /// 15 秒不是体验上的阻塞（调用方异步等待），而是避免 USB/后台快速重连时把
+    /// 「尚在注册的旧屏」误判成创建失败再立刻创建下一块。
+    static func isDisplayVisibleToScreenCaptureKit(displayID: CGDirectDisplayID) async -> Bool {
+        guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        else { return false }
+        return content.displays.contains(where: { $0.displayID == displayID })
+    }
+
     private func waitForDisplay(displayID: CGDirectDisplayID) async throws -> SCShareableContent {
-        for attempt in 0..<20 {
+        for attempt in 0..<150 {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
             if content.displays.contains(where: { $0.displayID == displayID }) {
                 return content
@@ -183,6 +172,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
     }
+
+
 
 
     /// SCK 帧状态直方图（菜单栏诊断用）

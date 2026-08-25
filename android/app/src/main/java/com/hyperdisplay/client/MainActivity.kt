@@ -1,9 +1,12 @@
 package com.hyperdisplay.client
 
 import android.annotation.SuppressLint
+import android.app.ActivityManager
 import android.content.res.Resources
 import android.graphics.Color
 import android.graphics.Typeface
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -42,7 +45,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var chromeHandle: TextView? = null
     private var chromeHideRunnable: Runnable? = null
 
-    /** 呼出状态条+配置按钮（6s 自动隐藏；配置面板打开期间不计时） */
+    /** 呼出临时状态条；配置按钮常驻，不能让屏幕/分辨率入口藏在手势里。 */
     private fun showChrome() {
         statsOverlay?.visibility = android.view.View.VISIBLE
         configButton?.visibility = android.view.View.VISIBLE
@@ -56,11 +59,13 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         // 配置面板挂在 root 上的场景不隐藏（用户正在操作）——简化判定：面板类弹窗
         // 存在时 statsTick 的 6s 计时照走，但面板自身是 Dialog 生命周期不受影响
         statsOverlay?.visibility = android.view.View.GONE
-        configButton?.visibility = android.view.View.GONE
+        // ⚙ 配置必须常驻：它是分辨率、双屏和画中画唯一的显式入口。
     }
     private var sessionRoot: FrameLayout? = null
     private val waitingOverlay by lazy { WaitingOverlay(this) }
     private var waitingSince = 0L
+    /** Host 已回包但 DISPLAYS 为空：保持会话，展示明确等待态，绝不把它当断线。 */
+    private var waitingForDisplay = false
     private var switchingBanner: android.widget.LinearLayout? = null
     private var switchingBannerShow: Runnable? = null
     private val regionViews = mutableListOf<StreamView>()
@@ -72,6 +77,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         @Volatile var codec = 1 // WELCOME 上报：1=HEVC 2=H.264（host 硬编会话耗尽时回退）
         @Volatile var width: Int = 0
         @Volatile var height: Int = 0
+        @Volatile var fps: Int = 60
         @Volatile var surface: Surface? = null
         @Volatile var lastKeyframeDeliveredAt = 0L
         var lastRendered = 0
@@ -99,13 +105,44 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val sideLeft: Boolean = false,    // 侧边在左
         val pipRatio: String = "16:10",   // 画中画宽高比（初始形状）
         val pipCustomW: Int = 0,          // 手指自由缩放后的画中画尺寸（0=按比例默认）
-        val pipCustomH: Int = 0
+        val pipCustomH: Int = 0,
+        /** 0=平板原生尺寸；其余为虚拟屏长边档位，随设备布局一起持久化。 */
+        val displayLongEdge: Int = 0
     )
 
     private var layoutConfig = LayoutConfig()
+
+    private fun loadLayoutConfig(): LayoutConfig {
+        val p = getSharedPreferences("hyperdisplay", MODE_PRIVATE)
+        val kind = runCatching {
+            LayoutKind.valueOf(p.getString("layout.kind", LayoutKind.SINGLE.name)!!)
+        }.getOrDefault(LayoutKind.SINGLE)
+        return LayoutConfig(
+            kind = kind,
+            fraction = p.getFloat("layout.fraction", 0.5f).coerceIn(0.2f, 0.8f),
+            sideLeft = p.getBoolean("layout.sideLeft", false),
+            pipRatio = p.getString("layout.pipRatio", "16:10") ?: "16:10",
+            pipCustomW = p.getInt("layout.pipCustomW", 0).coerceAtLeast(0),
+            pipCustomH = p.getInt("layout.pipCustomH", 0).coerceAtLeast(0),
+            displayLongEdge = p.getInt("layout.displayLongEdge", 0)
+                .takeIf { it in listOf(1440, 1600, 1920, 2240) } ?: 0
+        )
+    }
+
+    private fun saveLayoutConfig(cfg: LayoutConfig) {
+        getSharedPreferences("hyperdisplay", MODE_PRIVATE).edit()
+            .putString("layout.kind", cfg.kind.name)
+            .putFloat("layout.fraction", cfg.fraction)
+            .putBoolean("layout.sideLeft", cfg.sideLeft)
+            .putString("layout.pipRatio", cfg.pipRatio)
+            .putInt("layout.pipCustomW", cfg.pipCustomW)
+            .putInt("layout.pipCustomH", cfg.pipCustomH)
+            .putInt("layout.displayLongEdge", cfg.displayLongEdge)
+            .putInt("layout.pipLeft", pipLeft)
+            .putInt("layout.pipTop", pipTop)
+            .apply()
+    }
     private var subscribedIds = listOf<Int>()
-    private val createdIds = mutableListOf<Int>()
-    private var pendingRegions: List<Pair<Int, Int>>? = null
     private var displays: List<HostSession.DisplayInfo> = emptyList()
     private var configButton: Button? = null
     private var localCursor: LocalCursorView? = null
@@ -122,11 +159,17 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     @Volatile private var linkUp = false
     private val mainHandler = Handler(Looper.getMainLooper())
-    private enum class Transport { USB, WIFI }
-    private var transport = Transport.WIFI
     private var reconnecting = false
-    private var usbProbeCounter = 0
+    private var activeTransport = NsdFinder.Transport.OTHER
+    private var routeProbeTicks = 0
+    private var routeProbeActive = false
+    // 产品定位是外置显示器；不申请辅助功能，也不把触摸转换为 Mac 输入。
+    @Volatile private var remoteControlEnabled = false
     private var renderFps = 0
+    private var appCpuPercent = 0.0
+    private var appMemoryMB = 0
+    private var lastResourceSampleAt = 0L
+    private var lastProcessCpuMs = 0L
     private var lastWatchdogKfAt = 0L
     private val statsTick = object : Runnable {
         override fun run() {
@@ -199,13 +242,16 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 } else {
                     p.deadTicks = 0
                 }
-                if (p.decoderAgeTicks in listOf(3, 8, 15) && p.csd != null) {
+                // 华为 HEVC 坏会话会把首帧渲染为均匀绿屏。原先首次取证在 3 秒，
+                // 再等 host 编码器重建后用户会看见约 5 秒绿屏；提前到第 1 秒即可
+                // 在首帧阶段完成自愈，后两次保留为网络抖动后的兜底。
+                if (p.decoderAgeTicks in listOf(1, 3, 8) && p.csd != null) {
                     val view = regionViews.firstOrNull { it.displayId == p.id }
                     if (view != null) detectGreenAndBounce(view, p)
                 }
             }
             val s = session
-            if (s != null && linkUp) {
+            if (s != null && linkUp && !waitingForDisplay) {
                 waitingSince = 0
                 if (waitingOverlay.parent != null) waitingOverlay.dismiss()
                 for (p in snapshot) {
@@ -217,6 +263,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                         }
                     }
                 }
+            } else if (s != null && linkUp && waitingForDisplay && sessionRoot != null) {
+                waitingSince = 0
+                waitingOverlay.state = WaitingOverlay.State.CONNECTED_NO_DISPLAY
+                waitingOverlay.tryingUsb = activeTransport == NsdFinder.Transport.USB
+                waitingOverlay.tryingWifi = activeTransport != NsdFinder.Transport.USB
+                mainHandler.post { waitingOverlay.show(root) }
             } else if (s != null && sessionRoot != null) {
                 // 断链等待 >3s 且还没恢复：全屏等待页（双通道动画 + 动态文案）。
                 // 3s 宽限是为了不给快闪断（WiFi 探测的瞬时失败）闪屏。
@@ -225,32 +277,28 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 if (now - waitingSince > 3000) {
                     waitingOverlay.tryingUsb = true
                     waitingOverlay.tryingWifi = true // 智能重连两条路都在试
+                    waitingOverlay.state = WaitingOverlay.State.CONNECTING
                     val rootF = root
                     mainHandler.post { waitingOverlay.show(rootF) }
                 }
             }
-            // 会话已死但没人处理：USB 死链走智能重连（先试 USB 再降 WiFi）；
-            // WiFi 死链同样必须重连（openSession 的失败路径不重试，躺平=永久等待页）。
-            // 双通道都由这里兜底，5s 节流防风暴。
+            // Wi-Fi 首连/Host 重启期间，HostSession 会在同一 UDP socket 上无限静默
+            // 重发 HELLO。这里若每 5 秒 destroy + 重新发现，会让全屏等待页反复
+            // 销毁重建（用户看到“一闪一闪”），还会把 UDP 源端口不断换掉。
+            // 只有当前已在 USB 网络上，才需要主动拆会话回退到已知 Wi-Fi 地址。
             val s1 = session
-            if (!linkUp && s1 != null && !reconnecting
+            if (!linkUp && activeTransport == NsdFinder.Transport.USB && s1 != null && !reconnecting
                 && System.currentTimeMillis() - lastReconnectAt > 5000) {
                 mainHandler.post { scheduleSmartReconnect() }
             }
-            // WiFi 期间周期探测 USB 兜底（30s；插线即时触发见 onResume 注册的 onPlugged）
-            usbProbeCounter++
-            val s0 = session
-            if (usbProbeCounter >= 30) {
-                usbProbeCounter = 0
-                if (transport == Transport.WIFI && linkUp && s0 != null) {
-                    probeUsb { usbOk ->
-                        if (usbOk && transport == Transport.WIFI) {
-                            openSession("127.0.0.1", 5280, isSwitch = true)
-                            transport = Transport.USB
-                        }
-                    }
-                }
+            // 会话存在时才探测更优链路：插线广播会立即触发；30 秒低频轮询只作
+            // OEM 漏广播兜底。找到同一 Mac 的 USB UDP 地址才切换，USB 会话不轮询。
+            routeProbeTicks++
+            if (linkUp && activeTransport != NsdFinder.Transport.USB && routeProbeTicks >= 30) {
+                routeProbeTicks = 0
+                mainHandler.post { probeForUsbUpgrade() }
             }
+            if (s1 != null) sampleAppResources(System.currentTimeMillis())
             updateOverlay()
             writeStatusFile()
             mainHandler.postDelayed(this, 1000)
@@ -262,11 +310,16 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        layoutConfig = loadLayoutConfig()
+        val layoutPrefs = getSharedPreferences("hyperdisplay", MODE_PRIVATE)
+        pipLeft = layoutPrefs.getInt("layout.pipLeft", -1)
+        pipTop = layoutPrefs.getInt("layout.pipTop", -1)
         root = FrameLayout(this)
         setContentView(root)
         showConnectView()
         when (intent.getStringExtra("host")?.trim()?.lowercase()) {
-            "smart" -> smartConnect() // 自动选路：USB 优先，否则历史 WiFi / 自动发现
+            "discover" -> startAutoDiscovery() // USB 网络变化后由 mDNS 重新解析可达地址
+            "smart" -> smartConnect() // 优先复用已保存地址，否则自动发现
             null, "" -> smartConnect() // 零点击基线（AGENTS.md §7.1）：打开 app 即自动连接
             else -> intent.getStringExtra("host")!!.trim().let { text ->
                 parseEndpoint(text)?.let { (host, port) -> connect(host, port) }
@@ -274,11 +327,22 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        // 桌面再次点开只应唤回现有副屏会话，不能在同一任务叠一层 MainActivity。
+        // 有明确的 USB/通知指令时才重新探测；普通启动不打断已经存活的 Wi-Fi UDP 会话。
+        when (intent.getStringExtra("host")?.trim()?.lowercase()) {
+            "discover" -> startAutoDiscovery()
+            "smart" -> if (session == null) smartConnect()
+        }
+    }
+
     // MARK: 连接界面
 
     @SuppressLint("ApplySharedPref")
     private fun showConnectView() {
-        disconnectSession()
+        disconnectSession(removeDisplay = true)
         root.removeAllViews()
         window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
 
@@ -295,7 +359,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             gravity = Gravity.CENTER
         }
         val subtitle = TextView(this).apply {
-            text = "把这块平板变成 Mac 的扩展屏（局域网 UDP）"
+            text = connectionPathHint()
             textSize = 14f
             gravity = Gravity.CENTER
             setPadding(0, 8, 0, 32)
@@ -314,14 +378,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val button = Button(this).apply { text = "连接" }
         val scanButton = Button(this).apply { text = "扫码连接" }
         val findButton = Button(this).apply { text = "局域网发现" }
-        val usbButton = Button(this).apply { text = "USB 连线" }
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
         buttonRow.addView(scanButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         buttonRow.addView(findButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        buttonRow.addView(usbButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         statusText = TextView(this).apply {
             text = ""
             textSize = 13f
@@ -342,7 +404,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         hostInput = input
 
         button.setOnClickListener {
-            // 智能连接：优先 USB（插线即用），否则用手输/历史 WiFi 主机
+            // 已保存地址会自动连接；这里仅保留首次手输的兜底入口。
             val text = input.text.toString().trim()
             if (text.isNotEmpty()) {
                 val (host, port) = parseEndpoint(text) ?: run {
@@ -358,11 +420,33 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
         scanButton.setOnClickListener { launchQrScan() }
         findButton.setOnClickListener { showDiscoveryDialog() }
-        usbButton.setOnClickListener {
-            // USB 隧道：adb reverse 把 127.0.0.1:5280 经 USB 线转到 Mac 的隧道桥
-            statusText.text = "USB 隧道连接中…（需插线且 Mac 侧桥接在运行）"
-            connect("127.0.0.1", 5280)
+    }
+
+    /**
+     * 只依据当前真正存在的网络接口判断 USB 是否可用。插上数据线、选择 MTP
+     * 并不等于建立了网络；部分平板 ROM（例如当前实测的华为 DBY2-W00）根本不
+     * 暴露 USB 网络共享开关，这时必须诚实走 Wi-Fi。
+     */
+    private fun hasUsbUdpNetwork(): Boolean {
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+        return cm.allNetworks.any { network ->
+            val caps = cm.getNetworkCapabilities(network) ?: return@any false
+            if (Build.VERSION.SDK_INT >= 31 &&
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_USB)) {
+                return@any true
+            }
+            // 有些 RNDIS 实现上报为 Ethernet；仅在接口名也明确是 USB/RNDIS 时认定，
+            // 避免把扩展坞的普通有线网卡误标成“直连 USB”。
+            if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return@any false
+            val ifName = cm.getLinkProperties(network)?.interfaceName?.lowercase().orEmpty()
+            ifName.contains("rndis") || ifName.startsWith("usb")
         }
+    }
+
+    private fun connectionPathHint(): String = if (hasUsbUdpNetwork()) {
+        "USB UDP 已就绪，会优先使用；拔线后自动切回 Wi-Fi"
+    } else {
+        "当前未检测到 USB 网卡，将使用 Wi-Fi；MTP 只传文件，不能传画面"
     }
 
     private fun saveCode(text: String) {
@@ -379,56 +463,84 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     }
 
     private fun connect(host: String, port: Int) {
-        if (host != "127.0.0.1") {
-            getPreferences(MODE_PRIVATE).edit().putString("host", "$host:$port").apply()
-            transport = Transport.WIFI
-        } else {
-            transport = Transport.USB
-        }
-        openSession(host, port)
+        getPreferences(MODE_PRIVATE).edit()
+            .putString("host", "$host:$port")
+            .putString("lastWifiHost", "$host:$port")
+            .apply()
+        openSession(host, port, transport = NsdFinder.Transport.WIFI)
     }
 
     /** 发现结果直接连接：主机地址 + TXT 配对码一并记住（零点击，AGENTS.md §7） */
-    private fun connectEntry(e: NsdFinder.HostEntry) {
-        getPreferences(MODE_PRIVATE).edit()
+    private fun connectEntry(e: NsdFinder.HostEntry, isSwitch: Boolean = false) {
+        val editor = getPreferences(MODE_PRIVATE).edit()
             .putString("host", "${e.host}:${e.port}")
-            .putInt("pairingCode", e.code)
-            .apply()
-        connect(e.host, e.port)
+        if (e.code != 0) editor.putInt("pairingCode", e.code)
+        when (e.transport) {
+            NsdFinder.Transport.USB -> editor.putString("lastUsbHost", "${e.host}:${e.port}")
+            NsdFinder.Transport.WIFI -> editor.putString("lastWifiHost", "${e.host}:${e.port}")
+            NsdFinder.Transport.OTHER -> Unit
+        }
+        editor.apply()
+        openSession(e.host, e.port, isSwitch, e.network, e.transport)
     }
 
     /** 建立会话（连接页与自动重连共用）。
      *  isSwitch=true 才显示切换横幅：横幅语义是「正在换通道」，取消条件是首帧渲染。
      *  初次连接/重连不该用它——host 不健康时永远等不到首帧，横幅挂死不撤
      *  （2026-08-20 用户实测：开 app 一直"正在切换通道"）。初连用等待页语义。 */
-    private fun openSession(host: String, port: Int, isSwitch: Boolean = false) {
+    private fun openSession(
+        host: String,
+        port: Int,
+        isSwitch: Boolean = false,
+        network: android.net.Network? = null,
+        transport: NsdFinder.Transport = NsdFinder.Transport.OTHER
+    ) {
         disconnectSession()
         if (isSwitch) scheduleSwitchingBanner()
         val code = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
         val deviceId = HostSession.loadOrCreateDeviceId(this)
-        val s = HostSession.create(host, port, sessionListener, code, deviceId)
+        val s = HostSession.create(host, port, sessionListener, code, deviceId, requestedDisplaySpecs(), network)
         if (s == null) {
-            transport = Transport.WIFI
             showConnectView()
             statusText.text = "无法解析地址（仅支持数字 IPv4）"
             return
         }
+        activeTransport = transport
         session = s
+        waitingForDisplay = false
         showSessionView()
         s.start()
         mainHandler.post(statsTick)
         // 前台服务最后启动（会话已成立）：先启后停会触发
         // ForegroundServiceDidNotStartInTimeException（启动被 stopService 取消）
-        if (Build.VERSION.SDK_INT >= 26) {
-            startForegroundService(android.content.Intent(this, SessionService::class.java))
-        } else {
-            startService(android.content.Intent(this, SessionService::class.java))
+        // Android 12+ 禁止已退到后台的 Activity/重连回调任意拉起前台服务。
+        // 这不是连接失败，却会抛 ForegroundServiceStartNotAllowedException 并把
+        // 整个 App 打死。前台时服务正常启动；被系统拒绝时保留当前 UDP 会话，
+        // 下次回到前台再启动，而不是闪退。
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(android.content.Intent(this, SessionService::class.java))
+            } else {
+                startService(android.content.Intent(this, SessionService::class.java))
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "foreground session service start deferred by Android", e)
         }
     }
 
-    /** USB 链路探测（共享实现见 UsbProbe；注释保留原由） */
-    private fun probeUsb(result: (Boolean) -> Unit) {
-        UsbProbe.probe(this, result)
+    /** HELLO 的零点击设备档案：单屏=当前平板尺寸；分屏/画中画=上次保存的完整屏幕组。 */
+    private fun requestedDisplaySpecs(): List<Pair<Int, Int>> {
+        val (sw, sh) = screenDims()
+        val raw = if (layoutConfig.kind == LayoutKind.SINGLE) listOf(sw to sh)
+        else regionSizes(layoutConfig).ifEmpty { listOf(sw to sh) }.take(4)
+        val longEdge = layoutConfig.displayLongEdge
+        if (longEdge == 0) return raw
+        return raw.map { (w, h) ->
+            val scale = longEdge.toFloat() / maxOf(sw, sh).toFloat()
+            val rw = (((w * scale).toInt() + 15) and 15.inv()).coerceAtLeast(640)
+            val rh = (((h * scale).toInt() + 15) and 15.inv()).coerceAtLeast(480)
+            rw to rh
+        }
     }
 
     // MARK: 通道切换过渡横幅（快切换不浮现，慢 1.5s 后出现）
@@ -458,30 +570,26 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
-    /** 智能连接：有 USB 走 USB，否则走保存过的 WiFi 主机 */
+    /** 智能连接：复用已保存的 UDP 主机，否则搜索局域网内的 Mac。 */
     private fun smartConnect() {
-        statusText.text = "探测 USB 连接…"
-        probeUsb { usbOk ->
-            if (usbOk) {
-                statusText.text = "USB 隧道可用"
-                openSession("127.0.0.1", 5280)
-                transport = Transport.USB
-            } else {
-                val saved = getPreferences(MODE_PRIVATE).getString("host", null)
-                val ep = saved?.let { parseEndpoint(it) }
-                if (ep != null) {
-                    statusText.text = "走 WiFi：${ep.first}:${ep.second}"
-                    openSession(ep.first, ep.second)
-                    transport = Transport.WIFI
-                } else {
-                    statusText.text = "USB 未连接且无历史主机——自动搜索局域网内的 Mac…"
-                    startAutoDiscovery()
-                }
+        val prefs = getPreferences(MODE_PRIVATE)
+        val saved = prefs.getString("host", null)
+        val ep = saved?.let { parseEndpoint(it) }
+        if (ep != null) {
+            statusText.text = "连接 UDP 主机：${ep.first}:${ep.second}"
+            val transport = when (saved) {
+                prefs.getString("lastUsbHost", null) -> NsdFinder.Transport.USB
+                prefs.getString("lastWifiHost", null) -> NsdFinder.Transport.WIFI
+                else -> NsdFinder.Transport.OTHER
             }
+            openSession(ep.first, ep.second, transport = transport)
+        } else {
+            statusText.text = "无历史主机——自动搜索局域网内的 Mac…"
+            startAutoDiscovery()
         }
     }
 
-    /** 自动重连（USB 断开时降级；恢复时优先升回 USB） */
+    /** 自动重连 UDP 主机。 */
     private var lastReconnectAt = 0L
 
     private fun scheduleSmartReconnect() {
@@ -490,25 +598,19 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         lastReconnectAt = System.currentTimeMillis()
         mainHandler.postDelayed({
             reconnecting = false
-            probeUsb { usbOk ->
-                if (usbOk) {
-                    openSession("127.0.0.1", 5280, isSwitch = true)
-                    transport = Transport.USB
-                } else {
-                    val saved = getPreferences(MODE_PRIVATE).getString("host", null)
-                    val ep = saved?.let { parseEndpoint(it) }
-                    if (ep != null) {
-                        openSession(ep.first, ep.second, isSwitch = true)
-                        transport = Transport.WIFI
-                    } else {
-                        // 无历史主机：回到连接页让用户选（不留死会话）
-                        transport = Transport.WIFI
-                        showConnectView()
-                        statusText.text = "USB 已断开且无历史 WiFi 主机——请扫码 / 发现 / 输入 IP"
-                    }
-                }
+            val prefs = getPreferences(MODE_PRIVATE)
+            val wifi = prefs.getString("lastWifiHost", null)?.let { parseEndpoint(it) }
+            if (activeTransport == NsdFinder.Transport.USB && wifi != null) {
+                // USB 拔线：优先用已经验证过的 Wi-Fi 地址，不等一轮发现。
+                openSession(wifi.first, wifi.second, isSwitch = true,
+                    transport = NsdFinder.Transport.WIFI)
+            } else {
+                // 地址失效或网络切换：mDNS 同时覆盖 Wi-Fi 与 USB 网络共享。
+                disconnectSession()
+                showConnectView()
+                startAutoDiscovery()
             }
-        }, 1200)
+        }, 400)
     }
 
     // MARK: 扫码
@@ -546,7 +648,36 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     // MARK: 局域网发现
 
     private val nsdFinder by lazy { NsdFinder(this) }
+    private val routeFinder by lazy { NsdFinder(this) }
     private var discoveryDialog: android.app.AlertDialog? = null
+
+    /** 已连接 Wi-Fi 时只寻找同一配对码的 USB UDP 端点；不会碰当前会话，
+     *  直到候选明确解析为 TRANSPORT_USB 才切换。 */
+    private fun probeForUsbUpgrade() {
+        if (routeProbeActive || activeTransport == NsdFinder.Transport.USB || !linkUp) return
+        routeProbeActive = true
+        val expectedCode = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
+        routeFinder.setCallbacks(
+            onStart = { },
+            onHost = { e ->
+                val sameHost = expectedCode == 0 || e.code == expectedCode
+                if (routeProbeActive && sameHost && e.transport == NsdFinder.Transport.USB) {
+                    routeProbeActive = false
+                    routeFinder.stopDiscovery()
+                    Log.i(TAG, "USB UDP endpoint discovered: ${e.host}:${e.port}; upgrading")
+                    connectEntry(e, isSwitch = true)
+                }
+            },
+            onStop = { }
+        )
+        routeFinder.startDiscovery()
+        mainHandler.postDelayed({
+            if (routeProbeActive) {
+                routeProbeActive = false
+                routeFinder.stopDiscovery()
+            }
+        }, 2500)
+    }
 
     private fun showDiscoveryDialog() {
         nsdFinder.setCallbacks(
@@ -568,7 +699,11 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     private fun startAutoDiscovery() {
         autoDiscoveryArmed = true
-        statusText.text = "正在搜索局域网内的 Mac…（Mac 端 ◧ 未启动时会一直等，启动后自动连）"
+        statusText.text = if (hasUsbUdpNetwork()) {
+            "USB 网卡已就绪，正在优先搜索 Mac…"
+        } else {
+            "未检测到 USB 网卡，正在通过 Wi-Fi 搜索 Mac…（MTP 仅传文件）"
+        }
         nsdFinder.setCallbacks(
             onStart = { },
             onHost = {
@@ -588,12 +723,22 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     private fun settleAutoDiscovery() {
         if (!autoDiscoveryArmed) return
-        when (nsdFinder.currentHosts().size) {
+        val endpoints = nsdFinder.currentHosts()
+        // 同一台 Mac 可从 USB 与 Wi-Fi 各解析出一个地址；按配对码合并为一台主机，
+        // 并在组内选 USB。不能因此误判成“多主机”要求用户点选。
+        val hosts = endpoints.groupBy { if (it.code != 0) "code:${it.code}" else "name:${it.name}" }
+        when (hosts.size) {
             0 -> mainHandler.postDelayed(autoDiscoveryTick, 1200) // host 未上线：继续等
             1 -> {
                 autoDiscoveryArmed = false
                 nsdFinder.stopDiscovery()
-                val e = nsdFinder.currentHosts()[0]
+                val e = hosts.values.first().minByOrNull {
+                    when (it.transport) {
+                        NsdFinder.Transport.USB -> 0
+                        NsdFinder.Transport.WIFI -> 1
+                        NsdFinder.Transport.OTHER -> 2
+                    }
+                } ?: return
                 statusText.text = "发现 ${e.name}（${e.host}），自动连接…"
                 connectEntry(e)
             }
@@ -610,7 +755,14 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val items = if (hosts.isEmpty()) {
             arrayOf("搜索中…（确认 Mac 正在运行且同一 WiFi）")
         } else {
-            hosts.map { "${it.name}\n${it.host}:${it.port}" }.toTypedArray()
+            hosts.map {
+                val tr = when (it.transport) {
+                    NsdFinder.Transport.USB -> "USB"
+                    NsdFinder.Transport.WIFI -> "Wi-Fi"
+                    NsdFinder.Transport.OTHER -> "UDP"
+                }
+                "${it.name} · $tr\n${it.host}:${it.port}"
+            }.toTypedArray()
         }
         discoveryDialog = android.app.AlertDialog.Builder(this)
             .setTitle("局域网设备")
@@ -651,9 +803,18 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             }
         }
 
-        override fun onWelcome(displayId: Int, codec: Int, width: Int, height: Int, fps: Int) {
+        override fun onCursorImage(width: Int, height: Int, hotX: Int, hotY: Int, pixels: ByteArray) {
+            val lc = localCursor ?: return
+            mainHandler.post { lc.setSystemCursor(width, height, hotX, hotY, pixels) }
+        }
+
+        override fun onWelcome(displayId: Int, codec: Int, width: Int, height: Int, fps: Int, controlEnabled: Boolean) {
             mainHandler.post {
+                // Host 即使收到旧版本协商结果，也始终保持纯显示模式。
+                remoteControlEnabled = false
+                session?.setRemoteControlEnabled(false)
                 val p = pipelineOf(displayId)
+                p.fps = fps.coerceIn(1, 144)
                 p.codec = codec
                 p.width = width
                 p.height = height
@@ -695,6 +856,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         override fun onDisplays(list: List<HostSession.DisplayInfo>) {
             mainHandler.post {
                 displays = list
+                waitingForDisplay = list.isEmpty()
                 // 对账：host 重启/屏回收后 display id 会整体换代。已订阅的 id 若全部
                 // 不在新列表里（UI 已有视图时选屏器不会重跑），解码器将绑死死 id、
                 // 丢弃全部视频分片且关键帧请求被 host 静默忽略——永久 idle-wait 冻屏。
@@ -703,7 +865,6 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 if (validSubs.size != subscribedIds.size && list.isNotEmpty()) {
                     if (validSubs.isEmpty()) {
                         subscribedIds = listOf(list.first().id)
-                        recycledSingle = false
                         resetPipelines()
                         rebuildRegionViews()
                         session?.selectDisplay(subscribedIds.first())
@@ -713,50 +874,42 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                         session?.sendSubscribeDisplays(validSubs)
                     }
                 }
-                pendingRegions?.let { tryFulfillPendingLayout() }
-                // 连接初期（单屏默认）：DISPLAYS 首次到达时视图还没建——
-                // 默认订阅第一块屏并立即建渲染区，否则永远灰屏
-                if (recycledSingle && list.isNotEmpty()) {
-                    recycledSingle = false
-                    val first = list.first().id
-                    subscribedIds = listOf(first)
+                // Host 只按 HELLO 中持久化的设备档案创建/恢复屏幕；Android 在这里仅订阅。
+                // 不再因为 DISPLAYS 的一次刷新反向发 CREATE/DESTROY，避免拓扑 churn。
+                // 多屏创建是安全串行的：第一块会先出现、第二块稍后才加入列表。因此
+                // 列表从 1→2 时必须增量订阅并重建画中画视图，不能只在首次空视图时选屏。
+                if (list.isNotEmpty()) {
+                    val deviceId = HostSession.loadOrCreateDeviceId(this@MainActivity)
+                    val prefix = "Hyperdisplay 设备 ${deviceId % 10000}"
+                    val wanted = requestedDisplaySpecs().size
+                    val owned = list.filter { it.name.startsWith(prefix) }.take(wanted)
+                    val selected = if (owned.size == wanted) owned else list.take(wanted)
+                    val desiredIds = selected.map { it.id }
+                    if (regionViews.isEmpty()) {
+                    subscribedIds = selected.map { it.id }
                     resetPipelines()
                     rebuildRegionViews()
-                    session?.selectDisplay(first)
-                    session?.requestKeyframe(first)
-                } else if (regionViews.isEmpty() && pendingRegions == null && list.isNotEmpty()) {
-                    if (layoutConfig.kind != LayoutKind.SINGLE) {
-                        // 重连/换通道后恢复之前的布局（画中画/分屏）
-                        applyLayout(layoutConfig)
-                    } else {
-                        val m = Resources.getSystem().displayMetrics
-                        val dw = maxOf(m.widthPixels, m.heightPixels)
-                        val dh = minOf(m.widthPixels, m.heightPixels)
-                        val prefs = getSharedPreferences("hyperdisplay", MODE_PRIVATE)
-                        val myDisplay = prefs.getInt("myDisplayId", -1)
-                        // 优先级：我的屏（持久化，跨重启/重连一致）> 与设备宽高比最接近的屏
-                        // > first()。注意必须取「最接近」而非「第一个低于阈值」——否则
-                        // 1920x1200 初始屏(Δ0.078)会抢在 1920x1264 设备档案屏(Δ0.003)前被选中
-                        val devAspect = dw.toFloat() / dh.toFloat()
-                        val pick = list.firstOrNull { it.id == myDisplay }
-                            ?: list.minByOrNull { kotlin.math.abs(it.width.toFloat() / it.height - devAspect) }
-                            ?: list.first()
-                        val wantNative = pick.width.toFloat() / pick.height.let { it.toFloat() } !=
-                                dw.toFloat() / dh.toFloat() &&
-                                kotlin.math.abs(pick.width.toFloat() / pick.height - dw.toFloat() / dh) >= 0.08f
-                        if (!wantNative || list.any { it.id == myDisplay }) {
-                            subscribedIds = listOf(pick.id)
-                            prefs.edit().putInt("myDisplayId", pick.id).apply()
-                            rebuildRegionViews()
-                            // host 已按设备档案代订阅（setSubscriptions）；仅当本地选择与
-                            // host 视图不一致时才发 SELECT（避免覆盖回默认屏）
-                            if (pick.id != myDisplay) {
-                                session?.selectDisplay(pick.id)
-                            }
+                    if (subscribedIds.size == 1) {
+                        session?.selectDisplay(subscribedIds.first())
+                    } else if (subscribedIds.isNotEmpty()) {
+                        session?.sendSubscribeDisplays(subscribedIds)
+                    }
+                    subscribedIds.forEach { session?.requestKeyframe(it) }
+                    } else if (desiredIds.isNotEmpty() && desiredIds != subscribedIds) {
+                        val oldIds = subscribedIds
+                        subscribedIds = desiredIds
+                        // 画中画只在后到的第二块屏上增量建小窗，主画面和它的解码器
+                        // 不重建，避免把已经稳定的第一画面再次闪黑/闪绿。
+                        if (layoutConfig.kind == LayoutKind.PIP && oldIds.size == 1 &&
+                            desiredIds.size == 2 && oldIds[0] == desiredIds[0]) {
+                            session?.sendSubscribeDisplays(desiredIds)
+                            val (sw, sh) = screenDims()
+                            buildPipWindow(desiredIds[1], sw, sh)
+                            session?.requestKeyframe(desiredIds[1])
                         } else {
-                            // 没有匹配设备比例的屏：按设备原生尺寸建（像素 1:1），建好即订阅
-                            pendingRegions = listOf(dw to dh)
-                            tryFulfillPendingLayout()
+                            rebuildRegionViews()
+                            session?.sendSubscribeDisplays(desiredIds)
+                            desiredIds.forEach { session?.requestKeyframe(it) }
                         }
                     }
                 }
@@ -766,10 +919,6 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
         override fun onLinkEvent(connected: Boolean) {
             linkUp = connected
-            if (!connected && transport == Transport.USB && session != null) {
-                // USB 断开（拔线/桥接重启）：自动降级 WiFi 或升回恢复的 USB
-                mainHandler.post { scheduleSmartReconnect() }
-            }
             if (!connected) {
                 mainHandler.post {
                     synchronized(pipelineLock) {
@@ -794,9 +943,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             p.assembler = FrameAssembler(object : FrameAssembler.Callback {
                 override fun onFrame(frameId: Int, keyframe: Boolean, data: ByteArray) {
                     if (keyframe) p.lastKeyframeDeliveredAt = System.currentTimeMillis()
-                    val csd = p.csd
-                    val payload: ByteArray = if (keyframe && csd != null) csd + data else data
-                    p.decoder?.submit(VideoDecoder.Frame(keyframe, payload))
+                    // CONFIG 已作为 MediaFormat 的 csd-0 配置解码器；把同一份 VPS/SPS/PPS
+                    // 再拼到 IDR 前会让部分华为 HEVC 解码器偶发进入“有输出但全绿”的坏
+                    // 状态。若 CONFIG 与 IDR 乱序，FrameAssembler 会请求下一帧关键帧。
+                    p.decoder?.submit(VideoDecoder.Frame(keyframe, data))
                 }
                 override fun onKeyframeNeeded(reason: String) {
                     session?.requestKeyframe(p.id)
@@ -820,7 +970,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 // 按 host 实际使用的编码选解码器——硬编 HEVC 会话耗尽回退 H.264 时，
                 // 若仍开 HEVC 解码器会输出全零（绿屏）
                 val mime = if (p.codec == 2) "video/avc" else "video/hevc"
-                val d = VideoDecoder(mime, p.width, p.height, surface, csd)
+                val d = VideoDecoder(mime, p.width, p.height, p.fps, surface, csd)
                 d.start()
                 p.decoder = d
                 Log.i(TAG, "decoder started: display=${p.id} ${p.width}x${p.height}")
@@ -888,21 +1038,22 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         statsOverlay = overlay
 
         val cfgBtn = Button(this).apply {
-            text = "⚙ 屏幕配置"
+            text = "⚙ 配置"
             textSize = 12f
             setTextColor(Color.WHITE)
-            setBackgroundColor(0x66000000)
+            setBackgroundColor(0x99000000.toInt())
             setPadding(16, 8, 16, 8)
+            isAllCaps = false
+            contentDescription = "屏幕配置：分辨率、双屏、画中画"
             setOnClickListener { showConfigPanel() }
         }
         root.addView(cfgBtn, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END))
         configButton = cfgBtn
 
-        // 状态条/配置默认隐藏（用户反馈挡视野）：顶部中央近隐形小把手点按呼出，
-        // 6s 无操作自动隐藏。把手 12dp 高、25% 透明，不占 Mac 菜单栏实际点击区
+        // 统计条默认隐藏；右上角配置常驻。顶部中央小把手只负责临时显示统计信息。
         overlay.visibility = android.view.View.GONE
-        cfgBtn.visibility = android.view.View.GONE
+        cfgBtn.visibility = android.view.View.VISIBLE
         val handle = TextView(this).apply {
             text = "⌄"
             textSize = 14f
@@ -958,7 +1109,6 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     }
 
     private var greenRecoveries = 0
-    private var recycledSingle = false
 
     /** 绿屏自动恢复（最多两次）：ENCODER_RESET 让 host 只重建编码器会话。
      *  只 bounce 解码器救不了——坏流来自 host 侧编码会话污染；也不能用 RECYCLE
@@ -1114,8 +1264,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         fun makeView(id: Int): StreamView {
             val view = StreamView(this)
             view.displayId = id
-            // 半透明表面 + 黑色垫底：首帧到达前显示黑（加载态）而非显存残色（绿）
-            view.holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
+            // 使用不透明解码 surface，首帧到达前由黑色垫底显示加载态；透明 surface
+            // 在部分华为驱动上会把尚未初始化的解码缓冲合成为绿色。
+            view.holder.setFormat(android.graphics.PixelFormat.OPAQUE)
             view.onSurfaceReady = { did, surface ->
                 val pl = pipelineOf(did)
                 pl.surface = surface
@@ -1214,7 +1365,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
         val view = StreamView(this)
         view.displayId = displayId
-        view.holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
+        view.holder.setFormat(android.graphics.PixelFormat.OPAQUE)
         view.setZOrderMediaOverlay(true)
         view.onSurfaceReady = { did, surface ->
             val pl = pipelineOf(did)
@@ -1409,6 +1560,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 p.leftMargin = pipLeft; p.topMargin = pipTop
                 root.layoutParams = p
             }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> saveLayoutConfig(layoutConfig)
         }
     }
 
@@ -1438,41 +1590,26 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
         panel.addView(radio)
 
-        // 显示大小档位（2026-08-21）：切换 = host 记住档位并自重启（本 macOS 构建
-        // SCK 不支持任何在流改尺寸路径，实测三条全灭），平板自动重连后按新档建屏
+        // 显示大小写入平板设备档案；下一次 HELLO 由 Host 受控恢复整组屏幕。
         panel.addView(TextView(this).apply {
-            text = "显示大小（切换会短暂断流约 3 秒）"
+            val current = if (layoutConfig.displayLongEdge == 0) "原生" else "${layoutConfig.displayLongEdge}p"
+            text = "显示大小（当前：$current；切换会短暂断流约 3 秒）"
             textSize = 13f
             setPadding(0, 20, 0, 4)
         })
         val tiers = listOf("特大" to 1440, "大" to 1600, "标准" to 1920, "锐利" to 2240)
         val tierRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val m = Resources.getSystem().displayMetrics
-        val natW = maxOf(m.widthPixels, m.heightPixels)
-        val natH = minOf(m.widthPixels, m.heightPixels)
         tiers.forEach { (label, longEdge) ->
             tierRow.addView(android.widget.Button(this).apply {
                 text = label
                 textSize = 13f
                 setOnClickListener {
-                    val s = session ?: return@setOnClickListener
-                    val did = subscribedIds.firstOrNull() ?: pipelines.keys.firstOrNull() ?: return@setOnClickListener
-                    val scale = longEdge.toFloat() / natW
-                    val tw = ((natW * scale).toInt() + 15) and 15.inv()
-                    val th = ((natH * scale).toInt() + 15) and 15.inv()
+                    // 无需重启 Host，更不能为档位变化全量销毁所有虚拟屏。
+                    layoutConfig = layoutConfig.copy(displayLongEdge = longEdge)
+                    saveLayoutConfig(layoutConfig)
                     statusText.text = ""
-                    Log.i(TAG, "tier switch -> $label ${tw}x$th (host will re-exec)")
-                    s.sendSetTier(did, tw, th)
-                    scheduleSwitchingBanner()
-                    // 主动断开不等网络 EOF：adb 隧道对端关闭的传播可滞后数秒，
-                    // 等它 = 僵尸会话冻屏（实测 fps=0 假 link=up）。发包后 400ms
-                    // 主动拆会话（并复位 linkUp，否则快速重连循环会被假状态骗退）
-                    mainHandler.postDelayed({
-                        Log.i(TAG, "tier switch: proactively dropping session")
-                        linkUp = false
-                        disconnectSession()
-                    }, 400)
-                    scheduleFastReconnectAfterTierSwitch()
+                    Log.i(TAG, "tier switch -> $label; reconnecting from saved profile")
+                    if (session != null) reconnectForDisplayTopologyChange()
                 }
             }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
@@ -1550,11 +1687,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             .setView(panel)
             .setPositiveButton("应用") { d, _ ->
                 d.dismiss()
-                applyLayout(LayoutConfig(selected, frac, sideLeft, pipRatio))
-            }
-            .setNeutralButton("新建（适配本机）") { _, _ ->
-                val (sw2, sh2) = screenDims()
-                session?.createDisplay(sw2, sh2, "平板 ${'$'}{sw2}×${'$'}{sh2}")
+                applyLayout(layoutConfig.copy(kind = selected, fraction = frac, sideLeft = sideLeft, pipRatio = pipRatio))
             }
             .setNegativeButton("取消", null)
             .show()
@@ -1563,85 +1696,23 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     // MARK: 布局应用引擎
 
     private fun applyLayout(cfg: LayoutConfig) {
-        val s = session ?: return
+        val changed = layoutConfig != cfg
         layoutConfig = cfg
+        saveLayoutConfig(cfg)
         greenRecoveries = 0
-        if (cfg.kind == LayoutKind.SINGLE) {
-            pendingRegions = null
-            val first = displays.firstOrNull()?.id
-            if (first != null) {
-                subscribedIds = listOf(first)
-                resetPipelines()
-                rebuildRegionViews()
-                s.selectDisplay(first)
-                // 回收布局模式创建的多余屏，避免越积越多
-                for (id in createdIds.toList()) {
-                    if (id != first) {
-                        s.destroyDisplay(id)
-                        createdIds.remove(id)
-                    }
-                }
-            }
-            updateConfigButton(); updateOverlay()
-            return
-        }
-        pendingRegions = regionSizes(cfg)
-        // 快路径：不回收，直接补建（RECYCLE 全量回收要 2-3 秒，只在绿屏时才走——见 recoverFromGreen）
-        tryFulfillPendingLayout()
         updateConfigButton(); updateOverlay()
+        // 用户明确改变布局/分辨率时才做一次受控的整组替换。普通断线和 DISPLAYS
+        // 刷新永远不会触发建销；Host 使用稳定 EDID slot 复用未变的显示器身份。
+        if (changed && session != null) reconnectForDisplayTopologyChange()
     }
 
-    /** DISPLAYS 更新后：按尺寸（含重复）分配屏，凑齐即订阅；回收未用到的自建屏 */
-    private fun tryFulfillPendingLayout() {
-        val regions = pendingRegions ?: return
-        val s = session ?: return
-        // 先按缺口补建（RECYCLE 后通常全缺；幂等，凑齐前每轮 DISPLAYS 重复检查）。
-        // 尺寸匹配必须「host 档位感知」：host 对长边 >1920 的请求会自动降到 1920 档
-        // （2026-08-21 舒适档定稿；HiDPI 2x 不可达），按原始请求找屏 = 永远差一块 →
-        // 无限 CREATE 循环（churn 风暴）+ 渲染视图永远建不起来（2026-08-20 根因）。
-        // 对齐口径：期待尺寸 = 与 host createDisplay 相同的 16 对齐 + 1920 降档。
-        fun tierAligned(w: Int, h: Int): Pair<Int, Int> {
-            var aw = maxOf(640, (w + 15) and 15.inv())
-            var ah = maxOf(480, (h + 15) and 15.inv())
-            val long = maxOf(aw, ah)
-            if (long > 1920) {
-                val scale = 1920.0 / long
-                aw = maxOf(640, ((aw * scale).toInt() + 15) and 15.inv())
-                ah = maxOf(480, ((ah * scale).toInt() + 15) and 15.inv())
-            }
-            return aw to ah
-        }
-        val wanted = regions.map { (w, h) -> tierAligned(w, h) }
-        for (size in wanted.toSet()) {
-            val need = wanted.count { it == size }
-            val have = displays.count { (it.width to it.height) == size }
-            repeat((need - have).coerceAtLeast(0)) {
-                s.createDisplay(size.first, size.second, "布局 ${size.first}x${size.second}")
-            }
-        }
-        val matched = mutableListOf<Int>()
-        val usedIds = mutableSetOf<Int>()
-        for (region in wanted) {
-            val found = displays.filter { (it.width to it.height) == region && it.id !in usedIds }
-                .minByOrNull { it.id }
-            if (found != null) { matched.add(found.id); usedIds.add(found.id) }
-        }
-        if (matched.size < regions.size) return
-
-        pendingRegions = null
-        for (d in displays) {
-            if (d.id in createdIds && d.id !in usedIds) {
-                s.destroyDisplay(d.id)
-                createdIds.remove(d.id)
-            }
-        }
-        for (id in matched) if (id !in createdIds) createdIds.add(id)
-        subscribedIds = matched
-        resetPipelines()
-        rebuildRegionViews()
-        s.sendSubscribeDisplays(matched)
-        Log.i(TAG, "layout ${'$'}{layoutConfig.kind} applied: screens=${'$'}{matched.joinToString()}")
-        updateConfigButton()
+    private fun reconnectForDisplayTopologyChange() {
+        Log.i(TAG, "display profile changed: controlled reconnect")
+        linkUp = false
+        disconnectSession()
+        mainHandler.postDelayed({
+            if (!isFinishing && !isDestroyed) smartConnect()
+        }, 600)
     }
 
     /** 切换布局/屏集后清空全部解码管线，等各屏 WELCOME/CONFIG 重建 */
@@ -1659,7 +1730,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     private fun updateConfigButton() {
         val button = configButton ?: return
-        button.text = layoutConfig.kind.label +
+        button.text = "⚙ " + layoutConfig.kind.label +
             (if (subscribedIds.size > 1) "·" + subscribedIds.size + "屏" else "")
     }
 
@@ -1670,6 +1741,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var wheelLastY = 0f
 
     private fun handleTouch(displayId: Int, view: StreamView, event: MotionEvent) {
+        // 纯显示产品不向 Mac 注入触摸、鼠标或滚轮事件。
+        if (!remoteControlEnabled) return
         val s = session ?: return
         // 本地光标：手指位置零延迟反馈（远程画面不再含系统光标）。
         // 记录回显位置/时刻供 onCursor 仲裁（防 host 滞后推送拽回，见 onCursor）
@@ -1749,30 +1822,6 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     // MARK: 状态
 
-    /** 档位切换后的快速重连：host 自重载约 2.3s 回来，这里从 2.5s 起每 0.7s 探一次
-     *  隧道、直连 USB（不走 smartReconnect 的 1.2s 延迟 + WiFi 绕路 + 重试退避——
-     *  那套为意外断链设计，在已知断流场景下拖出 10s+，实测档位切换 13s 的主因）。
-     *  探测成功即 openSession；正常恢复后 statsTick 的横幅/等待逻辑接管。 */
-    private fun scheduleFastReconnectAfterTierSwitch() {
-        var attempts = 0
-        val probe = object : Runnable {
-            override fun run() {
-                attempts++
-                if (linkUp || attempts > 14) return // 已恢复或超时（~12s）→ 交给常规重连
-                probeUsb { ok ->
-                    if (ok && !linkUp) {
-                        Log.i(TAG, "fast reconnect after tier switch (attempt $attempts)")
-                        openSession("127.0.0.1", 5280, isSwitch = true)
-                        transport = Transport.USB
-                    } else if (!linkUp) {
-                        mainHandler.postDelayed(this, 700)
-                    }
-                }
-            }
-        }
-        mainHandler.postDelayed(probe, 2500)
-    }
-
     private fun updateOverlay() {
         val overlay = statsOverlay ?: return
         val link = if (linkUp) "链路 OK" else "等待主机…"
@@ -1782,7 +1831,11 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val p = pipelines.values.firstOrNull()
             if (p != null && p.width > 0) "${p.width}x${p.height}" else "?"
         }
-        val tr = if (transport == Transport.USB) "USB" else "WiFi"
+        val tr = when (activeTransport) {
+            NsdFinder.Transport.USB -> "USB·UDP"
+            NsdFinder.Transport.WIFI -> "Wi-Fi·UDP"
+            NsdFinder.Transport.OTHER -> "UDP"
+        }
         // 窗口模式提示（系统分屏等）：app 窗口明显小于物理屏时，流被缩小渲染、
         // 有效清晰度打折——明确告知而非默默降质（分辨率不跟随窗口变：切换成本 5s，
         // 拖动分屏线会灾难化；SurfaceView 自适应缩放 + 解码器重绑已自动处理布局）
@@ -1791,7 +1844,25 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val windowed = rw > 0 && rh > 0 &&
             (rw < dm.widthPixels * 85 / 100 || rh < dm.heightPixels * 85 / 100)
         val winMark = if (windowed) " · 窗口模式(画质降低)" else ""
-        overlay.text = "$renderFps fps · $screens · $tr · $link$winMark · 长按修复画面"
+        val controlMark = " · 纯显示"
+        val resourceMark = String.format(java.util.Locale.US, " · CPU %.1f%% · 内存 %dMB", appCpuPercent, appMemoryMB)
+        overlay.text = "$renderFps fps · $screens · $tr · $link$controlMark$resourceMark$winMark · 长按修复画面"
+    }
+
+    /** 当前 app 的资源采样；5 秒一次，连接存活时才运行，避免监控本身成为常驻负担。 */
+    private fun sampleAppResources(now: Long) {
+        if (now - lastResourceSampleAt < 5_000) return
+        val cpuMs = android.os.Process.getElapsedCpuTime()
+        if (lastResourceSampleAt > 0) {
+            appCpuPercent = ((cpuMs - lastProcessCpuMs).toDouble() * 100.0 /
+                (now - lastResourceSampleAt).toDouble()).coerceAtLeast(0.0)
+        }
+        val manager = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+        val memoryKb = manager.getProcessMemoryInfo(intArrayOf(android.os.Process.myPid()))
+            .firstOrNull()?.totalPss ?: 0
+        appMemoryMB = (memoryKb + 1023) / 1024
+        lastProcessCpuMs = cpuMs
+        lastResourceSampleAt = now
     }
 
     /** 状态落盘：锁屏/无屏环境下的可观测通道（adb pull 验证用） */
@@ -1805,11 +1876,16 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val pips = synchronized(pipelineLock) {
                 pipelines.values.joinToString(";") { "${it.id}:${it.width}x${it.height}" }
             }
-            val text = "link=$link transport=$transport layout=${layoutConfig.kind} subs=${subscribedIds.joinToString()} pipelines=$pips\n"
+            val transport = when (activeTransport) {
+                NsdFinder.Transport.USB -> "usb-udp"
+                NsdFinder.Transport.WIFI -> "wifi-udp"
+                NsdFinder.Transport.OTHER -> "udp"
+            }
+            val text = "link=$link transport=$transport fps=$renderFps cpu=${String.format(java.util.Locale.US, "%.1f", appCpuPercent)} memory_mb=$appMemoryMB layout=${layoutConfig.kind} subs=${subscribedIds.joinToString()} pipelines=$pips\n"
             val f = java.io.File(dir, "status.txt")
             if (text == lastStatusText && f.exists()) return // 闪存友好：内容没变且文件在，不写盘
             lastStatusText = text
-            val real = "link=$link fps=$renderFps transport=$transport layout=${layoutConfig.kind} subs=${subscribedIds.joinToString()} pipelines=${
+            val real = "link=$link fps=$renderFps cpu=${String.format(java.util.Locale.US, "%.1f", appCpuPercent)} memory_mb=$appMemoryMB transport=$transport layout=${layoutConfig.kind} subs=${subscribedIds.joinToString()} pipelines=${
                 synchronized(pipelineLock) { pipelines.values.joinToString(";") { "${it.id}:${it.width}x${it.height}:${it.renderedNow}" } }
             }\n"
             java.io.File(dir, "status.txt").writeText(real)
@@ -1818,7 +1894,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     // MARK: 生命周期收尾
 
-    private fun disconnectSession() {
+    private fun disconnectSession(removeDisplay: Boolean = false) {
         waitingSince = 0
         if (waitingOverlay.parent != null) waitingOverlay.dismiss()
         stopService(android.content.Intent(this, SessionService::class.java))
@@ -1827,9 +1903,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             for (p in pipelines.values) p.decoder?.release()
             pipelines.clear()
         }
-        session?.close()
+        session?.close(sendBye = removeDisplay)
         session = null
         linkUp = false
+        waitingForDisplay = false
         renderFps = 0
         statsOverlay = null
         configButton = null
@@ -1837,8 +1914,6 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         pipRoot = null
         displays = emptyList()
         subscribedIds = emptyList()
-        createdIds.clear()
-        pendingRegions = null
         regionViews.clear()
         sessionRoot = null
         touchMode = 0
@@ -1855,42 +1930,34 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     /** 后台自动断开：切走/锁屏超过 10s 还没回来 → 断开会话（发 BYE，host 回收副屏、
      *  窗口弹回 Mac 主屏可见）。10s 内回来不中断（保留「短暂切换不断流」的体验） */
-    private var bgDisconnectRunnable: Runnable? = null
+    // 后台即等同拔掉平板：onStop 立即发 BYE，Host 回收该设备的全部副屏。
     private var autoDisconnectedByBg = false
 
     override fun onPause() {
         super.onPause()
         UsbPlugReceiver.onPlugged = null // 防泄漏；后台拉起走通知路径
-        // 副屏应用：切走/锁屏不「立刻」断流（此前 onPause 直接断连，回来像「断开了」）；
-        // 但长时间离开（>10s，如切去打游戏）必须断：否则副屏窗口悬在无人可见的
-        // 虚拟屏上，Mac 主屏也看不到——「断开即恢复」由 BYE + host 回收完成
-        if (session != null && !isFinishing) {
-            val r = Runnable {
-                if (session != null && !isFinishing) {
-                    autoDisconnectedByBg = true
-                    Log.i(TAG, "background >10s — auto disconnect (bye)")
-                    disconnectSession()
-                }
-            }
-            bgDisconnectRunnable = r
-            mainHandler.postDelayed(r, 10_000)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // onStop 才表示用户真正离开/锁屏，避免权限弹窗等短暂 onPause 误拔屏。
+        if (session != null && !isChangingConfigurations) {
+            autoDisconnectedByBg = true
+            Log.i(TAG, "background — disconnect immediately (bye, remove virtual displays)")
+            disconnectSession(removeDisplay = true)
         }
     }
 
     override fun onResume() {
         super.onResume()
-        bgDisconnectRunnable?.let { mainHandler.removeCallbacks(it) }
-        bgDisconnectRunnable = null
-        // 插线即探测（秒级升级）：轮询兜底要等最多 30s，事件触发只在会话存活时探测
+        // 插线只触发重新探测；MTP 不会被误当成网络。系统有 USB/RNDIS 网卡才升级，
+        // 否则保留 Wi-Fi UDP，不会把实时流量降级到 TCP。
         UsbPlugReceiver.onPlugged = {
             mainHandler.post {
-                if (session != null && transport == Transport.WIFI && linkUp && !reconnecting) {
-                    probeUsb { usbOk ->
-                        if (usbOk && session != null && transport == Transport.WIFI) {
-                            openSession("127.0.0.1", 5280, isSwitch = true)
-                            transport = Transport.USB
-                        }
-                    }
+                if (session == null) {
+                    startAutoDiscovery()
+                } else {
+                    probeForUsbUpgrade()
                 }
             }
         }

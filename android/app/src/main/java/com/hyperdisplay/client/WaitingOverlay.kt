@@ -21,6 +21,19 @@ import android.widget.TextView
  */
 class WaitingOverlay(context: Context) : FrameLayout(context) {
 
+    /**
+     * 「UDP 尚未连通」和「已连通、但 Host 暂时没有可用副屏」不能共用黑屏。
+     * 后者常见于 Host 正在恢复显示器服务；它不是 Wi-Fi 断开，仍应原地等待，
+     * 而不是反复销毁会话重新发现。
+     */
+    enum class State { CONNECTING, CONNECTED_NO_DISPLAY }
+
+    var state = State.CONNECTING
+        set(value) {
+            field = value
+            refreshText()
+        }
+
     private val main = Handler(Looper.getMainLooper())
     private var started = false
     private var tick = 0L
@@ -28,14 +41,21 @@ class WaitingOverlay(context: Context) : FrameLayout(context) {
         override fun run() {
             tick++
             icons.invalidate()
-            statusView.text = when {
+            refreshText()
+            main.postDelayed(this, 400)
+        }
+    }
+
+    private fun refreshText() {
+        titleView.text = if (state == State.CONNECTED_NO_DISPLAY) "Mac 已连接" else "等待 Mac 主机"
+        statusView.text = when {
+                state == State.CONNECTED_NO_DISPLAY ->
+                    "Mac 当前还没有可用副屏。\n等待 Host 恢复后会自动出画面，无需重新打开 App。"
                 tryingUsb && tryingWifi -> "正在尝试 USB 与 WiFi 连接…"
                 tryingUsb -> "正在等待 USB 连接…\n（确认数据线已插好、Mac 侧 host 在运行）"
                 tryingWifi -> "正在搜索局域网内的 Mac…\n（确认与 Mac 在同一 WiFi，Mac 侧 host 在运行）"
                 else -> "等待连接…"
             }
-            main.postDelayed(this, 400)
-        }
     }
 
     var tryingUsb = false
@@ -95,19 +115,20 @@ class WaitingOverlay(context: Context) : FrameLayout(context) {
         setLineSpacing(6f, 1f)
     }
 
+    private val titleView = TextView(context).apply {
+        textSize = 22f
+        setTextColor(Color.WHITE)
+        gravity = Gravity.CENTER
+        setPadding(0, 0, 0, 40)
+    }
+
     init {
         setBackgroundColor(0xEE101418.toInt())
         val box = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
         }
-        box.addView(TextView(context).apply {
-            text = "等待 Mac 主机"
-            textSize = 22f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 40)
-        })
+        box.addView(titleView)
         box.addView(icons, LinearLayout.LayoutParams(340, 260))
         box.addView(statusView, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {

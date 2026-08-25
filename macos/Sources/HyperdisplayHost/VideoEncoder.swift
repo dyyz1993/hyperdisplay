@@ -84,11 +84,16 @@ final class VideoEncoder {
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
             kVTCompressionPropertyKey_AverageBitRate: Int(bitrate),
-            // 突发上限 2×（原 6× 会让大关键帧冲到 ~800KB/728 分片，WiFi 丢 1 片即整帧报废）
-            kVTCompressionPropertyKey_DataRateLimits: [Int(bitrate) * 2, 1] as [NSNumber],
+            // DataRateLimits 的单位是字节/秒。实时 UDP 不能靠一个远超平均码率的
+            // 巨型 IDR 来“补画质”：那样一旦缺片便会整屏冻结。限制为实际码率上限，
+            // 让任意关键帧保持在 Wi-Fi 可一次交付的规模。
+            kVTCompressionPropertyKey_DataRateLimits: [max(500_000, Int(bitrate) / 8), 1] as [NSNumber],
             kVTCompressionPropertyKey_ExpectedFrameRate: fps,
-            kVTCompressionPropertyKey_MaxKeyFrameInterval: fps * 10,
-            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 10,
+            // 华为 HEVC 对断引用 P 帧不会安全续播；即使反馈包丢失，也必须快速
+            // 回到一张独立可解码的画面。0.5 秒把“最新帧策略”的最坏冻结上界从
+            // 2 秒收紧到半秒，运动时以细节换连贯性，静止锐化仍会补高质量 IDR。
+            kVTCompressionPropertyKey_MaxKeyFrameInterval: max(1, fps / 2),
+            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 0.5,
             kVTCompressionPropertyKey_ProfileLevel:
                 (codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_Main_AutoLevel),
         ]

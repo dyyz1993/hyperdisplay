@@ -1,6 +1,6 @@
 #!/bin/bash
-# 组装 Hyperdisplay.app：release 二进制 + Info.plist + ad-hoc 签名。
-# TCC 权限（屏幕录制/辅助功能）按 bundle id 记账，必须以 .app 方式运行。
+# 组装 Hyperdisplay.app：release 二进制 + Info.plist + Developer ID（可用时）签名。
+# 屏幕录制 TCC 权限按 bundle id 记账，必须以 .app 方式运行。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -36,8 +36,6 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleIconFile</key>
-    <string>Hyperdisplay.icns</string>
-    <key>CFBundleIconName</key>
     <string>Hyperdisplay</string>
     <key>CFBundleShortVersionString</key>
     <string>0.1.0</string>
@@ -55,7 +53,20 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign - "$APP" >/dev/null 2>&1
+SIGNING_IDENTITY="${HYPERDISPLAY_SIGNING_IDENTITY:-}"
+if [[ -z "$SIGNING_IDENTITY" ]]; then
+    SIGNING_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -n 1)"
+fi
+
+if [[ -n "$SIGNING_IDENTITY" ]]; then
+    codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$APP"
+    echo "Signed with Developer ID: $SIGNING_IDENTITY"
+else
+    # 没有 Developer ID 的开发机仍可本地调试；分发版不可使用此签名。
+    codesign --force --sign - "$APP"
+    echo "Signed ad-hoc (development only; set HYPERDISPLAY_SIGNING_IDENTITY for distribution)"
+fi
 
 echo "Built $APP"
-echo "Run: open $APP   （首次需在系统设置授权 屏幕录制 + 辅助功能）"
+echo "Run: open $APP   （首次授权屏幕录制）"

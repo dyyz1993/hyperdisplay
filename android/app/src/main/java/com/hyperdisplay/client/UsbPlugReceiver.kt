@@ -5,10 +5,9 @@ import android.content.Context
 import android.content.Intent
 
 /**
- * 传输切换触发器：插线（POWER_CONNECTED）立即触发 USB 探测回调——
- * WiFi 会话期间等 10s 轮询太慢（平均 5s、最坏 10s），插线事件把升级
- * 探测提速到秒级。轮询保留为兜底（接收器未注册/事件丢失时）。
- * 拔线（DISCONNECTED）不在这里处理：会话死亡走 onLinkEvent 降级路径。
+ * 插线入口：唤起客户端重新探测网络。只有系统真正提供 USB/RNDIS 网卡时才会
+ * 走 USB UDP；MTP/PTP/HiSuite 都只是文件或设备管理协议，不能承载实时画面。
+ * 没有 USB UDP 路径时自动继续使用 Wi-Fi，不会降级成 TCP。
  */
 class UsbPlugReceiver : BroadcastReceiver() {
     companion object {
@@ -18,7 +17,8 @@ class UsbPlugReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
             Intent.ACTION_POWER_CONNECTED -> {
-                // 前台已运行：只做升级探测回调（不弹通知）；未运行：通知拉起
+                // 前台已运行：直接重新发现；后台：尝试直接拉起，系统若拦截则由
+                // 全屏通知兜底。两条路径都会自动发现 UDP host，无需输入地址。
                 if (onPlugged != null) {
                     onPlugged?.invoke()
                 } else {
@@ -30,8 +30,13 @@ class UsbPlugReceiver : BroadcastReceiver() {
 
     private fun notifyUsbReady(context: Context) {
         val launch = Intent(context, MainActivity::class.java).apply {
-            putExtra("host", "smart")
+            putExtra("host", "discover")
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        }
+        try {
+            context.startActivity(launch)
+        } catch (_: Exception) {
+            // Android 可能禁止后台拉起 Activity；下面的 full-screen PendingIntent 兜底。
         }
         val pi = android.app.PendingIntent.getActivity(
             context, 0, launch,
@@ -43,8 +48,8 @@ class UsbPlugReceiver : BroadcastReceiver() {
         }
         val n = android.app.Notification.Builder(context, "usb_plug")
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle("Mac 已连线")
-            .setContentText("点按开始副屏")
+            .setContentTitle("检测到 USB 连接")
+            .setContentText("正在探测 USB 网卡；MTP 仅传文件，没有 USB 网卡时自动使用 Wi-Fi")
             .setContentIntent(pi)
             .setFullScreenIntent(pi, true)
             .setAutoCancel(true)

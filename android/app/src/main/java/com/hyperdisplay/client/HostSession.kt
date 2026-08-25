@@ -21,11 +21,16 @@ class HostSession private constructor(
     private val port: Int,
     private val listener: Listener,
     private val pairingCode: Int,
-    private val deviceId: Int
+    private val deviceId: Int,
+    /** 当前平板持久布局对应的目标副屏组；随 HELLO 发给 Host，用于零点击复建。 */
+    private val requestedDisplays: List<Pair<Int, Int>>,
+    private val network: android.net.Network?
 ) {
     interface Listener {
         fun onCursor(displayId: Int, x: Float, y: Float) // did=0=光标离开虚拟屏（隐藏）
-        fun onWelcome(displayId: Int, codec: Int, width: Int, height: Int, fps: Int)
+        /** Host 从系统读取到的真实 BGRA 光标；位置仍由 onCursor 的 60Hz 小包驱动。 */
+        fun onCursorImage(width: Int, height: Int, hotX: Int, hotY: Int, pixels: ByteArray)
+        fun onWelcome(displayId: Int, codec: Int, width: Int, height: Int, fps: Int, controlEnabled: Boolean)
         fun onConfig(displayId: Int, codec: Int, paramSets: ByteArray)
         fun onVideoFragment(displayId: Int, frameId: Int, fragIdx: Int, fragCount: Int, keyframe: Boolean, payload: ByteArray)
         fun onDisplays(displays: List<DisplayInfo>)
@@ -56,6 +61,7 @@ class HostSession private constructor(
         private const val TYPE_PONG = 0x06
         private const val TYPE_DISPLAYS = 0x07
         private const val TYPE_CURSOR = 0x08
+        private const val TYPE_CURSOR_IMAGE = 0x09
         private const val TYPE_HELLO = 0x10
         private const val TYPE_KEYFRAME_REQ = 0x11
         private const val TYPE_INPUT = 0x12
@@ -65,7 +71,7 @@ class HostSession private constructor(
         private const val TYPE_DESTROY_DISPLAY = 0x16
         private const val TYPE_NACK = 0x17
         private const val TYPE_SUBSCRIBE_DISPLAYS = 0x18
-        private const val TYPE_RECYCLE = 0x19
+        private const val TYPE_CURSOR_IMAGE_ACK = 0x19
         private const val TYPE_BYE = 0x1A
         private const val DISPLAY_ID_BROADCAST = 0xFFFF
         private const val PROTO_VERSION = 1
@@ -73,13 +79,24 @@ class HostSession private constructor(
         private const val MAX_TRIES = 12
         private const val PING_INTERVAL_MS = 1500L
 
-        fun create(host: String, port: Int, listener: Listener, code: Int = 0, deviceId: Int = 0): HostSession? {
+        fun create(
+            host: String,
+            port: Int,
+            listener: Listener,
+            code: Int = 0,
+            deviceId: Int = 0,
+            requestedDisplays: List<Pair<Int, Int>> = emptyList(),
+            network: android.net.Network? = null
+        ): HostSession? {
             return try {
                 // M1 只支持数字 IPv4，避免主线程 DNS 解析
                 val parts = host.split(".").map { it.toInt() }
                 require(parts.size == 4 && parts.all { it in 0..255 })
                 val addr = InetAddress.getByAddress(parts.map { it.toByte() }.toByteArray())
-                HostSession(addr, port, listener, code, deviceId)
+                require(!addr.isLoopbackAddress) {
+                    "TCP USB tunnel was removed; use a USB-network UDP address or Wi-Fi"
+                }
+                HostSession(addr, port, listener, code, deviceId, requestedDisplays.take(4), network)
             } catch (e: Exception) {
                 Log.e(TAG, "invalid host address: $host", e)
                 null
@@ -90,16 +107,14 @@ class HostSession private constructor(
     private val socket = DatagramSocket().apply {
         receiveBufferSize = 4 shl 20
         sendBufferSize = 1 shl 20
+        // mDNS 告诉我们端点来自哪张 Android Network。显式绑定后，同一个 Mac
+        // 的 USB 与 Wi-Fi 地址可并存，切换不会被系统默认路由误送到另一张网卡。
+        network?.bindSocket(this)
     }
-    // USB 隧道模式：连 127.0.0.1 走 adb reverse 的 TCP（帧格式 [len u32][payload]），
-    // Mac 侧 usb-tunnel.py 桥接回 host 的 UDP。WiFi 版平板没有原生 USB 网络共享的替代。
-    private val useTcpTunnel = address.hostAddress == "127.0.0.1"
-    @Volatile private var tcpSocket: java.net.Socket? = null
-    @Volatile private var tcpOut: java.io.OutputStream? = null
-    private val tcpFrames = longArrayOf(0, 0, 0, 0, 0) // total/welcome/video/config/pong
     @Volatile private var running = true
     @Volatile private var threadLinkUp = false
     @Volatile private var lastPongAt = System.currentTimeMillis()
+    @Volatile private var remoteControlEnabled = true
     private val inputSeq = AtomicInteger(1)
     private val pingSeq = AtomicInteger(1)
 
@@ -111,92 +126,64 @@ class HostSession private constructor(
     private class Pending(val packet: ByteArray, @Volatile var lastSentAt: Long, @Volatile var tries: Int)
     private val pendingAcks = ConcurrentHashMap<Int, Pending>()
 
+    /**
+     * 光标样式是可靠的小状态，不应塞进视频 latest-frame 组装器。Host 发送一组不超过
+     * 1KB 的 UDP 分片；只有完整 BGRA 位图才替换当前样式，乱序/重复包不会闪回旧光标。
+     */
+    private class CursorImageAssembler {
+        private var assemblingId = -1
+        private var deliveredId = -1
+        private var width = 0
+        private var height = 0
+        private var hotX = 0
+        private var hotY = 0
+        private var parts: Array<ByteArray?> = emptyArray()
+        private var received = 0
+
+        data class Result(val id: Int, val width: Int, val height: Int,
+                          val hotX: Int, val hotY: Int, val pixels: ByteArray)
+
+        fun offer(id: Int, index: Int, count: Int, w: Int, h: Int, hx: Int, hy: Int,
+                  payload: ByteArray): Result? {
+            if (count !in 1..64 || index !in 0 until count || w !in 1..256 || h !in 1..256 ||
+                w * h * 4 > 32 * 1024) return null
+            // Host imageId 单调递增；旧重传到得更晚时绝不覆盖已经绘制的新形状。
+            if (deliveredId >= 0 && id <= deliveredId) return null
+            if (id != assemblingId) {
+                assemblingId = id
+                width = w; height = h; hotX = hx; hotY = hy
+                parts = arrayOfNulls(count)
+                received = 0
+            }
+            if (w != width || h != height || hx != hotX || hy != hotY || parts.size != count) return null
+            if (parts[index] == null) {
+                parts[index] = payload
+                received++
+            }
+            if (received != count) return null
+            val expected = width * height * 4
+            val joined = ByteArray(expected)
+            var offset = 0
+            for (part in parts) {
+                val bytes = part ?: return null
+                if (offset + bytes.size > expected) return null
+                System.arraycopy(bytes, 0, joined, offset, bytes.size)
+                offset += bytes.size
+            }
+            if (offset != expected) return null
+            deliveredId = id
+            return Result(id, width, height, hotX, hotY, joined)
+        }
+    }
+    private val cursorImageAssembler = CursorImageAssembler()
+
     private val thread = Thread({
         threadLinkUp = false // 每条新会话从「未连通」开始（否则旧会话的 true 会吞掉新会话的 onLinkEvent）
         lastPongAt = System.currentTimeMillis()
-        if (useTcpTunnel) {
-            // 独立心跳：TCP 读循环在有视频流时永不空闲，靠读超时触发 PING 会饿死
-            // （链路永远判定不通 → 反复重连闪屏）。启动即 HELLO+PING，之后每 1.5s 一个 PING。
-            sendHandler.postDelayed(object : Runnable {
-                override fun run() {
-                    if (!running) return
-                    send(buildPacket(TYPE_PING, pingSeq.getAndIncrement()))
-                    sendHandler.postDelayed(this, 1500)
-                }
-            }, 300)
-            try {
-                val s = java.net.Socket()
-                s.tcpNoDelay = true
-                // adb reverse 的监听绑在 IPv6（::）上，必须连 ::1 而不是 127.0.0.1
-                val v6 = java.net.InetAddress.getByAddress(
-                    byteArrayOf(0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1))
-                s.connect(java.net.InetSocketAddress(v6, port), 3000)
-                s.soTimeout = 500 // 读超时驱动心跳周期任务
-                tcpSocket = s
-                tcpOut = s.getOutputStream()
-            } catch (e: Exception) {
-                Log.e(TAG, "tcp tunnel connect failed: ${e.javaClass.simpleName}: ${e.message}")
-                running = false
-                listener.onLinkEvent(false)
-                return@Thread
-            }
-        }
         socket.soTimeout = 200
         sendHello()
         var lastPingAt = 0L
         val buf = ByteArray(65_536)
-        if (useTcpTunnel) {
-            // TCP 隧道接收循环
-            val inp = tcpSocket?.getInputStream() ?: ByteArray(0).inputStream()
-            val fbuf = ByteArray(65536 + 8)
-            var acc = 0
-            try {
-                while (running) {
-                    val n = try {
-                        inp.read(fbuf, acc, fbuf.size - acc)
-                    } catch (e: java.net.SocketTimeoutException) {
-                        // 心跳与重连（与 UDP 循环同职责）
-                        val now = System.currentTimeMillis()
-                        send(buildPacket(TYPE_PING, pingSeq.getAndIncrement()))
-                        val pongAge = now - lastPongAt
-                        if (threadLinkUp && pongAge > 5000) {
-                            threadLinkUp = false
-                            listener.onLinkEvent(false)
-                            sendHello()
-                        }
-                        if (!threadLinkUp && pongAge > 2500) {
-                            sendHello()
-                            lastPongAt = now
-                        }
-                        continue
-                    }
-                    if (n < 0) break
-                    acc += n
-                    while (acc >= 4) {
-                        val ln = ((fbuf[0].toInt() and 0xFF) or
-                            ((fbuf[1].toInt() and 0xFF) shl 8) or
-                            ((fbuf[2].toInt() and 0xFF) shl 16) or
-                            ((fbuf[3].toInt() and 0xFF) shl 24))
-                        if (ln <= 0 || ln > 65536) { acc = 0; break }
-                        if (acc < 4 + ln) break
-                        val pkt = fbuf.copyOfRange(4, 4 + ln)
-                        System.arraycopy(fbuf, 4 + ln, fbuf, 0, acc - 4 - ln)
-                        acc -= 4 + ln
-                        when (pkt[0].toInt() and 0xFF) {
-                            0x01 -> tcpFrames[1]++
-                            0x02 -> tcpFrames[2]++
-                            0x03 -> tcpFrames[3]++
-                            0x06 -> tcpFrames[4]++
-                        }
-                        dispatch(pkt, ln)
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "tcp read loop died: ${e.javaClass.simpleName}: ${e.message}")
-            }
-            Log.i(TAG, "tcp frames: total=${tcpFrames[0]} welcome=${tcpFrames[1]} video=${tcpFrames[2]} config=${tcpFrames[3]} pong=${tcpFrames[4]}")
-            if (running) { running = false; listener.onLinkEvent(false) }
-        }
         while (running) {
             val now = System.currentTimeMillis()
             // 心跳 / 掉线重连（host 重启后靠重复 HELLO 重新入会）
@@ -239,14 +226,17 @@ class HostSession private constructor(
         val bb = ByteBuffer.wrap(buf, 0, buf.size).order(ByteOrder.LITTLE_ENDIAN)
         when (buf[0].toInt() and 0xFF) {
                     TYPE_WELCOME -> {
-                        // [displayId u16][proto u8][codec u8][w u16][h u16][fps u8]
+                        // [displayId u16][proto u8][codec u8][w u16][h u16][fps u8][controlEnabled u8]
+                        if (len < 14) return
                         val displayId = bb.getShort(5).toInt() and 0xFFFF
                         val proto = buf[7].toInt() and 0xFF
                         val codec = buf[8].toInt() and 0xFF
                         val w = bb.getShort(9).toInt() and 0xFFFF
                         val h = bb.getShort(11).toInt() and 0xFFFF
                         val fps = buf[13].toInt() and 0xFF
-                        if (proto == PROTO_VERSION) listener.onWelcome(displayId, codec, w, h, fps)
+                        // 尾字段是新增的向后兼容字段；老 host 不带时默认可控制。
+                        val controlEnabled = len < 15 || (buf[14].toInt() and 0xFF) != 0
+                        if (proto == PROTO_VERSION) listener.onWelcome(displayId, codec, w, h, fps, controlEnabled)
                     }
                     TYPE_CONFIG -> {
                         // [displayId u16][codec u8][len u16][bytes]
@@ -290,11 +280,30 @@ class HostSession private constructor(
                     }
                     TYPE_CURSOR -> {
                         // [displayId u16][x f32][y f32]
-                        if (buf.size >= 12) {
+                        if (len >= 15) {
                             val did = bb.getShort(5).toInt() and 0xFFFF
                             val fx = Float.fromBits(bb.getInt(7))
                             val fy = Float.fromBits(bb.getInt(11))
                             listener.onCursor(did, fx, fy)
+                        }
+                    }
+                    TYPE_CURSOR_IMAGE -> {
+                        // [fragIdx u16][fragCount u16][w u16][h u16][hotX i16][hotY i16][BGRA]
+                        val payloadStart = 17
+                        if (len <= payloadStart) return
+                        val imageId = bb.getInt(1)
+                        val index = bb.getShort(5).toInt() and 0xFFFF
+                        val count = bb.getShort(7).toInt() and 0xFFFF
+                        val w = bb.getShort(9).toInt() and 0xFFFF
+                        val h = bb.getShort(11).toInt() and 0xFFFF
+                        val hotX = bb.getShort(13).toInt()
+                        val hotY = bb.getShort(15).toInt()
+                        val complete = cursorImageAssembler.offer(
+                            imageId, index, count, w, h, hotX, hotY, buf.copyOfRange(payloadStart, len))
+                        if (complete != null) {
+                            listener.onCursorImage(complete.width, complete.height, complete.hotX, complete.hotY, complete.pixels)
+                            // ACK 使用 imageId 作公共头 seq；Host 最多短暂重发三轮，空闲时零定时器。
+                            send(buildPacket(TYPE_CURSOR_IMAGE_ACK, complete.id))
                         }
                     }
                     TYPE_INPUT_ACK -> {
@@ -302,14 +311,18 @@ class HostSession private constructor(
                         pendingAcks.remove(seq)
                     }
                     TYPE_PONG -> {
-                        // 尾字节（老 host 无此字节则按 known）：host 是否仍认得本来源。
-                        // USB 桥接按连接分配 UDP 源端口，host 按 ip:port 记账——端口漂移/
-                        // 客户端被剪枝后，PONG 仍在回但视频早已停供。见 unknown 立即
-                        // 重 HELLO（带设备档案，host 会重建/重订阅虚拟屏），静默自愈不闪 UI。
+                        // 尾字节（老 host 无此字节则按 known）：host 是否仍有本会话的
+                        // 可用显示器。UDP 端口漂移、BYE 回收、Host 重启后的空订阅都必须
+                        // 立即重 HELLO；不能只在 threadLinkUp 后才做，否则冷启动收到
+                        // unknown PONG 会被持续心跳掩盖，永远停在“等待 Mac 主机”。
                         val known = buf.size < 6 || (buf[5].toInt() and 0xFF) != 0
-                        if (!known && threadLinkUp) {
-                            Log.w(TAG, "host forgot this session (unknown pong) — re-HELLO")
+                        if (!known) {
+                            Log.w(TAG, "host has no active displays for this session — re-HELLO")
                             sendHello()
+                            // 不把 unknown PONG 当作“链路已正常”：等待下一枚 known PONG
+                            // 才对 UI 宣布连通，避免空会话遮住等待提示。
+                            threadLinkUp = false
+                            return
                         }
                         if (known && !threadLinkUp) {
                             threadLinkUp = true
@@ -324,10 +337,10 @@ class HostSession private constructor(
         thread.start()
     }
 
-    fun close() {
-        // 先发 BYE 再停机：host 收到即摘除订阅并加速回收副屏（窗口弹回 Mac 主屏）。
-        // 必须在 running=false 之前发（send 有 running 守卫）
-        send(buildPacket(TYPE_BYE, 0))
+    fun close(sendBye: Boolean = true) {
+        // 只有平板真正离开（后台/关闭）才发 BYE 并移除虚拟屏；USB↔Wi-Fi
+        // 换路由时静默换 socket，让 Host 复用同一个稳定 EDID 的显示器对象。
+        if (sendBye) send(buildPacket(TYPE_BYE, 0))
         running = false
         // 幂等：重连流程可能多次 close（自动降级/升级路径）
         if (!socket.isClosed) {
@@ -336,7 +349,6 @@ class HostSession private constructor(
         try { thread.join(500) } catch (_: InterruptedException) {}
         sendHandler.removeCallbacksAndMessages(null)
         sendThread.quitSafely()
-        try { tcpSocket?.close() } catch (_: Exception) { }
         socket.close()
     }
 
@@ -356,15 +368,7 @@ class HostSession private constructor(
         sendHandler.post {
             if (!running) return@post
             try {
-                val out = tcpOut
-                if (useTcpTunnel && out != null) {
-                    val frame = ByteBuffer.allocate(4 + packet.size).order(ByteOrder.LITTLE_ENDIAN)
-                        .putInt(packet.size).put(packet).array()
-                    out.write(frame)
-                    out.flush()
-                } else {
-                    socket.send(DatagramPacket(packet, packet.size, address, port))
-                }
+                socket.send(DatagramPacket(packet, packet.size, address, port))
             } catch (e: Exception) {
                 if (running) Log.w(TAG, "send failed: ${e.javaClass.simpleName}: ${e.message}")
             }
@@ -375,11 +379,18 @@ class HostSession private constructor(
         val metrics = android.content.res.Resources.getSystem().displayMetrics
         val w = maxOf(metrics.widthPixels, metrics.heightPixels)
         val h = minOf(metrics.widthPixels, metrics.heightPixels)
-        // [proto u8][w u16][h u16][code u32]——host 校验配对码，错误即拒绝
-        val body = ByteBuffer.allocate(13).order(ByteOrder.LITTLE_ENDIAN)
+        // [proto][w][h][code][deviceId][目标屏数][w,h]×n。目标屏组是设备档案的一部分：
+        // 首次默认一块平板尺寸；后续分屏/画中画则一次性让 Host 创建整组，避免先黑屏
+        // 再逐块补建和错误地把它们当成新显示器。
+        val specs = requestedDisplays.take(4)
+        val body = ByteBuffer.allocate(14 + specs.size * 4).order(ByteOrder.LITTLE_ENDIAN)
             .put(PROTO_VERSION.toByte()).putShort(w.toShort()).putShort(h.toShort())
-            .putInt(pairingCode).putInt(deviceId).array()
-        send(buildPacket(TYPE_HELLO, 0, body))
+            .putInt(pairingCode).putInt(deviceId).put(specs.size.toByte())
+        for ((sw, sh) in specs) {
+            body.putShort(sw.coerceIn(640, 16_368).toShort())
+            body.putShort(sh.coerceIn(480, 16_368).toShort())
+        }
+        send(buildPacket(TYPE_HELLO, 0, body.array()))
     }
 
     private fun retransmitDue(now: Long) {
@@ -401,6 +412,7 @@ class HostSession private constructor(
     }
 
     private fun sendReliable(body: ByteArray) {
+        if (!remoteControlEnabled) return
         val seq = inputSeq.getAndIncrement()
         val packet = buildPacket(TYPE_INPUT, seq, body)
         pendingAcks[seq] = Pending(packet, System.currentTimeMillis(), 1)
@@ -408,6 +420,7 @@ class HostSession private constructor(
     }
 
     fun sendMove(displayId: Int, x: Float, y: Float) {
+        if (!remoteControlEnabled) return
         val body = ByteBuffer.allocate(11).order(ByteOrder.LITTLE_ENDIAN)
             .putShort(displayId.toShort()).put(0).putFloat(x).putFloat(y).array()
         send(buildPacket(TYPE_INPUT, inputSeq.getAndIncrement(), body))
@@ -426,16 +439,16 @@ class HostSession private constructor(
         sendReliable(body)
     }
 
+    fun setRemoteControlEnabled(enabled: Boolean) {
+        remoteControlEnabled = enabled
+        if (!enabled) pendingAcks.clear()
+    }
+
     /** displayId < 0 = 请求全部屏 */
     fun requestKeyframe(displayId: Int = -1) {
         val id = if (displayId < 0) DISPLAY_ID_BROADCAST else displayId
         val body = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort(id.toShort()).array()
         send(buildPacket(TYPE_KEYFRAME_REQ, pingSeq.getAndIncrement(), body))
-    }
-
-    /** 请求 host 整体回收流/屏（编码器池归零——切布局前调用，防绿屏流） */
-    fun sendRecycle() {
-        send(buildPacket(TYPE_RECYCLE, 0))
     }
 
     /** 请求 host 只重建该屏的编码器会话（绿屏自愈；不动屏/流——永生流架构） */

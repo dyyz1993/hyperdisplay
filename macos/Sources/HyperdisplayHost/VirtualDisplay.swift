@@ -7,22 +7,22 @@ import HyperdisplayObjC
 /// 显示器实例由 shim 常驻持有；进程退出（含崩溃）时 windowserver 自动摘除全部虚拟屏。
 final class VirtualDisplay {
     let displayID: CGDirectDisplayID
-    /// 逻辑尺寸（点）：流输出/编码/UI 布局全用这个。2x 屏的 pixelWidth 是它的一倍
+    /// 逻辑尺寸（点）：流输出/编码/UI 布局全用这个。当前生产配置固定为 1x。
     let logicalWidth: Int
     let logicalHeight: Int
-    /// 物理像素（2x 屏 = 逻辑 × 2）。仅诊断/日志用
+    /// 系统回读像素尺寸，仅诊断/日志用。
     private(set) var pixelWidth: Int
     private(set) var pixelHeight: Int
     /// 建屏时刻：起流沉降期判断（建屏瞬间起流的 SCK 概率性永不投递问题）
     let createdAt = Date()
     var age: TimeInterval { Date().timeIntervalSince(createdAt) }
 
-    /// - Parameters:
-    ///   - width/height: **逻辑尺寸**（2x 渲染时 UI 常规大小，物理像素 ×2）
-    ///   - hiDPI: 2 = 系统 2x 渲染（超采样：SCK 输出降到逻辑分辨率，文字更锐）；
-    ///            0 = 1x（遗留，2x 屏上模式切换才生效，新代码一律用 2）
-    init?(width: Int, height: Int, refreshRate: Double = 60, serial: UInt32 = 1, hiDPI: Int = 0) {
-        let id = hyperdisplayCreateVirtualDisplay(UInt32(width), UInt32(height), refreshRate, "Hyperdisplay", serial, UInt8(hiDPI))
+    /// hiDPI=0 是已验证的 1x 生产路径。非零值只供隔离实验；CGVirtualDisplay
+    /// 当前无法提供真实 Retina 2x 语义。
+    init?(width: Int, height: Int, refreshRate: Double = 60, productID: UInt32 = 0x0001,
+          serial: UInt32 = 1, hiDPI: Int = 0) {
+        let id = hyperdisplayCreateVirtualDisplay(UInt32(width), UInt32(height), refreshRate, "Hyperdisplay",
+                                                   productID, serial, UInt8(hiDPI))
         guard id != 0 else {
             NSLog("[hyperdisplay] CGVirtualDisplay creation failed (id=0)")
             return nil
@@ -48,20 +48,6 @@ final class VirtualDisplay {
     /// 显式销毁（不必等 deinit）
     func destroy() {
         hyperdisplayDestroyVirtualDisplay(displayID)
-    }
-
-    /// 原地改分辨率（模式切换，身份/位置/窗口归属不变）。成功后 pixelWidth/Height
-    /// 更新为系统回读值。显示大小档位切换专用——销毁重建会触发新 SCStream（必死）。
-    func resize(width: Int, height: Int) -> Bool {
-        guard hyperdisplayResizeVirtualDisplay(displayID, UInt32(width), UInt32(height)) else {
-            return false
-        }
-        if let mode = CGDisplayCopyDisplayMode(displayID) {
-            pixelWidth = Int(mode.pixelWidth)
-            pixelHeight = Int(mode.pixelHeight)
-        }
-        NSLog("[hyperdisplay] display \(displayID) resized to \(pixelWidth)x\(pixelHeight)")
-        return true
     }
 
     /// 该屏在全局桌面坐标系中的 frame（副屏原点可为负）
