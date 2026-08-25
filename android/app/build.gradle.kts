@@ -1,7 +1,17 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+val releaseKeystoreFile = rootProject.file("keystore.properties")
+val releaseKeystore = Properties()
+if (releaseKeystoreFile.isFile) {
+    releaseKeystoreFile.inputStream().use(releaseKeystore::load)
+}
+val hasReleaseSigning = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+    .all { !releaseKeystore.getProperty(it).isNullOrBlank() }
 
 android {
     namespace = "com.hyperdisplay.client"
@@ -15,9 +25,23 @@ android {
         versionName = "0.1.0"
     }
 
+    if (hasReleaseSigning) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(releaseKeystore.getProperty("storeFile"))
+                storePassword = releaseKeystore.getProperty("storePassword")
+                keyAlias = releaseKeystore.getProperty("keyAlias")
+                keyPassword = releaseKeystore.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

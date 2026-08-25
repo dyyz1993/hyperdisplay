@@ -7,6 +7,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/build/Hyperdisplay.app"
 ICON="$ROOT/Resources/Hyperdisplay.icns"
 MENUBAR_ICON="$ROOT/Resources/HyperdisplayMenuBar.png"
+# Release 页是安装 Android 客户端的唯一稳定入口；每个版本的 APK 名称可变，
+# 但 `/releases/latest` 始终指向当前正式版本。fork 可在打包时覆盖此 URL。
+RELEASE_URL="${HYPERDISPLAY_RELEASE_URL:-https://github.com/dyyz1993/hyperdisplay/releases/latest}"
 
 if [[ ! -f "$ICON" || ! -f "$MENUBAR_ICON" ]]; then
     "$ROOT/Scripts/generate-icon.sh"
@@ -20,7 +23,7 @@ cp "$ROOT/.build/release/HyperdisplayHost" "$APP/Contents/MacOS/Hyperdisplay"
 cp "$ICON" "$APP/Contents/Resources/Hyperdisplay.icns"
 cp "$MENUBAR_ICON" "$APP/Contents/Resources/HyperdisplayMenuBar.png"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -49,6 +52,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <true/>
     <key>NSHumanReadableCopyright</key>
     <string>MIT License. CGVirtualDisplay bindings derived from DeskPad (MIT).</string>
+    <key>HyperdisplayAndroidReleaseURL</key>
+    <string>${RELEASE_URL}</string>
 </dict>
 </plist>
 PLIST

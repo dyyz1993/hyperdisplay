@@ -10,6 +10,10 @@ build/
 local.properties
 *.apk
 *.aab
+*.jks
+*.keystore
+keystore.properties
+dist/
 captures/
 .externalNativeBuild/
 .cxx/

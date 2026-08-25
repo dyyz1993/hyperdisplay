@@ -64,6 +64,20 @@ macOS host 必须以 `Hyperdisplay.app` 运行，而不是直接把 release 二�
 
 默认 UDP 端口 `5277`。host 退出 → 全部虚拟屏自动销毁。
 
+## 下载与开源发布
+
+项目通过 GitHub Releases 直接分发，不走 Mac App Store：当前 Mac host 需要使用
+`CGVirtualDisplay` 私有 API，不能按 App Store 的公开 API 要求提交。每个正式 Release 提供：
+
+- `Hyperdisplay-macOS-arm64.dmg`：Developer ID 签名并经 Apple notarization 的 Mac 安装包；
+- `Hyperdisplay-android.apk`：同一个持久发布密钥签名的 Android 安装包；
+- `SHA256SUMS`：两个安装包的 SHA-256 校验值。
+
+Mac 菜单栏的「下载 Android 客户端（GitHub Releases）…」会始终打开最新版下载页。平板下载
+APK 后，按 Android 对所用浏览器或文件管理器的系统提示允许安装，之后打开 Hyperdisplay 即可。
+构建者请使用 `script/package-release.sh`：它会拒绝未签名 APK 或未 notarize 的 Mac 包，避免把
+开发产物误上传。发布到 GitHub 的命令在 `script/publish-github-release.sh`。
+
 ## 里程碑
 
 | 里程碑 | 内容 | 状态 |

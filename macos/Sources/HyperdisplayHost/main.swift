@@ -69,6 +69,17 @@ struct Config {
     }
 }
 
+/// 发行渠道配置：用户从菜单栏进入最新 GitHub Release，再按说明下载 Android APK。
+/// 允许 fork 在打包时通过 Info.plist 覆盖，避免把运行时行为绑定到开发目录或 git remote。
+enum ReleaseLinks {
+    static let fallbackAndroidDownload = URL(string: "https://github.com/dyyz1993/hyperdisplay/releases/latest")!
+
+    static var androidDownload: URL {
+        let configured = Bundle.main.object(forInfoDictionaryKey: "HyperdisplayAndroidReleaseURL") as? String
+        return configured.flatMap(URL.init(string:)) ?? fallbackAndroidDownload
+    }
+}
+
 // MARK: - --check 自检（无需任何权限）：造屏 → 可见 → 销毁 → 消失
 
 enum CheckMode {
@@ -1865,6 +1876,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "配对码: \(pairingCode)（客户端首次连接需输入）", action: nil, keyEquivalent: "")
         let qrItem = menu.addItem(withTitle: "显示连接二维码…", action: #selector(showQR), keyEquivalent: "")
         qrItem.target = self
+        let downloadAndroid = menu.addItem(withTitle: "下载 Android 客户端（GitHub Releases）…",
+                                           action: #selector(openAndroidDownload), keyEquivalent: "")
+        downloadAndroid.target = self
+        menu.addItem(withTitle: "  下载 APK 后，平板按系统提示允许安装即可", action: nil, keyEquivalent: "")
         let port = udp?.port ?? config.port
         menu.addItem(withTitle: "本机 UDP \(port)：", action: nil, keyEquivalent: "")
         for line in Self.allInterfaceAddresses(port: Int(port)) {
@@ -1904,6 +1919,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
             return (String(ip), port)
         }
         qrPanel.show(ipPortList: list.isEmpty ? [("?.?.?.?:\(port)", port)] : list, port: port, code: pairingCode)
+    }
+
+    @objc private func openAndroidDownload() {
+        NSWorkspace.shared.open(ReleaseLinks.androidDownload)
     }
 
     @objc private func requestScreenPerm() {
