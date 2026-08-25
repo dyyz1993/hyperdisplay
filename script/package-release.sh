@@ -32,17 +32,16 @@ if [[ -z "${HYPERDISPLAY_ANDROID_KEY_PASSWORD:-}" ]]; then
 fi
 export HYPERDISPLAY_ANDROID_KEY_ALIAS="${HYPERDISPLAY_ANDROID_KEY_ALIAS:-hyperdisplay}"
 
-VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || true)"
-if [[ -z "$VERSION" ]]; then
-    "$MACOS_DIR/Scripts/make-app.sh"
-    VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
-fi
+# 必须先重建再读取版本：否则工作区里尚存旧 .app 时，会把新版 APK/DMG 错放进
+# 旧版本目录，导致 GitHub Release 的标签与安装包版本不一致。
+"$MACOS_DIR/Scripts/make-app.sh"
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+[[ -n "$VERSION" ]] || fail "could not read Mac app version after build"
 DIST="$ROOT/dist/v$VERSION"
 mkdir -p "$DIST"
 [[ ! -e "$DIST/Hyperdisplay-macOS-arm64.dmg" ]] || fail "refusing to overwrite existing Mac DMG"
 
-# 重建后重新读取版本；并确保是 Developer ID + hardened runtime，而不是 ad-hoc。
-"$MACOS_DIR/Scripts/make-app.sh"
+# 确保是 Developer ID + hardened runtime，而不是 ad-hoc。
 # Do not pipe `codesign` into `grep -q` under `pipefail`: grep exits immediately
 # on a match and can make codesign report SIGPIPE as a false signing failure.
 SIGNING_INFO="$(codesign -dvv "$APP" 2>&1)"
