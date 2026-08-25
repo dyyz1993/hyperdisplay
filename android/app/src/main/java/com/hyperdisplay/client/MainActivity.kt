@@ -1059,6 +1059,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 // Host 只在“指纹命中、安装内 ID 已变化”时发这个包。它比显示列表先发；
                 // 即便 UDP 极端乱序，后续 onDisplays 也会按新布局重新选择完整屏组。
                 restoreLayoutFromHost(layout)
+                session?.acknowledgeSavedLayout()
             }
         }
 
@@ -1752,6 +1753,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val kindBtns = LinkedHashMap<LayoutKind, android.widget.RadioButton>()
         for (k in LayoutKind.values()) {
             val rb = android.widget.RadioButton(this).apply {
+                // 动态加入 RadioGroup 的 RadioButton 不会自动拿到稳定 ID；没有 ID 时
+                // 多个选项可同时 checked，onCheckedChange 又会错误命中首个“单屏”。
+                // 这会让“左右分屏/上下分屏”在 UI 看似选中但提交后仍是单屏。
+                id = View.generateViewId()
                 text = k.label
                 isChecked = k == layoutConfig.kind
             }

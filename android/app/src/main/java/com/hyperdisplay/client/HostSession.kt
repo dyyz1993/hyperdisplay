@@ -141,6 +141,7 @@ class HostSession private constructor(
         private const val TYPE_SUBSCRIBE_DISPLAYS = 0x18
         private const val TYPE_CURSOR_IMAGE_ACK = 0x19
         private const val TYPE_BYE = 0x1A
+        private const val TYPE_LAYOUT_RESTORE_ACK = 0x1D
         private const val DISPLAY_ID_BROADCAST = 0xFFFF
         private const val PROTO_VERSION = 1
         private const val RETRANSMIT_MS = 40L
@@ -511,6 +512,11 @@ class HostSession private constructor(
         sendThread.quitSafely()
         try { tcpSocket?.close() } catch (_: Exception) { }
         socket.close()
+    }
+
+    /** Host 只在收到此确认前保护旧档案；之后本次安装的用户设置立即成为新权威。 */
+    fun acknowledgeSavedLayout() {
+        send(buildPacket(TYPE_LAYOUT_RESTORE_ACK, 0))
     }
 
     // MARK: 发送

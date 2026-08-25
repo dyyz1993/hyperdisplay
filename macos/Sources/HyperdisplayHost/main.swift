@@ -132,6 +132,8 @@ struct Client {
     let addr: sockaddr_in
     /// 用于在健康护栏解除后按原有 EDID 档案恢复同一块副屏。
     let deviceId: UInt32
+    /// 当前 Android 安装实例的临时 ID。跨卸载恢复确认仅对这一实例生效。
+    let claimedDeviceId: UInt32
     var displayIds: Set<CGDirectDisplayID> // 单屏=1个元素；分屏=多个
     var lastSeen: Date
 }
@@ -172,6 +174,11 @@ private struct CanonicalDeviceIdentity {
     /// true 仅代表“指纹已有归属、这次安装内随机 ID 已变”，不能用 Android 的
     /// 单屏默认值覆盖 Host 已保存的多屏档案和布局。
     let restoredAfterReinstall: Bool
+}
+
+private struct DeviceRestoreClaim: Hashable {
+    let deviceId: UInt32
+    let claimedDeviceId: UInt32
 }
 
 /// 一次设备拓扑变更的不可分割事务。CGVirtualDisplay 的注销是异步的：Swift/ObjC 已经
@@ -716,6 +723,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
     /// 平板发送的是不可逆的系统指纹，绝不落盘原始 Android ID。这个映射让卸载重装
     /// 后新生成的会话 ID 继续归属于同一份档案/EDID/桌面坐标。
     private var deviceFingerprintMappings: [String: UInt32] = [:]
+    /// 仅存活于当前 Host 进程：客户端确认已应用旧布局后，同一安装实例接下来的
+    /// HELLO 全是用户的新意图，不能继续按“重装默认值”丢弃。
+    private var acknowledgedRestoreClaims: Set<DeviceRestoreClaim> = []
     /// 仅在建/销显示器或正常退出时读写；日常串流完全不访问磁盘。
     private var devicePlacements: [UInt32: [DeviceScreenPlacement]] = [:]
     /// 显示器拓扑不是网络包的同步副作用。HELLO/断线/改布局只更新期望状态，实际
@@ -1500,13 +1510,15 @@ final class HostApp: NSObject, NSApplicationDelegate {
             }
             let identity = canonicalDeviceIdentity(claimedId: claimedDeviceId, fingerprint: deviceFingerprint)
             let deviceId = identity.deviceId
+            let restoreClaim = DeviceRestoreClaim(deviceId: deviceId, claimedDeviceId: claimedDeviceId)
+            let restoringAfterReinstall = identity.restoredAfterReinstall && !acknowledgedRestoreClaims.contains(restoreClaim)
             currentDeviceId = deviceId
             // 每个 HELLO 携带该平板上次保存的目标屏幕组。首次只带当前平板尺寸，
             // Host 因此直接建一块默认屏；之后若用户选过分屏，则一次复建完整两块/多块。
             if deviceId != 0 {
-                if !identity.restoredAfterReinstall, let layout { saveDeviceLayout(deviceId, layout) }
+                if !restoringAfterReinstall, let layout { saveDeviceLayout(deviceId, layout) }
                 let profiles = deviceProfiles(deviceId: deviceId, clientWidth: cw, clientHeight: ch,
-                                              requested: identity.restoredAfterReinstall ? [] : requestedDisplays)
+                                              requested: restoringAfterReinstall ? [] : requestedDisplays)
                 reconcileDeviceDisplays(deviceId: deviceId, profiles: profiles)
             }
             // 目标屏：档案屏优先（剪枝后重入会也能回到自己的屏——setSubscriptions 对
@@ -1520,9 +1532,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 targets = [first]
             }
             clientsLock.lock()
-            clients[key] = Client(addr: addr, deviceId: deviceId, displayIds: targets, lastSeen: Date())
+            clients[key] = Client(addr: addr, deviceId: deviceId, claimedDeviceId: claimedDeviceId,
+                                  displayIds: targets, lastSeen: Date())
             clientsLock.unlock()
-            if identity.restoredAfterReinstall, let savedLayout = loadDeviceLayout(deviceId) {
+            if restoringAfterReinstall, let savedLayout = loadDeviceLayout(deviceId) {
                 var target = addr
                 udp?.send(to: &target, Wire.savedLayout(savedLayout))
                 NSLog("[hyperdisplay] restored remembered layout after client reinstall")
@@ -1559,6 +1572,15 @@ final class HostApp: NSObject, NSApplicationDelegate {
         case .setTier:
             // 新客户端会把尺寸写进 HELLO 档案后执行一次受控重连；不再为档位切换重启 Host。
             NSLog("[hyperdisplay] ignored legacy SET_TIER; waiting for profile-driven HELLO")
+
+        case .layoutRestoreAck:
+            clientsLock.lock()
+            if let client = clients[key] {
+                acknowledgedRestoreClaims.insert(DeviceRestoreClaim(deviceId: client.deviceId,
+                                                                     claimedDeviceId: client.claimedDeviceId))
+            }
+            clientsLock.unlock()
+            NSLog("[hyperdisplay] client confirmed restored layout; subsequent settings are authoritative")
 
         case .bye:
             // 平板真正进入后台/退出就是物理拔线：立即销毁这台设备的整组虚拟屏。
