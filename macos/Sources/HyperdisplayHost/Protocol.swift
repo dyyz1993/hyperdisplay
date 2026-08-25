@@ -13,7 +13,8 @@ import Foundation
 //   PONG          seq=回显 ping 的 seq
 //   CURSOR_IMAGE  seq=imageId [fragIdx u16][fragCount u16][w u16][h u16][hotX i16][hotY i16][BGRA payload]
 // client→host：
-//   HELLO         seq=0        [proto u8][clientW u16][clientH u16]
+//   HELLO         seq=0        [proto u8][clientW u16][clientH u16][code u32][deviceId u32]
+//                                  [screenCount u8][w,h]×n[fingerprint u64 optional]
 //   KEYFRAME_REQ               [displayId u16]（0xFFFF = 全部）
 //   NACK          seq=0        [displayId u16][frameId u32][count u16][fragIdx u16 × count]
 //   SELECT_DISPLAY id u32       —— 订阅集 = {id}（单屏模式）
@@ -28,7 +29,7 @@ import Foundation
 //   CURSOR_IMAGE_ACK seq=imageId —— 光标图像分片已完整收到
 
 enum PacketType: UInt8 {
-    case welcome = 0x01, videoFrag = 0x02, config = 0x03, inputAck = 0x05, pong = 0x06, displays = 0x07, cursor = 0x08, cursorImage = 0x09
+    case welcome = 0x01, videoFrag = 0x02, config = 0x03, inputAck = 0x05, pong = 0x06, displays = 0x07, cursor = 0x08, cursorImage = 0x09, savedLayout = 0x0A
     case hello = 0x10, keyframeReq = 0x11, input = 0x12, ping = 0x13
     case selectDisplay = 0x14, createDisplay = 0x15, destroyDisplay = 0x16, nack = 0x17, subscribeDisplays = 0x18
     case cursorImageAck = 0x19, bye = 0x1A, encoderReset = 0x1B, setTier = 0x1C
@@ -53,9 +54,23 @@ struct RequestedDisplaySpec {
     let height: UInt16
 }
 
+/// 平板布局的固定 15-byte 快照。它只在该平板卸载重装且 Host 指纹命中时回传，
+/// 让 Android 的分屏/画中画视图与已复用的 macOS 屏幕组同步恢复。
+struct DeviceLayoutState: Codable, Equatable {
+    let kind: UInt8
+    let fractionPermille: UInt16
+    let sideLeft: Bool
+    let pipRatio: UInt8
+    let pipCustomW: UInt16
+    let pipCustomH: UInt16
+    let displayLongEdge: UInt16
+    let pipLeft: Int16
+    let pipTop: Int16
+}
+
 enum Packet {
     case hello(proto: UInt8, clientWidth: UInt16, clientHeight: UInt16, code: UInt32, deviceId: UInt32,
-               requestedDisplays: [RequestedDisplaySpec])
+               requestedDisplays: [RequestedDisplaySpec], deviceFingerprint: UInt64, layout: DeviceLayoutState?)
     case keyframeReq(displayId: UInt16)
     case nack(displayId: UInt16, frameId: UInt32, indices: [UInt16])
     case inputMove(displayId: UInt16, seq: UInt32, x: Float32, y: Float32)
@@ -141,6 +156,20 @@ enum Wire {
             d.appendLE(UInt8(name.count))
             d.append(name)
         }
+        return d
+    }
+
+    static func savedLayout(_ layout: DeviceLayoutState) -> Data {
+        var d = Data(header(.savedLayout, seq: 0))
+        d.appendLE(layout.kind)
+        d.appendLE(layout.fractionPermille)
+        d.appendLE(UInt8(layout.sideLeft ? 1 : 0))
+        d.appendLE(layout.pipRatio)
+        d.appendLE(layout.pipCustomW)
+        d.appendLE(layout.pipCustomH)
+        d.appendLE(layout.displayLongEdge)
+        d.appendLE(UInt16(bitPattern: layout.pipLeft))
+        d.appendLE(UInt16(bitPattern: layout.pipTop))
         return d
     }
 
@@ -291,6 +320,9 @@ enum Wire {
         func u32(_ off: Int) -> UInt32 {
             data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: Wire.headerSize + off, as: UInt32.self).littleEndian }
         }
+        func u64(_ off: Int) -> UInt64 {
+            data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: Wire.headerSize + off, as: UInt64.self).littleEndian }
+        }
         func f32(_ off: Int) -> Float32 {
             Float32(bitPattern: data.withUnsafeBytes {
                 $0.loadUnaligned(fromByteOffset: Wire.headerSize + off, as: UInt32.self).littleEndian
@@ -300,22 +332,39 @@ enum Wire {
         switch type {
         case PacketType.hello.rawValue:
             guard body >= 5 else { return nil }
-            // [proto][w][h][code u32][deviceId u32]——code 配对码，deviceId 持久设备指纹
+            // [proto][w][h][code u32][deviceId u32]——code 配对码，deviceId 是旧版
+            // 安装内标识。可选尾部 fingerprint 是匿名且跨卸载稳定的设备归并键。
             let code: UInt32 = body >= 9 ? u32(5) : 0
             let deviceId: UInt32 = body >= 13 ? u32(9) : 0
             var requested: [RequestedDisplaySpec] = []
             // 可选尾部：[count u8][width u16][height u16]×count。最多四块，避免异常包
             // 触发批量建屏；旧 HELLO 只有 13-byte body，继续兼容。
             if body >= 14 {
-                let count = min(Int(u8(13)), 4)
+                let count = Int(u8(13))
+                guard count <= 4 else { return nil }
                 guard body >= 14 + count * 4 else { return nil }
                 requested.reserveCapacity(count)
                 for i in 0..<count {
                     requested.append(RequestedDisplaySpec(width: u16(14 + i * 4), height: u16(16 + i * 4)))
                 }
             }
+            let fingerprintOffset = 14 + requested.count * 4
+            let deviceFingerprint: UInt64 = body >= fingerprintOffset + 8 ? u64(fingerprintOffset) : 0
+            let layoutOffset = fingerprintOffset + 8
+            let layout: DeviceLayoutState?
+            if body >= layoutOffset + 15 {
+                layout = DeviceLayoutState(
+                    kind: u8(layoutOffset), fractionPermille: u16(layoutOffset + 1),
+                    sideLeft: (u8(layoutOffset + 3) & 1) != 0, pipRatio: u8(layoutOffset + 4),
+                    pipCustomW: u16(layoutOffset + 5), pipCustomH: u16(layoutOffset + 7),
+                    displayLongEdge: u16(layoutOffset + 9),
+                    pipLeft: Int16(bitPattern: u16(layoutOffset + 11)),
+                    pipTop: Int16(bitPattern: u16(layoutOffset + 13)))
+            } else {
+                layout = nil
+            }
             return .hello(proto: u8(0), clientWidth: u16(1), clientHeight: u16(3), code: code, deviceId: deviceId,
-                          requestedDisplays: requested)
+                          requestedDisplays: requested, deviceFingerprint: deviceFingerprint, layout: layout)
         case PacketType.keyframeReq.rawValue:
             guard body >= 2 else { return nil }
             return .keyframeReq(displayId: u16(0))

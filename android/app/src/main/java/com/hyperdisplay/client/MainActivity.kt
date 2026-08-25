@@ -145,6 +145,57 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             .putInt("layout.pipTop", pipTop)
             .apply()
     }
+
+    private fun layoutStateForHost(cfg: LayoutConfig): HostSession.LayoutState {
+        val ratio = when (cfg.pipRatio) {
+            "3:2" -> 1
+            "4:3" -> 2
+            "1:1" -> 3
+            else -> 0 // 16:10
+        }
+        return HostSession.LayoutState(
+            kind = cfg.kind.ordinal,
+            fractionPermille = (cfg.fraction * 10_000f).toInt(),
+            sideLeft = cfg.sideLeft,
+            pipRatio = ratio,
+            pipCustomW = cfg.pipCustomW,
+            pipCustomH = cfg.pipCustomH,
+            displayLongEdge = cfg.displayLongEdge,
+            pipLeft = pipLeft,
+            pipTop = pipTop
+        )
+    }
+
+    /** 仅用于 Host 识别出“同一平板但已卸载重装”的一次性恢复。 */
+    private fun restoreLayoutFromHost(state: HostSession.LayoutState) {
+        val kind = LayoutKind.values().getOrElse(state.kind) { LayoutKind.SINGLE }
+        val ratio = listOf("16:10", "3:2", "4:3", "1:1").getOrElse(state.pipRatio) { "16:10" }
+        layoutConfig = LayoutConfig(
+            kind = kind,
+            fraction = (state.fractionPermille / 10_000f).coerceIn(0.2f, 0.8f),
+            sideLeft = state.sideLeft,
+            pipRatio = ratio,
+            pipCustomW = state.pipCustomW,
+            pipCustomH = state.pipCustomH,
+            displayLongEdge = state.displayLongEdge.takeIf { it in listOf(1440, 1600, 1920, 2240) } ?: 0
+        )
+        pipLeft = state.pipLeft
+        pipTop = state.pipTop
+        saveLayoutConfig(layoutConfig)
+        updateConfigButton()
+        updateOverlay()
+        // UDP 不保证这个恢复包一定先于 DISPLAYS 到达。若默认单屏视图已经建好，
+        // 在这里按刚恢复的布局补齐订阅与区域，避免 Host 虽复用了双屏而平板只显示一块。
+        val desiredIds = displays.take(requestedDisplaySpecs().size).map { it.id }
+        if (desiredIds.isNotEmpty() && desiredIds != subscribedIds) {
+            subscribedIds = desiredIds
+            resetPipelines()
+            rebuildRegionViews()
+            if (desiredIds.size == 1) session?.selectDisplay(desiredIds.first())
+            else session?.sendSubscribeDisplays(desiredIds)
+            desiredIds.forEach { session?.requestKeyframe(it) }
+        }
+    }
     private var subscribedIds = listOf<Int>()
     private var displays: List<HostSession.DisplayInfo> = emptyList()
     private var configButton: TextView? = null
@@ -530,7 +581,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         if (isSwitch) scheduleSwitchingBanner()
         val code = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
         val deviceId = HostSession.loadOrCreateDeviceId(this)
-        val s = HostSession.create(host, port, sessionListener, code, deviceId, requestedDisplaySpecs(), network)
+        val deviceFingerprint = HostSession.loadDeviceFingerprint(this)
+        val s = HostSession.create(host, port, sessionListener, code, deviceId, deviceFingerprint,
+            requestedDisplaySpecs(), layoutStateForHost(layoutConfig), network)
         if (s == null) {
             showConnectView()
             statusText.text = "无法解析地址（仅支持数字 IPv4）"
@@ -998,6 +1051,14 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     }
                 }
                 updateConfigButton()
+            }
+        }
+
+        override fun onSavedLayout(layout: HostSession.LayoutState) {
+            mainHandler.post {
+                // Host 只在“指纹命中、安装内 ID 已变化”时发这个包。它比显示列表先发；
+                // 即便 UDP 极端乱序，后续 onDisplays 也会按新布局重新选择完整屏组。
+                restoreLayoutFromHost(layout)
             }
         }
 

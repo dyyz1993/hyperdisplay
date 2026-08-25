@@ -167,6 +167,13 @@ private struct DeviceScreenPlacement: Codable, Equatable {
     let y: Int32
 }
 
+private struct CanonicalDeviceIdentity {
+    let deviceId: UInt32
+    /// true 仅代表“指纹已有归属、这次安装内随机 ID 已变”，不能用 Android 的
+    /// 单屏默认值覆盖 Host 已保存的多屏档案和布局。
+    let restoredAfterReinstall: Bool
+}
+
 /// 一次设备拓扑变更的不可分割事务。CGVirtualDisplay 的注销是异步的：Swift/ObjC 已经
 /// 释放对象，并不代表 WindowServer/ScreenCaptureKit 已停止枚举它。因此同一时刻全局只
 /// 允许一个事务，且每块屏都要「出现 → 健康沉降」后才创建下一块。
@@ -706,6 +713,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
     private var displaySerial = 0
     /// 设备档案：一台平板可有一块默认屏或一组分屏；同时缓存在内存和 UserDefaults。
     private var deviceProfiles: [UInt32: [DeviceScreenProfile]] = [:]
+    /// 平板发送的是不可逆的系统指纹，绝不落盘原始 Android ID。这个映射让卸载重装
+    /// 后新生成的会话 ID 继续归属于同一份档案/EDID/桌面坐标。
+    private var deviceFingerprintMappings: [String: UInt32] = [:]
     /// 仅在建/销显示器或正常退出时读写；日常串流完全不访问磁盘。
     private var devicePlacements: [UInt32: [DeviceScreenPlacement]] = [:]
     /// 显示器拓扑不是网络包的同步副作用。HELLO/断线/改布局只更新期望状态，实际
@@ -880,6 +890,52 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     private func placementDefaultsKey(_ deviceId: UInt32) -> String {
         "hyperdisplay.devicePlacements.\(deviceId)"
+    }
+
+    private func layoutDefaultsKey(_ deviceId: UInt32) -> String {
+        "hyperdisplay.deviceLayout.\(deviceId)"
+    }
+
+    private var deviceFingerprintDefaultsKey: String { "hyperdisplay.deviceFingerprintMappings.v1" }
+
+    private func deviceFingerprintKey(_ fingerprint: UInt64) -> String {
+        String(format: "%016llx", fingerprint)
+    }
+
+    private func loadDeviceFingerprintMappingsIfNeeded() {
+        guard deviceFingerprintMappings.isEmpty else { return }
+        guard let data = UserDefaults.standard.data(forKey: deviceFingerprintDefaultsKey),
+              let saved = try? JSONDecoder().decode([String: UInt32].self, from: data) else { return }
+        deviceFingerprintMappings = saved
+    }
+
+    /// 将临时安装 ID 解析为 Host 侧的规范设备身份。指纹仅用于本地查表，绝不参与
+    /// EDID 或日志；最终的 EDID 仍由稳定 canonical ID 决定。
+    private func canonicalDeviceIdentity(claimedId: UInt32, fingerprint: UInt64) -> CanonicalDeviceIdentity {
+        guard claimedId != 0, fingerprint != 0 else {
+            return CanonicalDeviceIdentity(deviceId: claimedId, restoredAfterReinstall: false)
+        }
+        loadDeviceFingerprintMappingsIfNeeded()
+        let key = deviceFingerprintKey(fingerprint)
+        if let canonical = deviceFingerprintMappings[key] {
+            return CanonicalDeviceIdentity(deviceId: canonical, restoredAfterReinstall: canonical != claimedId)
+        }
+        deviceFingerprintMappings[key] = claimedId
+        if let data = try? JSONEncoder().encode(deviceFingerprintMappings) {
+            UserDefaults.standard.set(data, forKey: deviceFingerprintDefaultsKey)
+        }
+        NSLog("[hyperdisplay] registered stable device identity for existing display profile")
+        return CanonicalDeviceIdentity(deviceId: claimedId, restoredAfterReinstall: false)
+    }
+
+    private func loadDeviceLayout(_ deviceId: UInt32) -> DeviceLayoutState? {
+        guard let data = UserDefaults.standard.data(forKey: layoutDefaultsKey(deviceId)) else { return nil }
+        return try? JSONDecoder().decode(DeviceLayoutState.self, from: data)
+    }
+
+    private func saveDeviceLayout(_ deviceId: UInt32, _ layout: DeviceLayoutState) {
+        guard let data = try? JSONEncoder().encode(layout) else { return }
+        UserDefaults.standard.set(data, forKey: layoutDefaultsKey(deviceId))
     }
 
     private func loadDevicePlacements(_ deviceId: UInt32) -> [DeviceScreenPlacement] {
@@ -1429,7 +1485,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
         clientsLock.unlock()
 
         switch packet {
-        case .hello(let proto, let cw, let ch, let code, let deviceId, let requestedDisplays):
+        case .hello(let proto, let cw, let ch, let code, let claimedDeviceId, let requestedDisplays, let deviceFingerprint, let layout):
             guard code == pairingCode else {
                 NSLog("[hyperdisplay] HELLO from \(addressString(addr)) REJECTED (bad pairing code)")
                 return
@@ -1442,12 +1498,15 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 udp?.send(to: &a, Wire.pong(seq: 0, known: false))
                 return
             }
+            let identity = canonicalDeviceIdentity(claimedId: claimedDeviceId, fingerprint: deviceFingerprint)
+            let deviceId = identity.deviceId
             currentDeviceId = deviceId
             // 每个 HELLO 携带该平板上次保存的目标屏幕组。首次只带当前平板尺寸，
             // Host 因此直接建一块默认屏；之后若用户选过分屏，则一次复建完整两块/多块。
             if deviceId != 0 {
+                if !identity.restoredAfterReinstall, let layout { saveDeviceLayout(deviceId, layout) }
                 let profiles = deviceProfiles(deviceId: deviceId, clientWidth: cw, clientHeight: ch,
-                                              requested: requestedDisplays)
+                                              requested: identity.restoredAfterReinstall ? [] : requestedDisplays)
                 reconcileDeviceDisplays(deviceId: deviceId, profiles: profiles)
             }
             // 目标屏：档案屏优先（剪枝后重入会也能回到自己的屏——setSubscriptions 对
@@ -1463,6 +1522,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
             clientsLock.lock()
             clients[key] = Client(addr: addr, deviceId: deviceId, displayIds: targets, lastSeen: Date())
             clientsLock.unlock()
+            if identity.restoredAfterReinstall, let savedLayout = loadDeviceLayout(deviceId) {
+                var target = addr
+                udp?.send(to: &target, Wire.savedLayout(savedLayout))
+                NSLog("[hyperdisplay] restored remembered layout after client reinstall")
+            }
             NSLog("[hyperdisplay] HELLO proto=\(proto) client=\(cw)x\(ch) from \(addressString(addr))")
             pushDisplays()
             for id in targets { subscribe(key: key, displayId: id) }
@@ -1542,11 +1606,17 @@ final class HostApp: NSObject, NSApplicationDelegate {
     }
 
     private func pushDisplays() {
-        let data = Wire.displaysList(displayListEntries())
+        let entries = displayListEntries()
         clientsLock.lock()
-        let addresses = clients.values.map { $0.addr }
+        let recipients = clients.values.map { ($0.addr, $0.deviceId) }
         clientsLock.unlock()
-        for var addr in addresses {
+        for (var addr, deviceId) in recipients {
+            // 设备会话只看到自己的档案屏；这样 canonical ID 与新安装的临时 ID 不同
+            // 时，Android 也不会误把其他平板/手动屏选作“自己的第一块屏”。
+            let visible = deviceId == 0 ? entries : entries.filter { entry in
+                streams[CGDirectDisplayID(entry.id)]?.deviceId == deviceId
+            }
+            let data = Wire.displaysList(visible)
             udp?.send(to: &addr, data)
         }
     }

@@ -1,11 +1,13 @@
 package com.hyperdisplay.client
 
 import android.util.Log
+import android.provider.Settings
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -22,8 +24,12 @@ class HostSession private constructor(
     private val listener: Listener,
     private val pairingCode: Int,
     private val deviceId: Int,
+    /** 不可逆的系统设备指纹；Host 用它把卸载后的新随机 ID 归并回原有显示器档案。 */
+    private val deviceFingerprint: Long,
     /** 当前平板持久布局对应的目标副屏组；随 HELLO 发给 Host，用于零点击复建。 */
     private val requestedDisplays: List<Pair<Int, Int>>,
+    /** 由 Host 备份的跨卸载布局快照。 */
+    private val layout: LayoutState,
     private val network: android.net.Network?
 ) {
     interface Listener {
@@ -34,6 +40,8 @@ class HostSession private constructor(
         fun onConfig(displayId: Int, codec: Int, paramSets: ByteArray)
         fun onVideoFragment(displayId: Int, frameId: Int, fragIdx: Int, fragCount: Int, keyframe: Boolean, payload: ByteArray)
         fun onDisplays(displays: List<DisplayInfo>)
+        /** 卸载重装后，Host 回传该平板此前保存的布局；普通重连不会收到。 */
+        fun onSavedLayout(layout: LayoutState)
         fun onLinkEvent(connected: Boolean)
     }
 
@@ -41,10 +49,53 @@ class HostSession private constructor(
         override fun toString(): String = name
     }
 
+    /** 固定 15B 的跨端布局快照，不包含用户内容或设备原始标识。 */
+    class LayoutState(
+        val kind: Int = 0,
+        val fractionPermille: Int = 5000,
+        val sideLeft: Boolean = false,
+        val pipRatio: Int = 0,
+        val pipCustomW: Int = 0,
+        val pipCustomH: Int = 0,
+        val displayLongEdge: Int = 0,
+        val pipLeft: Int = -1,
+        val pipTop: Int = -1
+    ) {
+        fun writeTo(out: ByteBuffer) {
+            out.put(kind.coerceIn(0, 4).toByte())
+            out.putShort(fractionPermille.coerceIn(2000, 8000).toShort())
+            out.put(if (sideLeft) 1 else 0)
+            out.put(pipRatio.coerceIn(0, 3).toByte())
+            out.putShort(pipCustomW.coerceIn(0, 16_368).toShort())
+            out.putShort(pipCustomH.coerceIn(0, 16_368).toShort())
+            out.putShort(displayLongEdge.coerceIn(0, 16_368).toShort())
+            out.putShort(pipLeft.coerceIn(-1, 16_368).toShort())
+            out.putShort(pipTop.coerceIn(-1, 16_368).toShort())
+        }
+
+        companion object {
+            const val WIRE_BYTES = 15
+            fun readFrom(buf: ByteBuffer, offset: Int): LayoutState = LayoutState(
+                kind = buf.get(offset).toInt() and 0xFF,
+                fractionPermille = buf.getShort(offset + 1).toInt() and 0xFFFF,
+                sideLeft = (buf.get(offset + 3).toInt() and 1) != 0,
+                pipRatio = buf.get(offset + 4).toInt() and 0xFF,
+                pipCustomW = buf.getShort(offset + 5).toInt() and 0xFFFF,
+                pipCustomH = buf.getShort(offset + 7).toInt() and 0xFFFF,
+                displayLongEdge = buf.getShort(offset + 9).toInt() and 0xFFFF,
+                pipLeft = buf.getShort(offset + 11).toInt(),
+                pipTop = buf.getShort(offset + 13).toInt()
+            )
+        }
+    }
+
     companion object {
         private const val TAG = "HostSession"
 
-        /** 设备指纹：安装后恒定（host 据此复建同一块屏） */
+        /**
+         * 旧版安装内的设备 ID。保留已存值以保证普通升级绝不改 EDID；新安装时只是
+         * 本地会话编号，跨卸载的身份由 [loadDeviceFingerprint] 负责。
+         */
         fun loadOrCreateDeviceId(ctx: android.content.Context): Int {
             val prefs = ctx.getSharedPreferences("hyperdisplay", android.content.Context.MODE_PRIVATE)
             var id = prefs.getInt("deviceId", 0)
@@ -54,6 +105,22 @@ class HostSession private constructor(
             }
             return id
         }
+
+        /**
+         * Android ID 会随「设备 + 用户 + 签名证书」保持稳定，且不需要任何敏感权限。
+         * 只取 SHA-256 的前 64 位发送给已配对的 Host；原始 Android ID 从不离开平板。
+         */
+        fun loadDeviceFingerprint(ctx: android.content.Context): Long {
+            val androidId = Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ANDROID_ID)
+                ?: "unavailable"
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest("com.hyperdisplay.client/device-identity/v1:$androidId".toByteArray(Charsets.UTF_8))
+            val fingerprint = ByteBuffer.wrap(digest, 0, Long.SIZE_BYTES)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .long
+            // 0 是协议中的“旧客户端未提供指纹”保留值，极低概率碰到时改成 1。
+            return if (fingerprint == 0L) 1L else fingerprint
+        }
         private const val TYPE_WELCOME = 0x01
         private const val TYPE_VIDEO_FRAG = 0x02
         private const val TYPE_CONFIG = 0x03
@@ -62,6 +129,7 @@ class HostSession private constructor(
         private const val TYPE_DISPLAYS = 0x07
         private const val TYPE_CURSOR = 0x08
         private const val TYPE_CURSOR_IMAGE = 0x09
+        private const val TYPE_SAVED_LAYOUT = 0x0A
         private const val TYPE_HELLO = 0x10
         private const val TYPE_KEYFRAME_REQ = 0x11
         private const val TYPE_INPUT = 0x12
@@ -85,7 +153,9 @@ class HostSession private constructor(
             listener: Listener,
             code: Int = 0,
             deviceId: Int = 0,
+            deviceFingerprint: Long = 0L,
             requestedDisplays: List<Pair<Int, Int>> = emptyList(),
+            layout: LayoutState = LayoutState(),
             network: android.net.Network? = null
         ): HostSession? {
             return try {
@@ -93,7 +163,8 @@ class HostSession private constructor(
                 val parts = host.split(".").map { it.toInt() }
                 require(parts.size == 4 && parts.all { it in 0..255 })
                 val addr = InetAddress.getByAddress(parts.map { it.toByte() }.toByteArray())
-                HostSession(addr, port, listener, code, deviceId, requestedDisplays.take(4), network)
+                HostSession(addr, port, listener, code, deviceId, deviceFingerprint,
+                    requestedDisplays.take(4), layout, network)
             } catch (e: Exception) {
                 Log.e(TAG, "invalid host address: $host", e)
                 null
@@ -362,6 +433,11 @@ class HostSession private constructor(
                         }
                         if (ok) listener.onDisplays(list)
                     }
+                    TYPE_SAVED_LAYOUT -> {
+                        if (len >= 5 + LayoutState.WIRE_BYTES) {
+                            listener.onSavedLayout(LayoutState.readFrom(bb, 5))
+                        }
+                    }
                     TYPE_CURSOR -> {
                         // [displayId u16][x f32][y f32]
                         if (len >= 15) {
@@ -472,17 +548,20 @@ class HostSession private constructor(
         val metrics = android.content.res.Resources.getSystem().displayMetrics
         val w = maxOf(metrics.widthPixels, metrics.heightPixels)
         val h = minOf(metrics.widthPixels, metrics.heightPixels)
-        // [proto][w][h][code][deviceId][目标屏数][w,h]×n。目标屏组是设备档案的一部分：
+        // [proto][w][h][code][deviceId][目标屏数][w,h]×n[fingerprint u64][layout 15B]。
         // 首次默认一块平板尺寸；后续分屏/画中画则一次性让 Host 创建整组，避免先黑屏
         // 再逐块补建和错误地把它们当成新显示器。
         val specs = requestedDisplays.take(4)
-        val body = ByteBuffer.allocate(14 + specs.size * 4).order(ByteOrder.LITTLE_ENDIAN)
+        val body = ByteBuffer.allocate(14 + specs.size * 4 + Long.SIZE_BYTES + LayoutState.WIRE_BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN)
             .put(PROTO_VERSION.toByte()).putShort(w.toShort()).putShort(h.toShort())
             .putInt(pairingCode).putInt(deviceId).put(specs.size.toByte())
         for ((sw, sh) in specs) {
             body.putShort(sw.coerceIn(640, 16_368).toShort())
             body.putShort(sh.coerceIn(480, 16_368).toShort())
         }
+        body.putLong(deviceFingerprint)
+        layout.writeTo(body)
         send(buildPacket(TYPE_HELLO, 0, body.array()))
     }
 
