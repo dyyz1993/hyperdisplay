@@ -38,8 +38,8 @@ if [[ -z "$VERSION" ]]; then
     VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
 fi
 DIST="$ROOT/dist/v$VERSION"
-[[ ! -e "$DIST" ]] || fail "refusing to overwrite existing $DIST"
 mkdir -p "$DIST"
+[[ ! -e "$DIST/Hyperdisplay-macOS-arm64.dmg" ]] || fail "refusing to overwrite existing Mac DMG"
 
 # 重建后重新读取版本；并确保是 Developer ID + hardened runtime，而不是 ad-hoc。
 "$MACOS_DIR/Scripts/make-app.sh"
@@ -59,6 +59,10 @@ pushd "$ANDROID_DIR" >/dev/null
 APK="app/build/outputs/apk/release/app-release.apk"
 [[ -f "$APK" ]] || fail "signed release APK was not produced"
 APKSIGNER="$(command -v apksigner || true)"
+if [[ -z "$APKSIGNER" ]]; then
+    SDK_ROOT="$(sed -n 's|sdk.dir=||p' local.properties)"
+    APKSIGNER="$(find "$SDK_ROOT/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -n 1)"
+fi
 [[ -n "$APKSIGNER" ]] || fail "missing apksigner (install Android SDK build-tools)"
 "$APKSIGNER" verify --verbose --print-certs "$APK"
 cp "$APK" "$DIST/Hyperdisplay-android.apk"

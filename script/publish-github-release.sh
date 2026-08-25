@@ -27,6 +27,14 @@ else
   exit 1
 fi
 
+# Android 先行发布后，Mac 公证包可安全追加到同一 tag；--clobber 同时更新校验文件，
+# 不会创建第二个版本或让菜单栏的 latest 链接漂移。
+if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+  gh release upload "$TAG" "${ASSETS[@]}" --repo "$REPOSITORY" --clobber
+  echo "Updated existing release: $TAG"
+  exit 0
+fi
+
 gh release create "$TAG" \
   "${ASSETS[@]}" \
   --repo "$REPOSITORY" \

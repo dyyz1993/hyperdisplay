@@ -78,6 +78,16 @@ APK 后，按 Android 对所用浏览器或文件管理器的系统提示允许�
 构建者请使用 `script/package-release.sh`：它会拒绝未签名 APK 或未 notarize 的 Mac 包，避免把
 开发产物误上传。发布到 GitHub 的命令在 `script/publish-github-release.sh`。
 
+首次配置 Mac 直发时，运行 `script/setup-notary-profile.sh`，在终端安全提示中输入 Apple ID 与
+app-specific password；凭据会被验证并仅保存到 macOS Keychain。随后执行：
+
+```sh
+HYPERDISPLAY_NOTARY_PROFILE=HyperdisplayNotary ./script/package-release.sh
+./script/publish-github-release.sh 0.1.0
+```
+
+若 Android 已先发布，第二条命令会把已 notarize 的 Mac DMG 追加到同一个 GitHub Release。
+
 ## 里程碑
 
 | 里程碑 | 内容 | 状态 |
