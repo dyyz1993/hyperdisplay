@@ -43,8 +43,11 @@ mkdir -p "$DIST"
 
 # 重建后重新读取版本；并确保是 Developer ID + hardened runtime，而不是 ad-hoc。
 "$MACOS_DIR/Scripts/make-app.sh"
-codesign -dvv "$APP" 2>&1 | grep -q 'Authority=Developer ID Application:' || fail "Mac app is not Developer ID signed"
-codesign -dvv "$APP" 2>&1 | grep -q 'flags=.*runtime' || fail "Mac app is missing hardened runtime"
+# Do not pipe `codesign` into `grep -q` under `pipefail`: grep exits immediately
+# on a match and can make codesign report SIGPIPE as a false signing failure.
+SIGNING_INFO="$(codesign -dvv "$APP" 2>&1)"
+[[ "$SIGNING_INFO" == *"Authority=Developer ID Application:"* ]] || fail "Mac app is not Developer ID signed"
+[[ "$SIGNING_INFO" == *"runtime"* ]] || fail "Mac app is missing hardened runtime"
 
 MAC_ZIP="$DIST/Hyperdisplay-macOS-arm64.zip"
 ditto -c -k --keepParent "$APP" "$MAC_ZIP"
