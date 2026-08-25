@@ -49,6 +49,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private fun showChrome() {
         statsOverlay?.visibility = android.view.View.VISIBLE
         configButton?.visibility = android.view.View.VISIBLE
+        // 状态条自带传输明细（左上同位）：角标让位，收起后回归。
+        transportBadge?.visibility = android.view.View.GONE
         chromeHideRunnable?.let { mainHandler.removeCallbacks(it) }
         val r = Runnable { hideChrome() }
         chromeHideRunnable = r
@@ -59,6 +61,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         // 配置面板挂在 root 上的场景不隐藏（用户正在操作）——简化判定：面板类弹窗
         // 存在时 statsTick 的 6s 计时照走，但面板自身是 Dialog 生命周期不受影响
         statsOverlay?.visibility = android.view.View.GONE
+        transportBadge?.visibility = android.view.View.VISIBLE
         // ⚙ 配置必须常驻：它是分辨率、双屏和画中画唯一的显式入口。
     }
     private var sessionRoot: FrameLayout? = null
@@ -144,7 +147,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     }
     private var subscribedIds = listOf<Int>()
     private var displays: List<HostSession.DisplayInfo> = emptyList()
-    private var configButton: Button? = null
+    private var configButton: TextView? = null
+    /** 常驻传输角标（右上，与配置按钮同行）：一眼区分有线/无线。 */
+    private var transportBadge: TextView? = null
     private var localCursor: LocalCursorView? = null
     private var pipRoot: FrameLayout? = null
     private var pipLeft = -1
@@ -266,8 +271,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             } else if (s != null && linkUp && waitingForDisplay && sessionRoot != null) {
                 waitingSince = 0
                 waitingOverlay.state = WaitingOverlay.State.CONNECTED_NO_DISPLAY
-                waitingOverlay.tryingUsb = activeTransport == NsdFinder.Transport.USB
-                waitingOverlay.tryingWifi = activeTransport != NsdFinder.Transport.USB
+                waitingOverlay.tryingUsb = isWiredTransport()
+                waitingOverlay.tryingWifi = !isWiredTransport()
                 mainHandler.post { waitingOverlay.show(root) }
             } else if (s != null && sessionRoot != null) {
                 // 断链等待 >3s 且还没恢复：全屏等待页（双通道动画 + 动态文案）。
@@ -285,16 +290,22 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             // Wi-Fi 首连/Host 重启期间，HostSession 会在同一 UDP socket 上无限静默
             // 重发 HELLO。这里若每 5 秒 destroy + 重新发现，会让全屏等待页反复
             // 销毁重建（用户看到“一闪一闪”），还会把 UDP 源端口不断换掉。
-            // 只有当前已在 USB 网络上，才需要主动拆会话回退到已知 Wi-Fi 地址。
+            // 只有当前已在有线（USB 网络或 adb 隧道）上，才需要主动拆会话回退到已知
+            // Wi-Fi 地址——拔线后隧道/网卡即死，等 mDNS 重发现太慢。新会话给 3s
+            // 宽限：隧道握手 + 建屏 + 首个 PONG 需要 ~1.5s，刚切换就判死会把
+            // 升级上来的有线会话当场掐死（2026-08-25 无局域网实测：隧道↔WiFi
+            // 每 30s 震荡，视频已在流仍被杀）。
             val s1 = session
-            if (!linkUp && activeTransport == NsdFinder.Transport.USB && s1 != null && !reconnecting
+            if (!linkUp && isWiredTransport() && s1 != null && !reconnecting
+                && System.currentTimeMillis() - sessionStartedAt > 3000
                 && System.currentTimeMillis() - lastReconnectAt > 5000) {
                 mainHandler.post { scheduleSmartReconnect() }
             }
             // 会话存在时才探测更优链路：插线广播会立即触发；30 秒低频轮询只作
-            // OEM 漏广播兜底。找到同一 Mac 的 USB UDP 地址才切换，USB 会话不轮询。
+            // OEM 漏广播兜底。无线链路已死也要探——无局域网时隧道是唯一通路。
+            // 有线（USB UDP / adb 隧道）已就位时不再轮询。
             routeProbeTicks++
-            if (linkUp && activeTransport != NsdFinder.Transport.USB && routeProbeTicks >= 30) {
+            if (s1 != null && !isWiredTransport() && routeProbeTicks >= 30) {
                 routeProbeTicks = 0
                 mainHandler.post { probeForUsbUpgrade() }
             }
@@ -378,12 +389,14 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val button = Button(this).apply { text = "连接" }
         val scanButton = Button(this).apply { text = "扫码连接" }
         val findButton = Button(this).apply { text = "局域网发现" }
+        val usbButton = Button(this).apply { text = "USB 连线" }
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
         buttonRow.addView(scanButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         buttonRow.addView(findButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        buttonRow.addView(usbButton, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         statusText = TextView(this).apply {
             text = ""
             textSize = 13f
@@ -402,6 +415,18 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
         connectView = box
         hostInput = input
+
+        usbButton.setOnClickListener {
+            // 手动有线入口：完整握手探测（Mac 侧隧道在才连得上），失败给明确提示。
+            statusText.text = "正在探测 USB 有线链路（需平板开启 USB 调试）…"
+            UsbProbe.probe(this) { ok ->
+                if (ok) {
+                    connectTunnel()
+                } else {
+                    statusText.text = "USB 隧道不通：确认 Type-C 数据线已插、Mac 端 Hyperdisplay 在运行、平板 USB 调试已授权本机"
+                }
+            }
+        }
 
         button.setOnClickListener {
             // 已保存地址会自动连接；这里仅保留首次手输的兜底入口。
@@ -443,10 +468,15 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
+    /** 当前会话是否走在有线链路上（USB 网卡 UDP 或 adb TCP 隧道）。
+     *  有线 = 拔线即死要降级 Wi-Fi + 已是最优路径不再探测升级。 */
+    private fun isWiredTransport(): Boolean =
+        activeTransport == NsdFinder.Transport.USB || activeTransport == NsdFinder.Transport.TUNNEL
+
     private fun connectionPathHint(): String = if (hasUsbUdpNetwork()) {
         "USB UDP 已就绪，会优先使用；拔线后自动切回 Wi-Fi"
     } else {
-        "当前未检测到 USB 网卡，将使用 Wi-Fi；MTP 只传文件，不能传画面"
+        "插 Type-C 线走 USB 隧道（需平板开 USB 调试）；无有线时使用 Wi-Fi"
     }
 
     private fun saveCode(text: String) {
@@ -478,7 +508,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         when (e.transport) {
             NsdFinder.Transport.USB -> editor.putString("lastUsbHost", "${e.host}:${e.port}")
             NsdFinder.Transport.WIFI -> editor.putString("lastWifiHost", "${e.host}:${e.port}")
-            NsdFinder.Transport.OTHER -> Unit
+            // 隧道不经 mDNS 发现，永远不会出现在 HostEntry 里
+            NsdFinder.Transport.TUNNEL, NsdFinder.Transport.OTHER -> Unit
         }
         editor.apply()
         openSession(e.host, e.port, isSwitch, e.network, e.transport)
@@ -507,6 +538,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
         activeTransport = transport
         session = s
+        sessionStartedAt = System.currentTimeMillis()
         waitingForDisplay = false
         showSessionView()
         s.start()
@@ -570,24 +602,43 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
-    /** 智能连接：复用已保存的 UDP 主机，否则搜索局域网内的 Mac。 */
+    /** 智能连接：先探 adb 有线隧道（插线默认走有线，最快），否则复用已保存的
+     *  UDP 主机，最后搜索局域网内的 Mac。 */
     private fun smartConnect() {
-        val prefs = getPreferences(MODE_PRIVATE)
-        val saved = prefs.getString("host", null)
-        val ep = saved?.let { parseEndpoint(it) }
-        if (ep != null) {
-            statusText.text = "连接 UDP 主机：${ep.first}:${ep.second}"
-            val transport = when (saved) {
-                prefs.getString("lastUsbHost", null) -> NsdFinder.Transport.USB
-                prefs.getString("lastWifiHost", null) -> NsdFinder.Transport.WIFI
-                else -> NsdFinder.Transport.OTHER
+        statusText.text = "正在探测 USB 有线链路…"
+        UsbProbe.probe(this) { tunnelOk ->
+            if (tunnelOk && session == null && !isFinishing) {
+                connectTunnel()
+                return@probe
             }
-            openSession(ep.first, ep.second, transport = transport)
-        } else {
-            statusText.text = "无历史主机——自动搜索局域网内的 Mac…"
-            startAutoDiscovery()
+            if (session != null) return@probe // 探测期间已有会话接管
+            val prefs = getPreferences(MODE_PRIVATE)
+            val saved = prefs.getString("host", null)
+            val ep = saved?.let { parseEndpoint(it) }
+            if (ep != null && ep.first != "127.0.0.1") {
+                statusText.text = "连接 UDP 主机：${ep.first}:${ep.second}"
+                val transport = when (saved) {
+                    prefs.getString("lastUsbHost", null) -> NsdFinder.Transport.USB
+                    prefs.getString("lastWifiHost", null) -> NsdFinder.Transport.WIFI
+                    else -> NsdFinder.Transport.OTHER
+                }
+                openSession(ep.first, ep.second, transport = transport)
+            } else {
+                statusText.text = "无历史主机——自动搜索局域网内的 Mac…"
+                startAutoDiscovery()
+            }
         }
     }
+
+    /** 走 adb 有线隧道（TCP 127.0.0.1:5280，AGENTS.md §1 有线例外）。
+     *  不写入 host/lastWifiHost 偏好——隧道总是活体探测，不该被当成 UDP 地址复用。 */
+    private fun connectTunnel(isSwitch: Boolean = false) {
+        Log.i(TAG, "connecting via adb USB tunnel (127.0.0.1:5280)")
+        openSession("127.0.0.1", 5280, isSwitch, transport = NsdFinder.Transport.TUNNEL)
+    }
+
+    /** 当前会话建立时刻：死链重连的宽限基准（握手+建屏+首 PONG ~1.5s）。 */
+    @Volatile private var sessionStartedAt = 0L
 
     /** 自动重连 UDP 主机。 */
     private var lastReconnectAt = 0L
@@ -600,15 +651,25 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             reconnecting = false
             val prefs = getPreferences(MODE_PRIVATE)
             val wifi = prefs.getString("lastWifiHost", null)?.let { parseEndpoint(it) }
-            if (activeTransport == NsdFinder.Transport.USB && wifi != null) {
-                // USB 拔线：优先用已经验证过的 Wi-Fi 地址，不等一轮发现。
+            if (isWiredTransport() && wifi != null) {
+                // 拔线（USB 网卡或 adb 隧道断）：优先用已经验证过的 Wi-Fi 地址，
+                // 不等一轮发现。
                 openSession(wifi.first, wifi.second, isSwitch = true,
                     transport = NsdFinder.Transport.WIFI)
             } else {
                 // 地址失效或网络切换：mDNS 同时覆盖 Wi-Fi 与 USB 网络共享。
-                disconnectSession()
-                showConnectView()
-                startAutoDiscovery()
+                // 没有可用 Wi-Fi（无局域网场景）时回到 smart——它会持续探隧道。
+                val hasWifiFallback = wifi != null ||
+                    (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).activeNetwork != null
+                if (hasWifiFallback) {
+                    disconnectSession()
+                    showConnectView()
+                    startAutoDiscovery()
+                } else {
+                    disconnectSession()
+                    showConnectView()
+                    smartConnect()
+                }
             }
         }, 400)
     }
@@ -651,32 +712,42 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private val routeFinder by lazy { NsdFinder(this) }
     private var discoveryDialog: android.app.AlertDialog? = null
 
-    /** 已连接 Wi-Fi 时只寻找同一配对码的 USB UDP 端点；不会碰当前会话，
-     *  直到候选明确解析为 TRANSPORT_USB 才切换。 */
+    /** 已连接时探测更优链路：adb 隧道（快，毫秒级握手）优先；隧道不在再找同一
+     *  配对码的 USB UDP 端点（RNDIS/NCM 网卡）。不碰当前会话，确认可用才切换。
+     *  无线链路已死时同样要走这里——无局域网场景下 tunnel 是唯一出路。 */
     private fun probeForUsbUpgrade() {
-        if (routeProbeActive || activeTransport == NsdFinder.Transport.USB || !linkUp) return
+        if (routeProbeActive || isWiredTransport()) return
         routeProbeActive = true
-        val expectedCode = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
-        routeFinder.setCallbacks(
-            onStart = { },
-            onHost = { e ->
-                val sameHost = expectedCode == 0 || e.code == expectedCode
-                if (routeProbeActive && sameHost && e.transport == NsdFinder.Transport.USB) {
+        UsbProbe.probe(this) { tunnelOk ->
+            if (!routeProbeActive) return@probe // 期间已被别的路径接管/取消
+            if (tunnelOk) {
+                routeProbeActive = false
+                Log.i(TAG, "adb tunnel alive; upgrading to wired")
+                connectTunnel(isSwitch = true)
+                return@probe
+            }
+            val expectedCode = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
+            routeFinder.setCallbacks(
+                onStart = { },
+                onHost = { e ->
+                    val sameHost = expectedCode == 0 || e.code == expectedCode
+                    if (routeProbeActive && sameHost && e.transport == NsdFinder.Transport.USB) {
+                        routeProbeActive = false
+                        routeFinder.stopDiscovery()
+                        Log.i(TAG, "USB UDP endpoint discovered: ${e.host}:${e.port}; upgrading")
+                        connectEntry(e, isSwitch = true)
+                    }
+                },
+                onStop = { }
+            )
+            routeFinder.startDiscovery()
+            mainHandler.postDelayed({
+                if (routeProbeActive) {
                     routeProbeActive = false
                     routeFinder.stopDiscovery()
-                    Log.i(TAG, "USB UDP endpoint discovered: ${e.host}:${e.port}; upgrading")
-                    connectEntry(e, isSwitch = true)
                 }
-            },
-            onStop = { }
-        )
-        routeFinder.startDiscovery()
-        mainHandler.postDelayed({
-            if (routeProbeActive) {
-                routeProbeActive = false
-                routeFinder.stopDiscovery()
-            }
-        }, 2500)
+            }, 2500)
+        }
     }
 
     private fun showDiscoveryDialog() {
@@ -728,7 +799,19 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         // 并在组内选 USB。不能因此误判成“多主机”要求用户点选。
         val hosts = endpoints.groupBy { if (it.code != 0) "code:${it.code}" else "name:${it.name}" }
         when (hosts.size) {
-            0 -> mainHandler.postDelayed(autoDiscoveryTick, 1200) // host 未上线：继续等
+            0 -> {
+                // host 未上线：继续等。同时探 adb 隧道——无局域网场景 mDNS 永远
+                // 空手而归，隧道（host 侧 adb 轮询注册 reverse 可能慢插线几秒）
+                // 是唯一出路，每轮顺带探一次，就绪即连。
+                UsbProbe.probe(this) { tunnelOk ->
+                    if (tunnelOk && autoDiscoveryArmed && !isFinishing) {
+                        autoDiscoveryArmed = false
+                        nsdFinder.stopDiscovery()
+                        connectTunnel()
+                    }
+                }
+                mainHandler.postDelayed(autoDiscoveryTick, 1200)
+            }
             1 -> {
                 autoDiscoveryArmed = false
                 nsdFinder.stopDiscovery()
@@ -736,7 +819,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     when (it.transport) {
                         NsdFinder.Transport.USB -> 0
                         NsdFinder.Transport.WIFI -> 1
-                        NsdFinder.Transport.OTHER -> 2
+                        NsdFinder.Transport.TUNNEL, NsdFinder.Transport.OTHER -> 2
                     }
                 } ?: return
                 statusText.text = "发现 ${e.name}（${e.host}），自动连接…"
@@ -759,6 +842,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 val tr = when (it.transport) {
                     NsdFinder.Transport.USB -> "USB"
                     NsdFinder.Transport.WIFI -> "Wi-Fi"
+                    NsdFinder.Transport.TUNNEL -> "有线"
                     NsdFinder.Transport.OTHER -> "UDP"
                 }
                 "${it.name} · $tr\n${it.host}:${it.port}"
@@ -1037,19 +1121,47 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START))
         statsOverlay = overlay
 
-        val cfgBtn = Button(this).apply {
-            text = "⚙ 配置"
-            textSize = 12f
+        // 配置入口：纯图标小药丸（无文字，占地最小），样式与左上传输角标同族。
+        val cfgBtn = TextView(this).apply {
+            text = "⚙"
+            textSize = 14f
             setTextColor(Color.WHITE)
-            setBackgroundColor(0x99000000.toInt())
-            setPadding(16, 8, 16, 8)
-            isAllCaps = false
+            setPadding(11, 4, 11, 6)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0x99000000.toInt())
+                cornerRadius = 18f
+            }
             contentDescription = "屏幕配置：分辨率、双屏、画中画"
             setOnClickListener { showConfigPanel() }
         }
-        root.addView(cfgBtn, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END))
+        val cfgLp = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.END)
+        cfgLp.marginEnd = 12
+        cfgLp.topMargin = 10
+        root.addView(cfgBtn, cfgLp)
         configButton = cfgBtn
+
+        // 传输角标：左上角常驻小药丸（USB=绿 / Wi-Fi=蓝，断链降透明度）。
+        // 统计条（同在左上、含传输明细）呼出期间隐藏，避免重叠。
+        val badge = TextView(this).apply {
+            text = ""
+            textSize = 10f
+            setTypeface(Typeface.DEFAULT_BOLD)
+            setTextColor(Color.WHITE)
+            setPadding(14, 5, 14, 5)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0x99000000.toInt())
+                cornerRadius = 18f
+            }
+        }
+        val badgeLp = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.START)
+        badgeLp.marginStart = 12
+        badgeLp.topMargin = 10
+        root.addView(badge, badgeLp)
+        transportBadge = badge
 
         // 统计条默认隐藏；右上角配置常驻。顶部中央小把手只负责临时显示统计信息。
         overlay.visibility = android.view.View.GONE
@@ -1730,8 +1842,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     private fun updateConfigButton() {
         val button = configButton ?: return
-        button.text = "⚙ " + layoutConfig.kind.label +
-            (if (subscribedIds.size > 1) "·" + subscribedIds.size + "屏" else "")
+        // 纯图标不占版面；布局状态进无障碍描述，明细仍在统计条/配置面板里。
+        button.contentDescription = "屏幕配置：" + layoutConfig.kind.label +
+            (if (subscribedIds.size > 1) "，${subscribedIds.size} 屏" else "")
     }
 
     // MARK: 触摸 → 输入（按区域路由）
@@ -1823,6 +1936,24 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     // MARK: 状态
 
     private fun updateOverlay() {
+        // 传输角标独立于统计条更新（统计条默认隐藏，角标常驻）
+        transportBadge?.let { b ->
+            when {
+                isWiredTransport() -> {
+                    b.text = "⚡USB"
+                    b.setTextColor(0xFF6CE86C.toInt())
+                }
+                activeTransport == NsdFinder.Transport.WIFI -> {
+                    b.text = "📶Wi-Fi"
+                    b.setTextColor(0xFF6CB6FF.toInt())
+                }
+                else -> {
+                    b.text = "·UDP"
+                    b.setTextColor(Color.WHITE)
+                }
+            }
+            b.alpha = if (linkUp) 1f else 0.45f
+        }
         val overlay = statsOverlay ?: return
         val link = if (linkUp) "链路 OK" else "等待主机…"
         val screens = if (subscribedIds.size > 1) {
@@ -1834,6 +1965,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val tr = when (activeTransport) {
             NsdFinder.Transport.USB -> "USB·UDP"
             NsdFinder.Transport.WIFI -> "Wi-Fi·UDP"
+            NsdFinder.Transport.TUNNEL -> "USB·有线"
             NsdFinder.Transport.OTHER -> "UDP"
         }
         // 窗口模式提示（系统分屏等）：app 窗口明显小于物理屏时，流被缩小渲染、
@@ -1879,6 +2011,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val transport = when (activeTransport) {
                 NsdFinder.Transport.USB -> "usb-udp"
                 NsdFinder.Transport.WIFI -> "wifi-udp"
+                NsdFinder.Transport.TUNNEL -> "usb-tunnel"
                 NsdFinder.Transport.OTHER -> "udp"
             }
             val text = "link=$link transport=$transport fps=$renderFps cpu=${String.format(java.util.Locale.US, "%.1f", appCpuPercent)} memory_mb=$appMemoryMB layout=${layoutConfig.kind} subs=${subscribedIds.joinToString()} pipelines=$pips\n"
@@ -1910,6 +2043,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         renderFps = 0
         statsOverlay = null
         configButton = null
+        transportBadge = null
         localCursor = null
         pipRoot = null
         displays = emptyList()
@@ -1950,12 +2084,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 插线只触发重新探测；MTP 不会被误当成网络。系统有 USB/RNDIS 网卡才升级，
-        // 否则保留 Wi-Fi UDP，不会把实时流量降级到 TCP。
+        // 插线（POWER_CONNECTED）：前台已运行只做升级探测（含 adb 隧道）；断连状态
+        // 直接走 smart——隧道优先、无隧道回 Wi-Fi 历史/发现。
         UsbPlugReceiver.onPlugged = {
             mainHandler.post {
                 if (session == null) {
-                    startAutoDiscovery()
+                    smartConnect()
                 } else {
                     probeForUsbUpgrade()
                 }

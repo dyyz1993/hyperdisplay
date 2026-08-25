@@ -2,10 +2,18 @@
 
 > 所有 agent（含 AI 编程助手）在本仓库工作时的强制约束。
 
-## 1. 实时负载一律 UDP
+## 1. 实时负载一律 UDP（有线 adb 隧道是唯一例外）
 
-视频帧、输入事件一律走 UDP。禁止 TCP socket / WebSocket / TURN-TCP 承载任何实时负载。
-没有可用 UDP 路径时必须显式报错，不得静默降级。
+视频帧、输入事件一律走 UDP。任何**网络路径**（Wi-Fi、USB 网络共享/RNDIS/NCM 网卡）
+上禁止 TCP socket / WebSocket / TURN-TCP 承载实时负载——无线丢包会放大为队头阻塞，
+TCP 拥塞控制会误杀码率。
+
+**唯一例外（2026-08-25 用户定稿）：Type-C 有线 adb reverse 隧道允许 TCP。**
+该路径为 host 内置的 `UsbTunnelController`（TCP 127.0.0.1:5280 ↔ UDP host，帧格式
+`[len u32][payload]`），平板端 USB 调试授权后插线即用。理由：有线无损，TCP 无丢包
+重传与拥塞惩罚（2026-08-20 实测隧道 RTT 0.16ms，优于直连 UDP；干净系统 17-40fps
+无尖刺），且不依赖局域网。此例外仅限这条内置隧道，不得扩散到任何网络路径。
+没有可用 UDP 路径、隧道也不通时必须显式提示，不得静默降级到其他 TCP 形式。
 
 ## 2. 通道分离（均在 UDP 之上）
 

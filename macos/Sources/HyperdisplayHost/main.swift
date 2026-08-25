@@ -428,9 +428,13 @@ final class DisplayStream {
                     ? useconds_t(framePacingUs / fragCount)
                     : 0
                 for var addr in addresses {
+                    // USB 隧道客户端（127.0.0.1，经 UsbTunnelController 桥接）：跳过
+                    // usleep 节流——有线无损，节流只在编码回调/发送队列上白阻塞加延迟；
+                    // Wi-Fi 才需要防突发打爆接收缓冲。
+                    let isTunnel = addr.sin_addr.s_addr == INADDR_LOOPBACK.bigEndian
                     self.udp.enqueueVideoFrame(streamId: UInt32(self.display.displayID), to: addr,
                                                fragments: frags, keyframe: keyframe,
-                                               perFragmentDelay: perFragDelay)
+                                               perFragmentDelay: isTunnel ? 0 : perFragDelay)
                 }
             }
         )
@@ -678,6 +682,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
     private var statusBarIcon: NSImage?
 
     private var udp: UdpHost?
+    /// USB 隧道桥 + adb reverse 轮询（AGENTS.md §1 有线例外：TCP 仅限此路径）
+    private let usbTunnel = UsbTunnelController()
     /// streams/displayOrder 只在主线程写；锁仅为 UDP 接收线程的高频包路径提供
     /// 一致性快照读（ping/nack/input 在接收线程直接处理，避免逐包 async 主线程
     /// ——那会在包洪峰下把 RunLoop Timer 全部饿死：tick/哨兵停摆、进程"假死"，
@@ -851,6 +857,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
             let hostName = Host.current().localizedName ?? "Mac"
             _ = bonjour.start(name: "Hyperdisplay (\(hostName))", port: udp.port,
                               txt: ["code": String(pairingCode)])
+            // USB 隧道桥 + adb reverse 轮询（零点击：插线即用，AGENTS.md §7.1）。
+            // adb 不存在时只打一条日志——Wi-Fi 路径完全不受影响。
+            usbTunnel.onDeviceCountChange = { [weak self] in self?.rebuildMenu() }
+            usbTunnel.start(udpPort: udp.port)
             NSLog("[hyperdisplay] host listening on UDP \(udp.port); \(streams.count) virtual display(s)")
         } catch {
             NSLog("[hyperdisplay] \(error)")
@@ -1424,6 +1434,14 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 NSLog("[hyperdisplay] HELLO from \(addressString(addr)) REJECTED (bad pairing code)")
                 return
             }
+            if proto == 0xFF {
+                // 探针 HELLO（UsbProbe 链路检测）：只回声不注册——注册会订阅屏，
+                // 周期性充电探测会把闲置回收卡死（显示永远"有人订着"）。
+                // 放在配对码校验之后：错误码的探针拿不到回声，客户端探测如实失败。
+                var a = addr
+                udp?.send(to: &a, Wire.pong(seq: 0, known: false))
+                return
+            }
             currentDeviceId = deviceId
             // 每个 HELLO 携带该平板上次保存的目标屏幕组。首次只带当前平板尺寸，
             // Host 因此直接建一块默认屏；之后若用户选过分屏，则一次复建完整两块/多块。
@@ -1885,7 +1903,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
         for line in Self.allInterfaceAddresses(port: Int(port)) {
             menu.addItem(withTitle: "  \(line)", action: nil, keyEquivalent: "")
         }
-        menu.addItem(withTitle: "USB：仅支持 USB 网络共享上的 UDP（不使用 TCP/adb 隧道）", action: nil, keyEquivalent: "")
+        if usbTunnel.adbAvailable {
+            menu.addItem(withTitle: "USB 隧道 :\(UsbTunnelController.tcpPort)（\(usbTunnel.deviceCount) 台设备已配 reverse）", action: nil, keyEquivalent: "")
+        } else {
+            menu.addItem(withTitle: "USB 隧道不可用（未找到 adb，装 platform-tools 或放 PATH）", action: nil, keyEquivalent: "")
+        }
         // 显示器卫生状态行（DisplayHealth 哨兵，三级）
         if let cpu = displayHealth.lastColorSyncCPU {
             let mark: String
@@ -1991,6 +2013,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         bonjour.stop()
+        usbTunnel.stop()
         for deviceId in Set(streams.values.compactMap(\.deviceId)) {
             snapshotDevicePlacements(deviceId: deviceId)
         }

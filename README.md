@@ -20,11 +20,14 @@ ScreenCaptureKit 采集 → VideoToolbox HEVC 编码 → 局域网 UDP 推流到
 
 ## 当前功能（M1–M4）
 
-- 局域网 Wi-Fi 与 **USB 连线（仅限系统提供 USB/RNDIS 网卡的设备）** 双通道——实时负载
-  始终为 UDP，不使用 TCP/adb 隧道。Android 同时发现同一 Mac 的多网络端点，USB 网卡
-  可用时优先，拔线自动回退已保存的 Wi-Fi。MTP/PTP/HiSuite 只传文件或设备管理数据，
-  不会被误认为网络；实测华为 DBY2-W00（Wi-Fi 版）没有 USB 网络共享入口，因此该机型
-  当前走 Wi-Fi。
+- 局域网 Wi-Fi 与 **USB 有线（Type-C）** 双通道。有线有两条路径，自动择优：
+  1. **adb 隧道**（多数设备）：平板开启 USB 调试并授权后，插线即用——host 内置
+     `UsbTunnelController` 桥接 TCP↔UDP，**无需局域网**（无路由器/酒店环境可用），
+     边用边充电；有线无损，实测 RTT 0.16ms 优于 Wi-Fi。
+  2. **USB 网络共享**（系统提供 RNDIS/NCM 网卡的设备）：原生 UDP 路径。
+  插线默认走有线，拔线自动回退已保存的 Wi-Fi，恢复插线自动升回。MTP/PTP/HiSuite
+  只是文件/设备管理协议，不会被误认为网络；华为 DBY2-W00（Wi-Fi 版）无 USB 网络
+  共享入口，走 adb 隧道路径。
 - **零点击恢复**：Android 保存主机、设备身份、布局和画中画参数；同一设备以固定 EDID
   `(vendor, product, serial)` 恢复相同屏幕槽位。后台/退出即视为拔线，Host 立即移除该设备
   的虚拟屏；USB/Wi-Fi 换路由则静默重连并复用屏幕身份。无客户端时没有虚拟屏、采集或编码。
@@ -93,7 +96,7 @@ HYPERDISPLAY_NOTARY_PROFILE=HyperdisplayNotary ./script/package-release.sh
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | M1 | 手动 IP 连接 + 扩展屏串流 | ✅ 完成 |
-| M2 | 多虚拟屏 + 局域网/USB 网络共享 UDP 双通道 | Wi-Fi 已完成；USB 实现完成，待支持 RNDIS 的平板真机验证（DBY2-W00 不支持） |
+| M2 | 多虚拟屏 + 局域网/USB 双通道 | Wi-Fi 已完成；adb 有线隧道 2026-08-25 真机验证通过（无局域网 3s 内出画面、动画 29-34fps 无尖刺）；USB 网络共享 UDP 路径待支持 RNDIS 的设备验证 |
 | M3 | 局域网发现 + 扫码 + 关键帧 NACK | ✅ 完成（配对码并入后续） |
 | M4 | 平板分屏多路显示（区域像素 1:1） | ✅ 完成（真机 2 屏并发 51fps） |
 | M5 | 配对码 + 质量档 UI + 旋转重建 + 自适应码率 + 四分屏/缩略图 | 未开始 |

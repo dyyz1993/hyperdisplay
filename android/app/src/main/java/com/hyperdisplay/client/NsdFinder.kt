@@ -22,7 +22,9 @@ class NsdFinder(context: Context) {
         private const val SERVICE_TYPE = "_hyperdisplay._udp."
     }
 
-    enum class Transport { USB, WIFI, OTHER }
+    /** TUNNEL = adb 有线隧道（TCP 127.0.0.1:5280，AGENTS.md §1 有线例外），
+     *  不经 mDNS 发现——UsbProbe 握手探测，链路本身不依赖局域网。 */
+    enum class Transport { USB, WIFI, TUNNEL, OTHER }
 
     class HostEntry(
         val name: String,

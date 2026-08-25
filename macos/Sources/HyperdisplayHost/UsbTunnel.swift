@@ -199,19 +199,23 @@ final class UsbTunnelController {
         DispatchQueue.global(qos: .utility).async { self.registerReverse() }
     }
 
-    /// 已注册 reverse 的 serial 集合：不变时跳过 reverse 调用（每 5s 一次的
-    /// adb reverse fork 是纯浪费——reverse 只需在新 serial 出现时注册；设备重插
-    /// 后 serial 不变但 reverse 失效的场景由隧道探测失败→客户端重连路径兜底）
-    private var registeredSerials: Set<String> = []
-
+    /// reverse 注册核对：不能只看 serial 集合——设备重枚举、WiFi-adb 掉线都会
+    /// 清空已注册的 reverse 而 serial 不变（2026-08-25 无局域网实测：禁 WiFi 后
+    /// reverse 悄悄消失，"serial 在场就跳过"的旧优化导致永不重注册 → 平板探测
+    /// 永远失败）。每轮用 `reverse --list` 核对，缺失才注册；有设备时 5s 一次的
+    /// 小额 fork 可接受（无设备时 60s 退避不变，AGENTS §7.1）。
     private func registerReverse() {
-        guard let serials = Self.onlineDeviceSerials(adbPath: Self.locateAdb() ?? "") else { return }
-        let newSerials = serials.filter { !registeredSerials.contains($0) }
-        for sn in newSerials {
-            _ = Self.run(adbPath: Self.locateAdb() ?? "",
-                         args: ["-s", sn, "reverse", "tcp:\(Self.tcpPort)", "tcp:\(Self.tcpPort)"])
+        guard let adbPath = Self.locateAdb() else { return }
+        guard let serials = Self.onlineDeviceSerials(adbPath: adbPath) else { return }
+        for sn in serials {
+            let installed = (Self.run(adbPath: adbPath, args: ["-s", sn, "reverse", "--list"]) ?? "")
+                .contains("tcp:\(Self.tcpPort)")
+            if !installed {
+                _ = Self.run(adbPath: adbPath,
+                             args: ["-s", sn, "reverse", "tcp:\(Self.tcpPort)", "tcp:\(Self.tcpPort)"])
+                NSLog("[hyperdisplay] USB tunnel: re-registered reverse for %@", sn)
+            }
         }
-        registeredSerials = Set(serials)
         if serials.count != deviceCount {
             deviceCount = serials.count
             DispatchQueue.main.async { [weak self] in self?.onDeviceCountChange?() }
