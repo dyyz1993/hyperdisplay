@@ -11,13 +11,26 @@ NOTARY_PROFILE="${HYPERDISPLAY_NOTARY_PROFILE:-}"
 fail() { echo "release error: $*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"; }
 
-[[ -f "$ANDROID_DIR/keystore.properties" ]] || fail "missing android/keystore.properties (copy the .example; never commit it)"
 [[ -n "$NOTARY_PROFILE" ]] || fail "set HYPERDISPLAY_NOTARY_PROFILE to a notarytool keychain profile"
 require codesign
 require ditto
 require hdiutil
 require shasum
 require xcrun
+
+# 正式 APK 的密钥默认只存在本机 Keychain，不把密码写入仓库或 properties 文件。
+# 用户也可用四个 HYPERDISPLAY_ANDROID_* 环境变量覆盖，便于 CI 注入 secret。
+if [[ -z "${HYPERDISPLAY_ANDROID_KEYSTORE:-}" ]]; then
+    export HYPERDISPLAY_ANDROID_KEYSTORE="/Users/xuyingzhou/Library/Application Support/Hyperdisplay/keys/hyperdisplay-release.jks"
+fi
+[[ -f "$HYPERDISPLAY_ANDROID_KEYSTORE" ]] || fail "Android release keystore not found"
+if [[ -z "${HYPERDISPLAY_ANDROID_STORE_PASSWORD:-}" ]]; then
+    export HYPERDISPLAY_ANDROID_STORE_PASSWORD="$(security find-generic-password -a hyperdisplay-release -s com.hyperdisplay.android.store-password -w)"
+fi
+if [[ -z "${HYPERDISPLAY_ANDROID_KEY_PASSWORD:-}" ]]; then
+    export HYPERDISPLAY_ANDROID_KEY_PASSWORD="$(security find-generic-password -a hyperdisplay-release -s com.hyperdisplay.android.key-password -w)"
+fi
+export HYPERDISPLAY_ANDROID_KEY_ALIAS="${HYPERDISPLAY_ANDROID_KEY_ALIAS:-hyperdisplay}"
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || true)"
 if [[ -z "$VERSION" ]]; then

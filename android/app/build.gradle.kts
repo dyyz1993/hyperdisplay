@@ -10,8 +10,16 @@ val releaseKeystore = Properties()
 if (releaseKeystoreFile.isFile) {
     releaseKeystoreFile.inputStream().use(releaseKeystore::load)
 }
-val hasReleaseSigning = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
-    .all { !releaseKeystore.getProperty(it).isNullOrBlank() }
+fun signingValue(property: String, environment: String): String? =
+    releaseKeystore.getProperty(property)?.takeIf { it.isNotBlank() }
+        ?: System.getenv(environment)?.takeIf { it.isNotBlank() }
+
+val releaseStoreFile = signingValue("storeFile", "HYPERDISPLAY_ANDROID_KEYSTORE")
+val releaseStorePassword = signingValue("storePassword", "HYPERDISPLAY_ANDROID_STORE_PASSWORD")
+val releaseKeyAlias = signingValue("keyAlias", "HYPERDISPLAY_ANDROID_KEY_ALIAS")
+val releaseKeyPassword = signingValue("keyPassword", "HYPERDISPLAY_ANDROID_KEY_PASSWORD")
+val hasReleaseSigning = listOf(releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword)
+    .all { !it.isNullOrBlank() }
 
 android {
     namespace = "com.hyperdisplay.client"
@@ -28,10 +36,10 @@ android {
     if (hasReleaseSigning) {
         signingConfigs {
             create("release") {
-                storeFile = file(releaseKeystore.getProperty("storeFile"))
-                storePassword = releaseKeystore.getProperty("storePassword")
-                keyAlias = releaseKeystore.getProperty("keyAlias")
-                keyPassword = releaseKeystore.getProperty("keyPassword")
+                storeFile = file(requireNotNull(releaseStoreFile))
+                storePassword = requireNotNull(releaseStorePassword)
+                keyAlias = requireNotNull(releaseKeyAlias)
+                keyPassword = requireNotNull(releaseKeyPassword)
             }
         }
     }
