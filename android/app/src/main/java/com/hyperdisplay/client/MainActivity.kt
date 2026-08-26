@@ -71,6 +71,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var waitingForDisplay = false
     private var switchingBanner: android.widget.LinearLayout? = null
     private var switchingBannerShow: Runnable? = null
+    private var switchingBannerTitle: TextView? = null
+    private var switchingBannerDetail: TextView? = null
+    /** 布局替换必须等整组新屏都至少渲染一帧，不能被仍在播放的旧屏提前取消动画。 */
+    private var topologyTransitionInFlight = false
+    private var topologyTransitionOldIds = emptySet<Int>()
+    private var topologyTransitionExpectedIds = emptySet<Int>()
     private val regionViews = mutableListOf<StreamView>()
 
     private class DisplayPipeline(val id: Int) {
@@ -219,6 +225,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var activeTransport = NsdFinder.Transport.OTHER
     private var routeProbeTicks = 0
     private var routeProbeActive = false
+    /** 插线后的短窗口重试：Mac 需要先收到 IOKit 事件并执行一次 adb reverse。
+     *  这不是常驻轮询；只在 POWER_CONNECTED 后最多探测约 5 秒，避免先连 Wi‑Fi
+     *  又被 30 秒兜底轮询拖住才升级到 USB。 */
+    private var usbTunnelBurstGeneration = 0
     // 产品定位是外置显示器；不申请辅助功能，也不把触摸转换为 Mac 输入。
     @Volatile private var remoteControlEnabled = false
     private var renderFps = 0
@@ -242,8 +252,21 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 pipelines.values.toList()
             }
             renderFps = total
-            // 新会话首帧落地 → 撤切换横幅（快切换时它根本没来得及浮现）
-            if (total > 0) cancelSwitchingBanner()
+            // 通道切换的任意首帧即可收起；布局替换则必须等完整新屏组都出过一帧，
+            // 旧屏仍在播放时不能把“正在优化布局”的提示提前撤掉。
+            val topologyReady = synchronized(pipelineLock) {
+                topologyTransitionExpectedIds.isNotEmpty() &&
+                    topologyTransitionExpectedIds.all { id ->
+                        (pipelines[id]?.renderedNow ?: 0) > 0
+                    }
+            }
+            if (topologyTransitionInFlight && topologyReady) {
+                topologyTransitionInFlight = false
+                topologyTransitionExpectedIds = emptySet()
+                cancelSwitchingBanner()
+            } else if (!topologyTransitionInFlight && total > 0) {
+                cancelSwitchingBanner()
+            }
             for (p in snapshot) p.assembler?.stallCheck()
             // 解码器死亡检测：仅在「有输入提交但输出 3 秒不涨」时重建——
             // 静止桌面（内容驱动、无新帧）下输出冻结是合法状态，不能误杀
@@ -614,11 +637,11 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     }
 
     /** HELLO 的零点击设备档案：单屏=当前平板尺寸；分屏/画中画=上次保存的完整屏幕组。 */
-    private fun requestedDisplaySpecs(): List<Pair<Int, Int>> {
+    private fun requestedDisplaySpecs(config: LayoutConfig = layoutConfig): List<Pair<Int, Int>> {
         val (sw, sh) = screenDims()
-        val raw = if (layoutConfig.kind == LayoutKind.SINGLE) listOf(sw to sh)
-        else regionSizes(layoutConfig).ifEmpty { listOf(sw to sh) }.take(4)
-        val longEdge = layoutConfig.displayLongEdge
+        val raw = if (config.kind == LayoutKind.SINGLE) listOf(sw to sh)
+        else regionSizes(config).ifEmpty { listOf(sw to sh) }.take(4)
+        val longEdge = config.displayLongEdge
         if (longEdge == 0) return raw
         return raw.map { (w, h) ->
             val scale = longEdge.toFloat() / maxOf(sw, sh).toFloat()
@@ -628,22 +651,33 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
-    // MARK: 通道切换过渡横幅（快切换不浮现，慢 1.5s 后出现）
+    // MARK: 通道/布局切换过渡层（旧画面保留，中心卡片解释正在做什么）
 
-    private fun scheduleSwitchingBanner() {
+    private fun scheduleSwitchingBanner(
+        title: String = "正在切换通道…",
+        detail: String = "画面即将恢复",
+        delayMillis: Long = 1_500L
+    ) {
         cancelSwitchingBanner()
+        switchingBannerTitle?.text = title
+        switchingBannerDetail?.text = detail
         val r = Runnable {
             val b = switchingBanner ?: return@Runnable
             b.visibility = android.view.View.VISIBLE
             b.alpha = 0f
-            b.animate()?.alpha(1f)?.setDuration(200)?.start()
-            // 兜底自动消失：首帧取消是主路径，但 host 不健康时永远等不到首帧——
-            // 横幅最多挂 10s，之后让位给会话视图自身的"等待视频流"状态
+            b.scaleX = 0.98f; b.scaleY = 0.98f
+            b.animate()?.alpha(1f)?.scaleX(1f)?.scaleY(1f)?.setDuration(220)?.start()
+            // 兜底只处理普通通道切换。布局替换由完整新屏组的首帧完成收尾，不能
+            // 因仍在播放的旧画面而在 10 秒后悄悄撤掉说明。
             switchingBannerShow = null
-            mainHandler.postDelayed({ cancelSwitchingBanner() }, 10_000)
+            if (!topologyTransitionInFlight) {
+                mainHandler.postDelayed({
+                    if (!topologyTransitionInFlight) cancelSwitchingBanner()
+                }, 10_000)
+            }
         }
         switchingBannerShow = r
-        mainHandler.postDelayed(r, 1500)
+        mainHandler.postDelayed(r, delayMillis)
     }
 
     private fun cancelSwitchingBanner() {
@@ -653,6 +687,17 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             it.animate().cancel()
             it.visibility = android.view.View.GONE
         }
+    }
+
+    private fun beginTopologyTransition() {
+        topologyTransitionInFlight = true
+        topologyTransitionOldIds = subscribedIds.toSet()
+        topologyTransitionExpectedIds = emptySet()
+        scheduleSwitchingBanner(
+            title = "正在应用新的屏幕布局",
+            detail = "保留当前画面，正在优化副屏…",
+            delayMillis = 220L
+        )
     }
 
     /** 智能连接：先探 adb 有线隧道（插线默认走有线，最快），否则复用已保存的
@@ -801,6 +846,30 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 }
             }, 2500)
         }
+    }
+
+    /** POWER_CONNECTED 的有线升级快速通道。
+     *
+     * Android 的插线广播与 Mac 上 adb reverse 注册是两个独立事件，第一次探测可能
+     * 恰好早于 Mac 的注册完成。这里有界地串行重试，成功即停；无设备/无授权时仍由
+     * 同时进行的 Wi‑Fi 连接立即出画面，不把失败变成用户可见等待。 */
+    private fun startUsbTunnelUpgradeBurst() {
+        val generation = ++usbTunnelBurstGeneration
+        fun attempt(remaining: Int) {
+            if (generation != usbTunnelBurstGeneration || isFinishing || isWiredTransport()) return
+            UsbProbe.probe(this) { ok ->
+                if (generation != usbTunnelBurstGeneration || isFinishing || isWiredTransport()) {
+                    return@probe
+                }
+                if (ok) {
+                    Log.i(TAG, "adb tunnel became ready after USB plug; upgrading")
+                    connectTunnel(isSwitch = session != null)
+                } else if (remaining > 0) {
+                    mainHandler.postDelayed({ attempt(remaining - 1) }, 250L)
+                }
+            }
+        }
+        attempt(3)
     }
 
     private fun showDiscoveryDialog() {
@@ -993,35 +1062,22 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         override fun onDisplays(list: List<HostSession.DisplayInfo>) {
             mainHandler.post {
                 displays = list
-                waitingForDisplay = list.isEmpty()
-                // 对账：host 重启/屏回收后 display id 会整体换代。已订阅的 id 若全部
-                // 不在新列表里（UI 已有视图时选屏器不会重跑），解码器将绑死死 id、
-                // 丢弃全部视频分片且关键帧请求被 host 静默忽略——永久 idle-wait 冻屏。
-                val liveIds = list.map { it.id }.toSet()
-                val validSubs = subscribedIds.filter { it in liveIds }
-                if (validSubs.size != subscribedIds.size && list.isNotEmpty()) {
-                    if (validSubs.isEmpty()) {
-                        subscribedIds = listOf(list.first().id)
-                        resetPipelines()
-                        rebuildRegionViews()
-                        session?.selectDisplay(subscribedIds.first())
-                        session?.requestKeyframe(subscribedIds.first())
-                    } else {
-                        subscribedIds = validSubs
-                        session?.sendSubscribeDisplays(validSubs)
-                    }
-                }
                 // Host 只按 HELLO 中持久化的设备档案创建/恢复屏幕；Android 在这里仅订阅。
                 // 不再因为 DISPLAYS 的一次刷新反向发 CREATE/DESTROY，避免拓扑 churn。
-                // 多屏创建是安全串行的：第一块会先出现、第二块稍后才加入列表。因此
-                // 列表从 1→2 时必须增量订阅并重建画中画视图，不能只在首次空视图时选屏。
+                // 多屏创建是安全串行的：第一块会先出现、第二块稍后才加入列表。第一块
+                // 必须立刻渲染到它的正确半区，不能为了等第二块把整个平板黑住。
                 if (list.isNotEmpty()) {
-                    val deviceId = HostSession.loadOrCreateDeviceId(this@MainActivity)
-                    val prefix = "Hyperdisplay 设备 ${deviceId % 10000}"
-                    val wanted = requestedDisplaySpecs().size
-                    val owned = list.filter { it.name.startsWith(prefix) }.take(wanted)
-                    val selected = if (owned.size == wanted) owned else list.take(wanted)
+                    val wanted = requestedDisplaySpecs().size.coerceAtLeast(1)
+                    waitingForDisplay = false
+                    // Host 已按当前 canonical device ID 做过列表过滤，客户端无需再用本地
+                    // 安装 ID 猜名称；卸载重装时两者不同会导致“明明有两块却只选一块”。
+                    val selected = list.take(wanted)
                     val desiredIds = selected.map { it.id }
+                    if (topologyTransitionInFlight && desiredIds.size == wanted &&
+                        desiredIds.toSet() != topologyTransitionOldIds) {
+                        topologyTransitionExpectedIds = desiredIds.toSet()
+                        switchingBannerDetail?.text = "新副屏已建立，正在恢复清晰画面…"
+                    }
                     if (regionViews.isEmpty()) {
                     subscribedIds = selected.map { it.id }
                     resetPipelines()
@@ -1050,6 +1106,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                         }
                     }
                 }
+                if (list.isEmpty()) waitingForDisplay = true
                 updateConfigButton()
             }
         }
@@ -1139,33 +1196,52 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         sessionRoot = container
 
-        // 通道切换过渡横幅：屏幕中央半透明黑底「正在切换到 USB/WiFi…」。
-        // 快切换（<1.5s 出画面）不浮现——不打扰；慢了才出现，且半透明灰罩
-        // 压住冻住的旧画面，明确「在切换」而非「卡死」。
+        // 通道/布局替换的过渡层：背景只轻微压暗，旧画面仍可见；中心卡片带原生旋转
+        // 指示器和入场缩放，明确系统正在恢复副屏而不是无故黑屏。
         val banner = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setBackgroundColor(0xB3000000.toInt())
-            setPadding(48, 36, 48, 36)
+            setBackgroundColor(0x33000000)
             visibility = android.view.View.GONE
         }
-        banner.addView(android.widget.TextView(this).apply {
+        val card = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(52, 36, 52, 34)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xE6202938.toInt())
+                cornerRadius = 28f
+                setStroke(1, 0x556B7C93)
+            }
+        }
+        card.addView(android.widget.ProgressBar(this).apply {
+            isIndeterminate = true
+        }, android.widget.LinearLayout.LayoutParams(42, 42).apply { bottomMargin = 16 })
+        val title = android.widget.TextView(this).apply {
             text = "正在切换通道…"
             textSize = 18f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-        })
-        banner.addView(android.widget.TextView(this).apply {
+        }
+        card.addView(title)
+        val detail = android.widget.TextView(this).apply {
             text = "画面即将恢复"
             textSize = 12f
-            setTextColor(0xFFAAAAAA.toInt())
+            setTextColor(0xFFD0D8E4.toInt())
             gravity = Gravity.CENTER
             setPadding(0, 10, 0, 0)
-        })
+        }
+        card.addView(detail)
+        banner.addView(card, android.widget.LinearLayout.LayoutParams(
+            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
         root.addView(banner, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT))
         switchingBanner = banner
+        switchingBannerTitle = title
+        switchingBannerDetail = detail
 
         val overlay = TextView(this).apply {
             text = "等待视频流…"
@@ -1365,12 +1441,20 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private val decorViews = mutableListOf<View>()
     private val regionWrappers = mutableListOf<FrameLayout>()
 
-    /** 可拖分割线：拖动实时预览两区大小，松手按新比例重建虚拟屏 */
+    /**
+     * 可拖分隔把手：手指拖动时只实时重排本地视图；松手才按新比例受控重建虚拟屏。
+     * 触控热区故意比可见细线宽，避免用户必须精确点中一条 1px 的缝。
+     */
     @SuppressLint("ClickableViewAccessibility")
     private fun addDivider(container: FrameLayout, vertical: Boolean, pos: Int, sw: Int, sh: Int,
                            minFrac: Float, maxFrac: Float, side: Boolean) {
-        val thickness = (20 * resources.displayMetrics.density).toInt()
-        val divider = View(this).apply { setBackgroundColor(0x99FFFFFF.toInt()) }
+        val density = resources.displayMetrics.density
+        val thickness = (36 * density).toInt()
+        val visibleThickness = maxOf(2, (2 * density).toInt())
+        val divider = FrameLayout(this).apply {
+            contentDescription = if (vertical) "拖动以调整左右屏大小" else "拖动以调整上下屏大小"
+            isClickable = true
+        }
         val lp = if (vertical) {
             FrameLayout.LayoutParams(thickness, sh, Gravity.TOP or Gravity.START).also { it.leftMargin = pos - thickness / 2 }
         } else {
@@ -1379,19 +1463,49 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         container.addView(divider, lp)
         decorViews.add(divider)
 
+        // 中央细线 + 小把手只负责提示；外围透明区域才是实际可触控热区。
+        val line = View(this).apply { setBackgroundColor(0xD9FFFFFF.toInt()) }
+        divider.addView(line, if (vertical) {
+            FrameLayout.LayoutParams(visibleThickness, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.CENTER)
+        } else {
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, visibleThickness, Gravity.CENTER)
+        })
+        val grip = TextView(this).apply {
+            text = if (vertical) "⋮" else "⋯"
+            textSize = 25f
+            setTextColor(0xEE1D2A3A.toInt())
+            setShadowLayer(3f, 0f, 1f, 0x99FFFFFF.toInt())
+            gravity = Gravity.CENTER
+        }
+        divider.addView(grip, FrameLayout.LayoutParams(
+            if (vertical) thickness else (52 * density).toInt(),
+            if (vertical) (52 * density).toInt() else thickness,
+            Gravity.CENTER
+        ))
+
         divider.setOnTouchListener(object : View.OnTouchListener {
             var liveFrac = 0f
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> liveFrac = layoutConfig.fraction
+                    MotionEvent.ACTION_DOWN -> {
+                        liveFrac = layoutConfig.fraction
+                        v.parent?.requestDisallowInterceptTouchEvent(true)
+                    }
                     MotionEvent.ACTION_MOVE -> {
-                        val f = (if (vertical) e.rawX / sw else e.rawY / sh)
+                        val location = IntArray(2)
+                        container.getLocationOnScreen(location)
+                        val localPosition = if (vertical) e.rawX - location[0] else e.rawY - location[1]
+                        val edge = if (vertical) sw else sh
+                        val visualFrac = (localPosition / edge).coerceIn(0f, 1f)
+                        // “侧边在右”保存的是右侧宽度，分隔条在视觉上则位于 1-f；此前
+                        // 直接使用 rawX 会让把手与实际区域错位。
+                        val f = (if (side && !layoutConfig.sideLeft) 1f - visualFrac else visualFrac)
                             .coerceIn(minFrac, maxFrac)
                         liveFrac = f
                         // 实时预览：只改视图布局，不动流
-                        val p = (f * (if (vertical) sw else sh)).toInt()
-                        for (rv in regionViews) {
-                            val rlp = rv.layoutParams as FrameLayout.LayoutParams
+                        val p = ((if (side && !layoutConfig.sideLeft) 1f - f else f) * edge).toInt()
+                        for (region in regionWrappers) {
+                            val rlp = region.layoutParams as FrameLayout.LayoutParams
                             if (vertical) {
                                 if (rlp.leftMargin == 0) rlp.width = p
                                 else { rlp.leftMargin = p; rlp.width = sw - p }
@@ -1399,13 +1513,14 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                                 if (rlp.topMargin == 0) rlp.height = p
                                 else { rlp.topMargin = p; rlp.height = sh - p }
                             }
-                            rv.layoutParams = rlp
+                            region.layoutParams = rlp
                         }
                         val dlp = divider.layoutParams as FrameLayout.LayoutParams
                         if (vertical) dlp.leftMargin = p - thickness / 2 else dlp.topMargin = p - thickness / 2
                         divider.layoutParams = dlp
                     }
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        v.parent?.requestDisallowInterceptTouchEvent(false)
                         if (kotlin.math.abs(liveFrac - layoutConfig.fraction) > 0.015f) {
                             applyLayout(layoutConfig.copy(fraction = liveFrac))
                         }
@@ -1462,7 +1577,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             return view
         }
 
-        fun place(v: StreamView, w: Int, h: Int, x: Int, y: Int) {
+        fun place(v: View, w: Int, h: Int, x: Int, y: Int) {
             val wrap = FrameLayout(this@MainActivity)
             wrap.addView(View(this@MainActivity).apply { setBackgroundColor(Color.BLACK) },
                 FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
@@ -1473,7 +1588,20 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             lp.topMargin = y
             container.addView(wrap, lp)
             regionWrappers.add(wrap)
-            regionViews.add(v)
+            if (v is StreamView) regionViews.add(v)
+        }
+
+        fun pendingSecondScreen(): View = FrameLayout(this@MainActivity).apply {
+            setBackgroundColor(0xFF111827.toInt())
+            addView(TextView(this@MainActivity).apply {
+                text = "正在建立第 2 块副屏…"
+                textSize = 15f
+                setTextColor(0xFFD1D5DB.toInt())
+                gravity = Gravity.CENTER
+            }, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ))
         }
 
         when (layoutConfig.kind) {
@@ -1481,24 +1609,31 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 place(makeView(ids[0]), sw, sh, 0, 0)
             }
             LayoutKind.SPLIT_LR -> {
+                val lw = evenOf((sw * layoutConfig.fraction).toInt().coerceIn(sw / 5, sw * 4 / 5))
                 if (ids.size >= 2) {
-                    val lw = evenOf((sw * layoutConfig.fraction).toInt().coerceIn(sw / 5, sw * 4 / 5))
                     place(makeView(ids[0]), lw, sh, 0, 0)
                     place(makeView(ids[1]), evenOf(sw - lw), sh, lw, 0)
-                    addDivider(container, true, lw, sw, sh, 0.3f, 0.7f, false)
-                } else place(makeView(ids[0]), sw, sh, 0, 0)
+                } else {
+                    // 第一块先在正确半区出画，避免为安全串行建第二块而整屏黑 8 秒。
+                    place(makeView(ids[0]), lw, sh, 0, 0)
+                    place(pendingSecondScreen(), evenOf(sw - lw), sh, lw, 0)
+                }
+                addDivider(container, true, lw, sw, sh, 0.3f, 0.7f, false)
             }
             LayoutKind.SPLIT_TB -> {
+                val th = evenOf((sh * layoutConfig.fraction).toInt().coerceIn(sh / 5, sh * 4 / 5))
                 if (ids.size >= 2) {
-                    val th = evenOf((sh * layoutConfig.fraction).toInt().coerceIn(sh / 5, sh * 4 / 5))
                     place(makeView(ids[0]), sw, th, 0, 0)
                     place(makeView(ids[1]), sw, evenOf(sh - th), 0, th)
-                    addDivider(container, false, th, sw, sh, 0.3f, 0.7f, false)
-                } else place(makeView(ids[0]), sw, sh, 0, 0)
+                } else {
+                    place(makeView(ids[0]), sw, th, 0, 0)
+                    place(pendingSecondScreen(), sw, evenOf(sh - th), 0, th)
+                }
+                addDivider(container, false, th, sw, sh, 0.3f, 0.7f, false)
             }
             LayoutKind.SIDE -> {
+                val sideW = evenOf((sw * layoutConfig.fraction).toInt().coerceIn(sw / 5, sw * 2 / 5))
                 if (ids.size >= 2) {
-                    val sideW = evenOf((sw * layoutConfig.fraction).toInt().coerceIn(sw / 5, sw * 2 / 5))
                     val main = makeView(ids[0]); val side = makeView(ids[1])
                     if (layoutConfig.sideLeft) {
                         place(side, sideW, sh, 0, 0)
@@ -1507,8 +1642,16 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                         place(main, evenOf(sw - sideW), sh, 0, 0)
                         place(side, sideW, sh, evenOf(sw - sideW), 0)
                     }
-                    addDivider(container, true, sideW, sw, sh, 0.2f, 0.4f, true)
-                } else place(makeView(ids[0]), sw, sh, 0, 0)
+                } else if (layoutConfig.sideLeft) {
+                    place(pendingSecondScreen(), sideW, sh, 0, 0)
+                    place(makeView(ids[0]), evenOf(sw - sideW), sh, sideW, 0)
+                } else {
+                    place(makeView(ids[0]), evenOf(sw - sideW), sh, 0, 0)
+                    place(pendingSecondScreen(), sideW, sh, evenOf(sw - sideW), 0)
+                }
+                addDivider(container, true,
+                    if (layoutConfig.sideLeft) sideW else sw - sideW,
+                    sw, sh, 0.2f, 0.4f, true)
             }
             LayoutKind.PIP -> {
                 place(makeView(ids[0]), sw, sh, 0, 0)
@@ -1782,12 +1925,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 text = label
                 textSize = 13f
                 setOnClickListener {
-                    // 无需重启 Host，更不能为档位变化全量销毁所有虚拟屏。
-                    layoutConfig = layoutConfig.copy(displayLongEdge = longEdge)
-                    saveLayoutConfig(layoutConfig)
-                    statusText.text = ""
-                    Log.i(TAG, "tier switch -> $label; reconnecting from saved profile")
-                    if (session != null) reconnectForDisplayTopologyChange()
+                    // 档位与布局共用同一条“会话内受控更新”路径：保留旧画面，等新屏首帧。
+                    Log.i(TAG, "tier switch -> $label; updating display profile in session")
+                    applyLayout(layoutConfig.copy(displayLongEdge = longEdge))
                 }
             }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
@@ -1874,23 +2014,21 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     // MARK: 布局应用引擎
 
     private fun applyLayout(cfg: LayoutConfig) {
-        val changed = layoutConfig != cfg
+        val previous = layoutConfig
+        val changed = previous != cfg
+        val virtualScreenChange = previous.kind != cfg.kind ||
+            requestedDisplaySpecs(previous) != requestedDisplaySpecs(cfg)
         layoutConfig = cfg
         saveLayoutConfig(cfg)
         greenRecoveries = 0
         updateConfigButton(); updateOverlay()
-        // 用户明确改变布局/分辨率时才做一次受控的整组替换。普通断线和 DISPLAYS
-        // 刷新永远不会触发建销；Host 使用稳定 EDID slot 复用未变的显示器身份。
-        if (changed && session != null) reconnectForDisplayTopologyChange()
-    }
-
-    private fun reconnectForDisplayTopologyChange() {
-        Log.i(TAG, "display profile changed: controlled reconnect")
-        linkUp = false
-        disconnectSession()
-        mainHandler.postDelayed({
-            if (!isFinishing && !isDestroyed) smartConnect()
-        }, 600)
+        // 真实虚拟屏尺寸仍需 Host 受控替换，但无需断开 Android 的 UDP 会话，更不能
+        // 预先释放旧 Surface/解码器。旧画面保留到完整新屏组出现后才一次性切换。
+        if (changed && session != null) {
+            Log.i(TAG, "display profile changed: in-session topology update")
+            if (virtualScreenChange) beginTopologyTransition()
+            session?.updateDisplayTopology(requestedDisplaySpecs(), layoutStateForHost(cfg))
+        }
     }
 
     /** 切换布局/屏集后清空全部解码管线，等各屏 WELCOME/CONFIG 重建 */
@@ -2135,6 +2273,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        usbTunnelBurstGeneration++ // 退后台即取消插线重试，避免后台抢占 Wi‑Fi 会话
         UsbPlugReceiver.onPlugged = null // 防泄漏；后台拉起走通知路径
     }
 
@@ -2154,6 +2293,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         // 直接走 smart——隧道优先、无隧道回 Wi-Fi 历史/发现。
         UsbPlugReceiver.onPlugged = {
             mainHandler.post {
+                // Mac 侧 IOKit 收到插线后会立即注册 reverse；短重试覆盖两端事件的
+                // 正常竞态，消灭之前靠 30 秒低频兜底才出现 ⚡USB 的体验。
+                startUsbTunnelUpgradeBurst()
                 if (session == null) {
                     smartConnect()
                 } else {

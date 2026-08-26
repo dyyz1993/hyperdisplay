@@ -41,7 +41,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key>
     <string>Hyperdisplay</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.3.2</string>
+    <string>0.3.3</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>

@@ -86,7 +86,7 @@ app-specific password；凭据会被验证并仅保存到 macOS Keychain。随�
 
 ```sh
 HYPERDISPLAY_NOTARY_PROFILE=HyperdisplayNotary ./script/package-release.sh
-./script/publish-github-release.sh 0.1.0
+./script/publish-github-release.sh 0.3.3
 ```
 
 若 Android 已先发布，第二条命令会把已 notarize 的 Mac DMG 追加到同一个 GitHub Release。

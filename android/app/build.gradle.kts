@@ -29,8 +29,8 @@ android {
         applicationId = "com.hyperdisplay.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "0.3.2"
+        versionCode = 6
+        versionName = "0.3.3"
     }
 
     if (hasReleaseSigning) {

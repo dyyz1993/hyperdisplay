@@ -7,6 +7,7 @@ TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hyperdisplay-protocol.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 swiftc "$ROOT_DIR/macos/Sources/HyperdisplayHost/Protocol.swift" \
+       "$ROOT_DIR/macos/Sources/HyperdisplayHost/DeviceTopology.swift" \
        "$ROOT_DIR/macos/Tests/ProtocolContractTests.swift" \
        -o "$TMP_DIR/protocol-contract-tests"
 "$TMP_DIR/protocol-contract-tests"

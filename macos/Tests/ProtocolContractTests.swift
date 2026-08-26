@@ -52,6 +52,25 @@ struct ProtocolContractTests {
         check(fingerprint == 0x1122_3344_5566_7788, "stable fingerprint")
         check(layout?.kind == 1 && layout?.displayLongEdge == 2_240, "saved layout fields")
 
+        // 布局是身份边界：不同布局必须有独立 EDID；同一布局内无论尺寸档位或比例
+        // 怎么变，身份都不能变化，macOS 才能恢复它自己的编排和窗口归属。
+        let topologyDeviceId: UInt32 = 998_877
+        let single = DeviceTopologyIdentity.edid(deviceId: topologyDeviceId, topology: .single, slot: 0)
+        let leftRight0 = DeviceTopologyIdentity.edid(deviceId: topologyDeviceId, topology: .splitLeftRight, slot: 0)
+        let leftRight1 = DeviceTopologyIdentity.edid(deviceId: topologyDeviceId, topology: .splitLeftRight, slot: 1)
+        let topBottom0 = DeviceTopologyIdentity.edid(deviceId: topologyDeviceId, topology: .splitTopBottom, slot: 0)
+        check(single.productID == 0x0001 && single.serial == 1000 + (topologyDeviceId & 0xFFFF),
+              "single display keeps the pre-v2 identity")
+        check(leftRight0 != single && leftRight0 != topBottom0,
+              "different layout profiles must never share slot-zero identity")
+        check(leftRight0 != leftRight1,
+              "screens inside a split layout need distinct identities")
+        check(DeviceTopologyIdentity.edid(deviceId: topologyDeviceId, topology: .splitLeftRight, slot: 0) == leftRight0,
+              "resolution tiers and divider fractions must not change an existing layout identity")
+        check(DeviceTopology(layoutKind: nil, requestedScreenCount: 1) == .single &&
+              DeviceTopology(layoutKind: nil, requestedScreenCount: 2) == .splitLeftRight,
+              "legacy clients receive non-colliding fallback topologies")
+
         var ack = Data(Wire.header(.layoutRestoreAck, seq: 0))
         check({ if case .layoutRestoreAck? = Wire.parse(ack) { return true }; return false }(),
               "layout restore acknowledgement")

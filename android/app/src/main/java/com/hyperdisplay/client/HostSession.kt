@@ -26,10 +26,10 @@ class HostSession private constructor(
     private val deviceId: Int,
     /** 不可逆的系统设备指纹；Host 用它把卸载后的新随机 ID 归并回原有显示器档案。 */
     private val deviceFingerprint: Long,
-    /** 当前平板持久布局对应的目标副屏组；随 HELLO 发给 Host，用于零点击复建。 */
-    private val requestedDisplays: List<Pair<Int, Int>>,
-    /** 由 Host 备份的跨卸载布局快照。 */
-    private val layout: LayoutState,
+    /** 当前平板持久布局对应的目标副屏组；可在同一会话内随 HELLO 更新。 */
+    @Volatile private var requestedDisplays: List<Pair<Int, Int>>,
+    /** 由 Host 备份的跨卸载布局快照；与目标屏组一起原子语义地更新。 */
+    @Volatile private var layout: LayoutState,
     private val network: android.net.Network?
 ) {
     interface Listener {
@@ -517,6 +517,16 @@ class HostSession private constructor(
     /** Host 只在收到此确认前保护旧档案；之后本次安装的用户设置立即成为新权威。 */
     fun acknowledgeSavedLayout() {
         send(buildPacket(TYPE_LAYOUT_RESTORE_ACK, 0))
+    }
+
+    /**
+     * 布局/尺寸变更不需要断开 UDP 会话。保留旧解码 Surface 到 Host 的新屏首帧到来，
+     * 避免“松手调分隔条 → 客户端主动清空画面 → 两边黑屏”。
+     */
+    fun updateDisplayTopology(displays: List<Pair<Int, Int>>, newLayout: LayoutState) {
+        requestedDisplays = displays.take(4).map { it.first to it.second }
+        layout = newLayout
+        sendHello()
     }
 
     // MARK: 发送

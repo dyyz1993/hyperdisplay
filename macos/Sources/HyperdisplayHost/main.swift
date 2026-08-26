@@ -134,6 +134,8 @@ struct Client {
     let deviceId: UInt32
     /// 当前 Android 安装实例的临时 ID。跨卸载恢复确认仅对这一实例生效。
     let claimedDeviceId: UInt32
+    /// 当前客户端想恢复的布局档案。它与设备 ID 一起决定本次应使用哪一组稳定 EDID。
+    let topology: DeviceTopology
     var displayIds: Set<CGDirectDisplayID> // 单屏=1个元素；分屏=多个
     var lastSeen: Date
 }
@@ -186,6 +188,7 @@ private struct DeviceRestoreClaim: Hashable {
 /// 允许一个事务，且每块屏都要「出现 → 健康沉降」后才创建下一块。
 private final class DeviceTopologyTransition {
     let deviceId: UInt32
+    let topology: DeviceTopology
     let profiles: [DeviceScreenProfile]
     let generation: UInt64
     var started = false
@@ -198,8 +201,9 @@ private final class DeviceTopologyTransition {
     var screenCaptureVisible = false
     var healthGateUntil = Date.distantPast
 
-    init(deviceId: UInt32, profiles: [DeviceScreenProfile], generation: UInt64) {
+    init(deviceId: UInt32, topology: DeviceTopology, profiles: [DeviceScreenProfile], generation: UInt64) {
         self.deviceId = deviceId
+        self.topology = topology
         self.profiles = profiles
         self.generation = generation
     }
@@ -207,6 +211,7 @@ private final class DeviceTopologyTransition {
 
 private struct DeviceTopologyRequest {
     let deviceId: UInt32
+    let topology: DeviceTopology
     let profiles: [DeviceScreenProfile]
     let generation: UInt64
 }
@@ -235,6 +240,8 @@ final class DisplayStream {
     let deviceId: UInt32?
     /// 同一设备下的稳定屏幕序号（0-based）；nil 为手动临时屏。
     let screenSlot: Int?
+    /// 同一设备的布局档案。slot 只在该布局内部有意义。
+    let topology: DeviceTopology?
     let fps: Int
     let bitrate: UInt32
     private weak var host: HostApp?
@@ -290,11 +297,13 @@ final class DisplayStream {
     private var motionBitrateActive = false
 
     init(display: VirtualDisplay, name: String, deviceId: UInt32? = nil, screenSlot: Int? = nil,
+         topology: DeviceTopology? = nil,
          fps: Int, bitrate: UInt32, host: HostApp, udp: UdpHost) {
         self.display = display
         self.name = name
         self.deviceId = deviceId
         self.screenSlot = screenSlot
+        self.topology = topology
         self.fps = fps
         self.bitrate = bitrate
         self.targetBitrate = bitrate
@@ -718,8 +727,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
     private var restartForScreenRecordingPending = false
     private var currentDeviceId: UInt32 = 0
     private var displaySerial = 0
-    /// 设备档案：一台平板可有一块默认屏或一组分屏；同时缓存在内存和 UserDefaults。
-    private var deviceProfiles: [UInt32: [DeviceScreenProfile]] = [:]
+    /// 设备档案按「平板 × 布局」隔离：单屏、左右、上下、侧边、画中画互不覆盖。
+    private var deviceProfiles: [DeviceTopologyProfileKey: [DeviceScreenProfile]] = [:]
     /// 平板发送的是不可逆的系统指纹，绝不落盘原始 Android ID。这个映射让卸载重装
     /// 后新生成的会话 ID 继续归属于同一份档案/EDID/桌面坐标。
     private var deviceFingerprintMappings: [String: UInt32] = [:]
@@ -727,7 +736,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
     /// HELLO 全是用户的新意图，不能继续按“重装默认值”丢弃。
     private var acknowledgedRestoreClaims: Set<DeviceRestoreClaim> = []
     /// 仅在建/销显示器或正常退出时读写；日常串流完全不访问磁盘。
-    private var devicePlacements: [UInt32: [DeviceScreenPlacement]] = [:]
+    private var devicePlacements: [DeviceTopologyProfileKey: [DeviceScreenPlacement]] = [:]
     /// 显示器拓扑不是网络包的同步副作用。HELLO/断线/改布局只更新期望状态，实际
     /// CGVirtualDisplay 生命周期由这一个串行事务编排，避免旧屏尚未注销就创建新屏。
     private var pendingTopologyRequests: [UInt32: DeviceTopologyRequest] = [:]
@@ -894,12 +903,16 @@ final class HostApp: NSObject, NSApplicationDelegate {
         return "Hyperdisplay \(displaySerial)"
     }
 
-    private func profileDefaultsKey(_ deviceId: UInt32) -> String {
-        "hyperdisplay.deviceScreens.\(deviceId)"
+    private func profileDefaultsKey(_ key: DeviceTopologyProfileKey) -> String {
+        // 单屏读写历史键，升级后仍能无感恢复既有桌面位置。其他布局从 v2 命名空间
+        // 开始独立存储，避免旧的“slot 0”记录在单屏和分屏之间互相覆盖。
+        if key.topology == .single { return "hyperdisplay.deviceScreens.\(key.deviceId)" }
+        return "hyperdisplay.deviceScreens.v2.\(key.deviceId).\(key.topology.persistenceComponent)"
     }
 
-    private func placementDefaultsKey(_ deviceId: UInt32) -> String {
-        "hyperdisplay.devicePlacements.\(deviceId)"
+    private func placementDefaultsKey(_ key: DeviceTopologyProfileKey) -> String {
+        if key.topology == .single { return "hyperdisplay.devicePlacements.\(key.deviceId)" }
+        return "hyperdisplay.devicePlacements.v2.\(key.deviceId).\(key.topology.persistenceComponent)"
     }
 
     private func layoutDefaultsKey(_ deviceId: UInt32) -> String {
@@ -948,40 +961,43 @@ final class HostApp: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(data, forKey: layoutDefaultsKey(deviceId))
     }
 
-    private func loadDevicePlacements(_ deviceId: UInt32) -> [DeviceScreenPlacement] {
-        if let cached = devicePlacements[deviceId] { return cached }
+    private func loadDevicePlacements(_ key: DeviceTopologyProfileKey) -> [DeviceScreenPlacement] {
+        if let cached = devicePlacements[key] { return cached }
         let loaded: [DeviceScreenPlacement]
-        if let data = UserDefaults.standard.data(forKey: placementDefaultsKey(deviceId)),
+        if let data = UserDefaults.standard.data(forKey: placementDefaultsKey(key)),
            let decoded = try? JSONDecoder().decode([DeviceScreenPlacement].self, from: data) {
             loaded = Array(decoded.sorted { $0.slot < $1.slot }.prefix(4))
         } else {
             loaded = []
         }
-        devicePlacements[deviceId] = loaded
+        devicePlacements[key] = loaded
         return loaded
     }
 
     /// 必须在释放 CGVirtualDisplay 对象前调用；之后 WindowServer 只会给出新屏的
     /// 默认位置，已经无法推回用户原先的排列。
-    private func snapshotDevicePlacements(deviceId: UInt32) {
+    private func snapshotDevicePlacements(deviceId: UInt32, topology: DeviceTopology) {
+        let key = DeviceTopologyProfileKey(deviceId: deviceId, topology: topology)
         let placements = streams.values.compactMap { stream -> DeviceScreenPlacement? in
-            guard stream.deviceId == deviceId, let slot = stream.screenSlot else { return nil }
+            guard stream.deviceId == deviceId, stream.topology == topology, let slot = stream.screenSlot else { return nil }
             let bounds = stream.display.bounds
             return DeviceScreenPlacement(slot: slot,
                                          x: Int32(clamping: Int(bounds.minX)),
                                          y: Int32(clamping: Int(bounds.minY)))
         }.sorted { $0.slot < $1.slot }
         guard !placements.isEmpty else { return }
-        devicePlacements[deviceId] = placements
+        devicePlacements[key] = placements
         guard let data = try? JSONEncoder().encode(placements) else { return }
-        UserDefaults.standard.set(data, forKey: placementDefaultsKey(deviceId))
-        NSLog("[hyperdisplay] saved \(placements.count) display placement(s) for device \(deviceId)")
+        UserDefaults.standard.set(data, forKey: placementDefaultsKey(key))
+        NSLog("[hyperdisplay] saved \(placements.count) display placement(s) for device \(deviceId) \(topology.displayName)")
     }
 
     /// WindowServer 和 SCK 都确认新屏可用后才写原点。使用 session 级公开 API：
     /// 不碰显示模式、不新建对象，下一次重连仍由我们持久化档案再次恢复。
-    private func restoreDevicePlacement(displayID: CGDirectDisplayID, deviceId: UInt32, slot: Int) {
-        guard let placement = loadDevicePlacements(deviceId).first(where: { $0.slot == slot }) else { return }
+    private func restoreDevicePlacement(displayID: CGDirectDisplayID, deviceId: UInt32,
+                                        topology: DeviceTopology, slot: Int) {
+        let key = DeviceTopologyProfileKey(deviceId: deviceId, topology: topology)
+        guard let placement = loadDevicePlacements(key).first(where: { $0.slot == slot }) else { return }
         var configuration: CGDisplayConfigRef?
         guard CGBeginDisplayConfiguration(&configuration) == .success, let configuration else {
             NSLog("[hyperdisplay] could not begin placement restore for display \(displayID)")
@@ -999,58 +1015,66 @@ final class HostApp: NSObject, NSApplicationDelegate {
         NSLog("[hyperdisplay] restored display \(displayID) slot \(slot) to (\(placement.x),\(placement.y))")
     }
 
-    private func loadDeviceProfiles(_ deviceId: UInt32) -> [DeviceScreenProfile]? {
-        if let cached = deviceProfiles[deviceId], !cached.isEmpty { return cached }
-        if let data = UserDefaults.standard.data(forKey: profileDefaultsKey(deviceId)),
+    private func loadDeviceProfiles(_ deviceId: UInt32, topology: DeviceTopology) -> [DeviceScreenProfile]? {
+        let key = DeviceTopologyProfileKey(deviceId: deviceId, topology: topology)
+        if let cached = deviceProfiles[key], !cached.isEmpty { return cached }
+        if let data = UserDefaults.standard.data(forKey: profileDefaultsKey(key)),
            let decoded = try? JSONDecoder().decode([DeviceScreenProfile].self, from: data),
            !decoded.isEmpty {
             let normalized = decoded.sorted { $0.slot < $1.slot }.prefix(4).map { $0 }
-            deviceProfiles[deviceId] = normalized
+            deviceProfiles[key] = normalized
             return normalized
         }
         // 兼容上一版单屏档位落盘；新格式会在本次成功连接后覆盖它。
+        guard topology == .single else { return nil }
         let tierKey = "hyperdisplay.tier.\(deviceId)"
         if let saved = UserDefaults.standard.string(forKey: tierKey),
            let w = saved.split(separator: ",").first.flatMap({ Int($0) }),
            let h = saved.split(separator: ",").last.flatMap({ Int($0) }), w >= 640, h >= 480 {
             let legacy = [DeviceScreenProfile(width: w, height: h,
                                               name: "Hyperdisplay 设备 \(deviceId % 10000)", slot: 0)]
-            deviceProfiles[deviceId] = legacy
+            deviceProfiles[key] = legacy
             return legacy
         }
         return nil
     }
 
-    private func saveDeviceProfiles(_ deviceId: UInt32, _ profiles: [DeviceScreenProfile]) {
+    private func saveDeviceProfiles(_ deviceId: UInt32, topology: DeviceTopology,
+                                    _ profiles: [DeviceScreenProfile]) {
+        let key = DeviceTopologyProfileKey(deviceId: deviceId, topology: topology)
         let safe = Array(profiles.sorted { $0.slot < $1.slot }.prefix(4))
         guard !safe.isEmpty, let data = try? JSONEncoder().encode(safe) else { return }
-        deviceProfiles[deviceId] = safe
-        UserDefaults.standard.set(data, forKey: profileDefaultsKey(deviceId))
+        deviceProfiles[key] = safe
+        UserDefaults.standard.set(data, forKey: profileDefaultsKey(key))
     }
 
-    private func makeProfiles(deviceId: UInt32, specs: [RequestedDisplaySpec]) -> [DeviceScreenProfile] {
+    private func makeProfiles(deviceId: UInt32, topology: DeviceTopology,
+                              specs: [RequestedDisplaySpec]) -> [DeviceScreenProfile] {
         specs.prefix(4).enumerated().map { index, spec in
             let w = max(640, (Int(spec.width) + 15) & ~15)
             let h = max(480, (Int(spec.height) + 15) & ~15)
-            let suffix = specs.count > 1 ? " · 屏 \(index + 1)" : ""
+            let suffix = specs.count > 1 ? " · \(topology.displayName) · 屏 \(index + 1)" : " · \(topology.displayName)"
             return DeviceScreenProfile(width: w, height: h,
                                        name: "Hyperdisplay 设备 \(deviceId % 10000)\(suffix)", slot: index)
         }
     }
 
-    private func deviceProfiles(deviceId: UInt32, clientWidth: UInt16, clientHeight: UInt16,
+    private func deviceProfiles(deviceId: UInt32, topology: DeviceTopology,
+                                clientWidth: UInt16, clientHeight: UInt16,
                                 requested: [RequestedDisplaySpec]) -> [DeviceScreenProfile] {
         // 平板自身已保存的布局是最近一次用户选择；新 HELLO 带它即表示主动恢复/更新。
         // 没有尾部规格的旧客户端才优先使用 Mac 上已落盘的档案。
         if !requested.isEmpty {
-            let profiles = makeProfiles(deviceId: deviceId, specs: requested)
-            if loadDeviceProfiles(deviceId) != profiles { saveDeviceProfiles(deviceId, profiles) }
+            let profiles = makeProfiles(deviceId: deviceId, topology: topology, specs: requested)
+            if loadDeviceProfiles(deviceId, topology: topology) != profiles {
+                saveDeviceProfiles(deviceId, topology: topology, profiles)
+            }
             return profiles
         }
-        if let saved = loadDeviceProfiles(deviceId) { return saved }
-        let fallback = makeProfiles(deviceId: deviceId,
+        if let saved = loadDeviceProfiles(deviceId, topology: topology) { return saved }
+        let fallback = makeProfiles(deviceId: deviceId, topology: topology,
                                     specs: [RequestedDisplaySpec(width: clientWidth, height: clientHeight)])
-        saveDeviceProfiles(deviceId, fallback)
+        saveDeviceProfiles(deviceId, topology: topology, fallback)
         return fallback
     }
 
@@ -1058,28 +1082,30 @@ final class HostApp: NSObject, NSApplicationDelegate {
     /// 直接复用现有屏；否则只登记目标拓扑，交给单队列按「旧屏完全消失 → 新屏出现
     /// → 健康沉降」执行。禁止客户端逐块 CREATE/DESTROY，避免一次 UI 刷新放大成
     /// WindowServer/ColorSync churn。
-    private func reconcileDeviceDisplays(deviceId: UInt32, profiles: [DeviceScreenProfile]) {
+    private func reconcileDeviceDisplays(deviceId: UInt32, topology: DeviceTopology,
+                                         profiles: [DeviceScreenProfile]) {
         if let active = activeTopologyTransition, active.deviceId == deviceId {
-            guard active.profiles != profiles else { return }
+            guard active.topology != topology || active.profiles != profiles else { return }
             // 新 HELLO 代表更晚的用户意图。正在创建的旧布局不再继续扩张；已创建的
             // 部分会走同一条显式销毁 + 消失确认路径，绝不交叠创建。
             active.cancelled = true
-        } else if pendingTopologyRequests[deviceId]?.profiles == profiles {
+        } else if let pending = pendingTopologyRequests[deviceId],
+                  pending.topology == topology, pending.profiles == profiles {
             return
-        } else if topologyMatchesCurrentStreams(deviceId: deviceId, profiles: profiles) {
-            NSLog("[hyperdisplay] device \(deviceId) reconnected → reusing \(profiles.count) remembered display(s)")
+        } else if topologyMatchesCurrentStreams(deviceId: deviceId, topology: topology, profiles: profiles) {
+            NSLog("[hyperdisplay] device \(deviceId) reconnected → reusing \(profiles.count) remembered \(topology.displayName) display(s)")
             return
         }
 
         topologyGeneration &+= 1
         pendingTopologyRequests[deviceId] = DeviceTopologyRequest(
-            deviceId: deviceId, profiles: profiles, generation: topologyGeneration)
+            deviceId: deviceId, topology: topology, profiles: profiles, generation: topologyGeneration)
         advanceTopologyTransition()
     }
 
-    private func topologyMatchesCurrentStreams(deviceId: UInt32,
+    private func topologyMatchesCurrentStreams(deviceId: UInt32, topology: DeviceTopology,
                                                 profiles: [DeviceScreenProfile]) -> Bool {
-        let existing = streams.filter { $0.value.deviceId == deviceId }
+        let existing = streams.filter { $0.value.deviceId == deviceId && $0.value.topology == topology }
         return existing.count == profiles.count && profiles.allSatisfy { profile in
             guard let stream = existing.first(where: { $0.value.screenSlot == profile.slot })?.value else {
                 return false
@@ -1102,7 +1128,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
     }
 
     private func removeDeviceDisplays(deviceId: UInt32) {
-        snapshotDevicePlacements(deviceId: deviceId)
+        let topologies = Set(streams.values.compactMap { stream -> DeviceTopology? in
+            guard stream.deviceId == deviceId else { return nil }
+            return stream.topology
+        })
+        for topology in topologies { snapshotDevicePlacements(deviceId: deviceId, topology: topology) }
         let ids = streams.filter { $0.value.deviceId == deviceId }.map(\.key)
         for id in ids { destroyDisplay(id: id, allowLast: true) }
     }
@@ -1154,7 +1184,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
                     if now > active.appearanceDeadline {
                         NSLog("[hyperdisplay] topology rebuild timed out waiting for WindowServer to remove old display(s); no retry for 5 minutes")
                         pendingTopologyRequests[active.deviceId] = DeviceTopologyRequest(
-                            deviceId: active.deviceId, profiles: active.profiles,
+                            deviceId: active.deviceId, topology: active.topology, profiles: active.profiles,
                             generation: active.generation)
                         activeTopologyTransition = nil
                         nextWaitingRestoreAt = now.addingTimeInterval(300)
@@ -1170,7 +1200,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
                         NSLog("[hyperdisplay] created display \(displayID) never appeared; stopping automatic topology retry")
                         removeDeviceDisplays(deviceId: active.deviceId)
                         pendingTopologyRequests[active.deviceId] = DeviceTopologyRequest(
-                            deviceId: active.deviceId, profiles: active.profiles,
+                            deviceId: active.deviceId, topology: active.topology, profiles: active.profiles,
                             generation: active.generation)
                         activeTopologyTransition = nil
                         nextWaitingRestoreAt = now.addingTimeInterval(300)
@@ -1190,7 +1220,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
                         NSLog("[hyperdisplay] display \(displayID) never appeared in ScreenCaptureKit; stopping automatic topology retry")
                         removeDeviceDisplays(deviceId: active.deviceId)
                         pendingTopologyRequests[active.deviceId] = DeviceTopologyRequest(
-                            deviceId: active.deviceId, profiles: active.profiles,
+                            deviceId: active.deviceId, topology: active.topology, profiles: active.profiles,
                             generation: active.generation)
                         activeTopologyTransition = nil
                         nextWaitingRestoreAt = now.addingTimeInterval(300)
@@ -1198,7 +1228,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
                     return
                 }
                 if let slot = streams[displayID]?.screenSlot {
-                    restoreDevicePlacement(displayID: displayID, deviceId: active.deviceId, slot: slot)
+                    restoreDevicePlacement(displayID: displayID, deviceId: active.deviceId,
+                                           topology: active.topology, slot: slot)
                 }
                 active.awaitingDisplayID = nil
                 // 第一块屏一旦同时被 WindowServer 与 ScreenCaptureKit 确认，就可以先
@@ -1217,11 +1248,12 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 guard let id = createDisplay(width: profile.width, height: profile.height,
                                              name: profile.name, deviceId: active.deviceId,
                                              screenSlot: profile.slot,
+                                             topology: active.topology,
                                              colorSyncPreflighted: true) else {
                     NSLog("[hyperdisplay] topology creation failed for \(profile.name); stopping automatic retry")
                     removeDeviceDisplays(deviceId: active.deviceId)
                     pendingTopologyRequests[active.deviceId] = DeviceTopologyRequest(
-                        deviceId: active.deviceId, profiles: active.profiles,
+                        deviceId: active.deviceId, topology: active.topology, profiles: active.profiles,
                         generation: active.generation)
                     activeTopologyTransition = nil
                     nextWaitingRestoreAt = now.addingTimeInterval(300)
@@ -1249,7 +1281,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
         guard colorSyncAllowsDisplayCreation() else { return }
         pendingTopologyRequests.removeValue(forKey: request.deviceId)
         activeTopologyTransition = DeviceTopologyTransition(
-            deviceId: request.deviceId, profiles: request.profiles, generation: request.generation)
+            deviceId: request.deviceId, topology: request.topology,
+            profiles: request.profiles, generation: request.generation)
         advanceTopologyTransition(now: now)
     }
 
@@ -1311,6 +1344,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     private func createDisplay(width: Int, height: Int, name: String, deviceId: UInt32? = nil,
                                screenSlot: Int? = nil,
+                               topology: DeviceTopology? = nil,
                                colorSyncPreflighted: Bool = false) -> CGDirectDisplayID? {
         // 同一份用户档案的多块屏共享一次预检；这样不会在已开始的受控组建过程中，
         // 因瞬时采样把布局留成半组。任何新一轮拓扑仍必须先通过静态预检。
@@ -1333,24 +1367,17 @@ final class HostApp: NSObject, NSApplicationDelegate {
         // 压过 1920）；用户显式选的档位（SET_TIER 落盘，含 2240 锐利档）原样生效——
         // 在这里二次压档会把锐利档吃掉，实测用户切档"无变化"的根因（2026-08-21）
         let w = w0, h = h0
-        // EDID 身份必须同时满足两件事：同一 slot 跨重连恒定（macOS 才能记住排列），
-        // 不同 slot 并发时唯一（否则 WindowServer/ColorSync 会把两块逻辑屏误归并）。
-        // slot 0 保留历史 serial/product，避免已保存的单屏排列被当成新显示器；slot>0
-        // 使用独立的稳定编码，不再与 slot 0 或其他并发屏共享 serial。
-        let slot = UInt32(max(0, screenSlot ?? 0))
-        let serial: UInt32
+        // 同一「平板 × 布局 × slot」的 EDID 恒定；不同布局不再共用 slot 0。
+        // 这样单屏、左右、上下、侧边、画中画可分别恢复 macOS 的排列和窗口归属。
+        let edid: (productID: UInt32, serial: UInt32)
         if let deviceId {
-            if slot == 0 {
-                serial = 1000 + (deviceId & 0xFFFF)
-            } else {
-                serial = 0x8000_0000 | ((deviceId & 0x07FF_FFFF) << 4) | (slot & 0x0F)
-            }
+            edid = DeviceTopologyIdentity.edid(deviceId: deviceId, topology: topology ?? .single,
+                                                slot: screenSlot ?? 0)
         } else {
-            serial = 1
+            edid = (productID: 0x0001, serial: 1)
         }
-        let productID: UInt32 = deviceId == nil ? 0x0001 : 0x0001 + slot
         guard let vd = VirtualDisplay(width: w, height: h, refreshRate: Double(config.fps),
-                                      productID: productID, serial: serial) else {
+                                      productID: edid.productID, serial: edid.serial) else {
             lastCreateFailAt = Date()
             return nil
         }
@@ -1361,7 +1388,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
         // 是双屏时平板 UDP 队列被打满的直接原因。
         let baseBitrate = config.bitrate ?? Config.autoBitrate(width: width, height: height)
         let stream = DisplayStream(
-            display: vd, name: name, deviceId: deviceId, screenSlot: screenSlot, fps: config.fps,
+            display: vd, name: name, deviceId: deviceId, screenSlot: screenSlot, topology: topology,
+            fps: config.fps,
             bitrate: baseBitrate,
             host: self, udp: udp)
         streamsLock.lock()
@@ -1515,11 +1543,15 @@ final class HostApp: NSObject, NSApplicationDelegate {
             currentDeviceId = deviceId
             // 每个 HELLO 携带该平板上次保存的目标屏幕组。首次只带当前平板尺寸，
             // Host 因此直接建一块默认屏；之后若用户选过分屏，则一次复建完整两块/多块。
+            let effectiveLayout = restoringAfterReinstall ? loadDeviceLayout(deviceId) ?? layout : layout
+            let topology = DeviceTopology(layoutKind: effectiveLayout?.kind,
+                                          requestedScreenCount: restoringAfterReinstall ? 0 : requestedDisplays.count)
             if deviceId != 0 {
                 if !restoringAfterReinstall, let layout { saveDeviceLayout(deviceId, layout) }
-                let profiles = deviceProfiles(deviceId: deviceId, clientWidth: cw, clientHeight: ch,
+                let profiles = deviceProfiles(deviceId: deviceId, topology: topology,
+                                              clientWidth: cw, clientHeight: ch,
                                               requested: restoringAfterReinstall ? [] : requestedDisplays)
-                reconcileDeviceDisplays(deviceId: deviceId, profiles: profiles)
+                reconcileDeviceDisplays(deviceId: deviceId, topology: topology, profiles: profiles)
             }
             // 目标屏：档案屏优先（剪枝后重入会也能回到自己的屏——setSubscriptions 对
             // 不存在的客户端是空操作，不能依赖它），其次既有订阅，最后默认屏
@@ -1533,6 +1565,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
             }
             clientsLock.lock()
             clients[key] = Client(addr: addr, deviceId: deviceId, claimedDeviceId: claimedDeviceId,
+                                  topology: topology,
                                   displayIds: targets, lastSeen: Date())
             clientsLock.unlock()
             if restoringAfterReinstall, let savedLayout = loadDeviceLayout(deviceId) {
@@ -1905,11 +1938,13 @@ final class HostApp: NSObject, NSApplicationDelegate {
         nextWaitingRestoreAt = now.addingTimeInterval(30)
         clientsLock.lock()
         let waiting = clients.first { _, client in
-            client.deviceId != 0 && client.displayIds.isEmpty && loadDeviceProfiles(client.deviceId) != nil
+            client.deviceId != 0 && client.displayIds.isEmpty &&
+                loadDeviceProfiles(client.deviceId, topology: client.topology) != nil
         }
         clientsLock.unlock()
-        guard let (key, client) = waiting, let profiles = loadDeviceProfiles(client.deviceId) else { return }
-        reconcileDeviceDisplays(deviceId: client.deviceId, profiles: profiles)
+        guard let (key, client) = waiting,
+              let profiles = loadDeviceProfiles(client.deviceId, topology: client.topology) else { return }
+        reconcileDeviceDisplays(deviceId: client.deviceId, topology: client.topology, profiles: profiles)
         let restored = Set(streams.filter { $0.value.deviceId == client.deviceId }.map(\.key))
         guard !restored.isEmpty else { return }
         clientsLock.lock()
@@ -2106,8 +2141,12 @@ final class HostApp: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         bonjour.stop()
         usbTunnel.stop()
-        for deviceId in Set(streams.values.compactMap(\.deviceId)) {
-            snapshotDevicePlacements(deviceId: deviceId)
+        let activeProfiles = Set(streams.values.compactMap { stream -> DeviceTopologyProfileKey? in
+            guard let deviceId = stream.deviceId, let topology = stream.topology else { return nil }
+            return DeviceTopologyProfileKey(deviceId: deviceId, topology: topology)
+        })
+        for key in activeProfiles {
+            snapshotDevicePlacements(deviceId: key.deviceId, topology: key.topology)
         }
         for stream in streams.values {
             stream.stop()

@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import IOKit
 
 /// USB 隧道桥（内置，取代 Scripts/usb-start.sh + usb-tunnel.py + usb-watch.sh）：
 /// - TCP 127.0.0.1:5280 ↔ UDP 127.0.0.1:<udpPort> 帧互转。帧格式 [len u32 LE][payload]；
@@ -19,6 +20,11 @@ final class UsbTunnelController {
     private var listenFd: Int32 = -1
     private var acceptThread: Thread?
     private var pollTimer: Timer?
+    /// 插入任意 USB 设备时立即跑一次 adb 检查。它是 IOKit 的被动 RunLoop source：
+    /// 无设备时不 fork、不轮询，不会破坏 AGENTS 的闲时近零成本约束。
+    private var usbNotificationPort: IONotificationPortRef?
+    private var usbMatchIterator: io_iterator_t = 0
+    private let reverseQueue = DispatchQueue(label: "hyperdisplay.usb-reverse", qos: .utility)
     private let lock = NSLock()
     private var connFds: Set<Int32> = []
     private var udpPort: UInt16 = 5277
@@ -28,11 +34,13 @@ final class UsbTunnelController {
     func start(udpPort: UInt16) {
         self.udpPort = udpPort
         startListener()
+        startUsbDeviceMonitor()
         startPolling()
     }
 
     func stop() {
         if let timer = pollTimer { timer.invalidate(); pollTimer = nil }
+        stopUsbDeviceMonitor()
         let fd = listenFd
         listenFd = -1
         if fd >= 0 { _ = close(fd) } // accept 线程随 fd 关闭退出
@@ -177,9 +185,8 @@ final class UsbTunnelController {
     // MARK: adb reverse 轮询
 
     /// 无设备时退避：每 12 拍才真正跑一次（5s→60s）。adb devices 是一次进程 fork，
-    /// 闲时近零成本。SLA 不依赖轮询及时性：reverse 未注册时平板探测被立即拒绝 →
-    /// 秒降 WiFi 出画面（≤3s 达标），reverse 由闲时轮询补上后 30s 内自动升 USB。
-    /// （NSWorkspace 无 USB 设备通知，IOKit 监听过重，不做事件驱动。）
+    /// 闲时近零成本。IOKit 会在 USB 插入时立即补一次 reverse 注册，因此不会再让
+    /// 平板先失败、再等 30~60 秒轮询才升级；轮询只保留给 Wi‑Fi ADB / 漏事件兜底。
     private var pollSkip = 0
 
     private func startPolling() {
@@ -194,9 +201,64 @@ final class UsbTunnelController {
                 if self.pollSkip < 12 { return }
                 self.pollSkip = 0
             }
-            DispatchQueue.global(qos: .utility).async { self.registerReverse() }
+            self.scheduleReverseRegistration()
         }
-        DispatchQueue.global(qos: .utility).async { self.registerReverse() }
+        scheduleReverseRegistration()
+    }
+
+    /// 低成本的 USB 插入通知。匹配到的是物理 USB 设备而非某个 Android 专有类：
+    /// 任何插入只多做一次 `adb devices`，实际没有调试授权的设备自然不会出现在
+    /// serial 列表里。这比常驻 `adb track-devices` 子进程更省资源，也避免 60 秒盲等。
+    private func startUsbDeviceMonitor() {
+        guard adbAvailable, usbNotificationPort == nil else { return }
+        guard let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
+        guard let matching = IOServiceMatching("IOUSBHostDevice") else {
+            IONotificationPortDestroy(port)
+            return
+        }
+        var iterator: io_iterator_t = 0
+        let result = IOServiceAddMatchingNotification(
+            port,
+            kIOMatchedNotification,
+            matching,
+            { context, iterator in
+                guard let context else { return }
+                let controller = Unmanaged<UsbTunnelController>.fromOpaque(context).takeUnretainedValue()
+                controller.handleUsbDeviceMatch(iterator)
+            },
+            Unmanaged.passUnretained(self).toOpaque(),
+            &iterator
+        )
+        guard result == KERN_SUCCESS else {
+            IONotificationPortDestroy(port)
+            return
+        }
+        usbNotificationPort = port
+        usbMatchIterator = iterator
+        let source = IONotificationPortGetRunLoopSource(port).takeUnretainedValue()
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        // 必须先 drain 一次，通知才会被 arm；也顺便让 Host 启动时已插着的设备
+        // 立即注册，不必等待下一拍 timer。
+        handleUsbDeviceMatch(iterator)
+    }
+
+    private func stopUsbDeviceMonitor() {
+        guard let port = usbNotificationPort else { return }
+        let source = IONotificationPortGetRunLoopSource(port).takeUnretainedValue()
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        if usbMatchIterator != 0 { IOObjectRelease(usbMatchIterator); usbMatchIterator = 0 }
+        IONotificationPortDestroy(port)
+        usbNotificationPort = nil
+    }
+
+    private func handleUsbDeviceMatch(_ iterator: io_iterator_t) {
+        var matched = false
+        while IOIteratorNext(iterator) != 0 { matched = true }
+        if matched { scheduleReverseRegistration() }
+    }
+
+    private func scheduleReverseRegistration() {
+        reverseQueue.async { [weak self] in self?.registerReverse() }
     }
 
     /// reverse 注册核对：不能只看 serial 集合——设备重枚举、WiFi-adb 掉线都会
