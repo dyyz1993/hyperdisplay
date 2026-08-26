@@ -7,6 +7,7 @@
     <title>Hyperdisplay — 让平板成为 Mac 的第二块屏幕</title>
     <link rel="icon" href="assets/hyperdisplay-mark.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="multi-screen.css" />
   </head>
   <body>
     <div class="aurora aurora-a"></div><div class="aurora aurora-b"></div>
@@ -56,6 +57,39 @@
         </div>
       </section>
 
+      <section id="multi-screen" class="tablet-layout wrap">
+        <div class="tablet-layout-copy">
+          <p class="eyeline">ONE TABLET · MULTIPLE DISPLAYS</p>
+          <h2>一台平板，<br /><em>不止一块屏。</em></h2>
+          <p>不是把同一张画面硬切开。Hyperdisplay 会为平板里的每个区域创建独立的虚拟外接显示器：Mac 上的窗口可以分别拖进去、分别排列，重新连接后还会认回原来的布局。</p>
+          <div class="layout-switcher" role="group" aria-label="平板多屏布局演示">
+            <button type="button" data-layout="single" aria-pressed="false">单块屏幕</button>
+            <button type="button" data-layout="horizontal" aria-pressed="true">左右两块屏</button>
+            <button type="button" data-layout="vertical" aria-pressed="false">上下两块屏</button>
+            <button type="button" data-layout="pip" aria-pressed="false">主屏 + 侧边/画中画</button>
+          </div>
+          <p class="layout-caption" aria-live="polite">左右两块独立显示器：在 Mac 的“显示器排列”里，它们也是两块可单独摆放的外接屏。</p>
+        </div>
+
+        <div class="tablet-stage" data-layout="horizontal" aria-label="平板多块独立显示器动态示意">
+          <div class="tablet-camera"></div>
+          <div class="tablet-screen">
+            <article class="screen-pane pane-a">
+              <div class="pane-head"><span>显示器 01</span><i></i><b>独立桌面</b></div>
+              <div class="mock-window code-window"><span></span><span></span><span></span><strong>工作窗口</strong><small>可从 Mac 单独拖入</small></div>
+              <div class="pane-glow"></div>
+            </article>
+            <article class="screen-pane pane-b">
+              <div class="pane-head"><span>显示器 02</span><i></i><b>独立桌面</b></div>
+              <div class="mock-window note-window"><small>今日任务</small><strong>资料、聊天、预览<br />各自放一块屏</strong><em></em><em></em><em></em></div>
+              <div class="pane-glow"></div>
+            </article>
+            <div class="demo-divider" aria-hidden="true"><span></span></div>
+          </div>
+          <div class="tablet-footer"><span class="live-dot"></span> Hyperdisplay · 2 个虚拟外接屏</div>
+        </div>
+      </section>
+
       <section class="layout wrap">
         <div class="layout-visual"><img src="assets/poster-multi.png" alt="一台 Mac 与多个平板外接屏组成的工作空间" /></div>
         <div><p class="eyeline">不是投屏，是外接屏</p><h2>窗口可以拖过去，<br />桌面会记住它在哪里。</h2><p>Hyperdisplay 创建真正的虚拟外接显示器。平板重新连接时，会沿用稳定的显示器身份、原先的排列位置和窗口归属。</p></div>
@@ -74,5 +108,30 @@
     </main>
 
     <footer class="wrap"><img src="assets/hyperdisplay-mark.svg" alt="" /><span>Hyperdisplay · MIT License</span><a href="https://github.com/dyyz1993/hyperdisplay">GitHub ↗</a></footer>
+    <script>
+      (() => {
+        const stage = document.querySelector('.tablet-stage');
+        const footer = stage?.querySelector('.tablet-footer');
+        const caption = document.querySelector('.layout-caption');
+        const labels = {
+          single: ['单块完整外接屏：平板作为一块完整显示器使用。', '1 个虚拟外接屏'],
+          horizontal: ['左右两块独立显示器：在 Mac 的“显示器排列”里，它们也是两块可单独摆放的外接屏。', '2 个虚拟外接屏'],
+          vertical: ['上下两块独立显示器：上下区域分别对应两块可拖放窗口的外接屏。', '2 个虚拟外接屏'],
+          pip: ['主屏与侧边/画中画：重点内容在主区域，辅助窗口留在独立小屏。', '2 个虚拟外接屏'],
+        };
+        document.querySelectorAll('[data-layout]').forEach((button) => {
+          if (button.tagName !== 'BUTTON') return;
+          button.addEventListener('click', () => {
+            const mode = button.dataset.layout;
+            stage.dataset.layout = mode;
+            document.querySelectorAll('.layout-switcher button').forEach((item) => {
+              item.setAttribute('aria-pressed', String(item === button));
+            });
+            caption.textContent = labels[mode][0];
+            footer.lastChild.textContent = ` Hyperdisplay · ${labels[mode][1]}`;
+          });
+        });
+      })();
+    </script>
   </body>
 </html>
