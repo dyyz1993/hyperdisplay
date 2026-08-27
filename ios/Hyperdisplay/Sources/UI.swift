@@ -168,6 +168,7 @@ struct SessionScreen: View {
 
             VStack {
                 HStack(spacing: 14) {
+                    TransportBadge(linkUp: model.linkUp)
                     Spacer()
                     if chromeVisible {
                         Button {
@@ -178,14 +179,6 @@ struct SessionScreen: View {
                                 .foregroundColor(.white.opacity(0.75))
                                 .padding(8)
                                 .background(Circle().fill(Color.white.opacity(0.14)))
-                        }
-                        Button {
-                            withAnimation { chromeVisible = false }
-                            model.cancelToConnectScreen()
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 34))
-                                .foregroundColor(.white.opacity(0.55))
                         }
                     }
                 }
@@ -212,8 +205,7 @@ struct SessionScreen: View {
         }
     }
 
-    private func bannerOverlay(title: String, detail: String) -> some View {
-        VStack {
+    private func bannerOverlay(title: String, detail: String) -> some View {        VStack {
             HStack {
                 Spacer()
                 VStack(spacing: 4) {
@@ -246,6 +238,26 @@ struct SessionScreen: View {
         }
         .padding(30)
         .background(RoundedRectangle(cornerRadius: 18).fill(Color.white.opacity(0.06)))
+    }
+}
+
+/// 常驻传输标识（对照安卓 transportBadge）：一眼区分链路状态。
+/// iOS 无有线通道，固定 Wi-Fi；断链时降为灰色未连接态。
+struct TransportBadge: View {
+    let linkUp: Bool
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: linkUp ? "wifi" : "wifi.exclamationmark")
+                .font(.system(size: 11, weight: .semibold))
+            Text(linkUp ? "Wi‑Fi" : "未连接")
+                .font(.system(size: 11, weight: .semibold))
+        }
+        .foregroundColor(linkUp ? .white : .white.opacity(0.5))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(Color.black.opacity(0.45)))
+        .accessibilityLabel(linkUp ? "已通过 Wi-Fi 连接" : "未连接")
     }
 }
 
@@ -618,6 +630,15 @@ struct LayoutConfigSheet: View {
                     Button {
                         draft.clarity = 1
                     } label: { checkRow("Retina 2x", draft.clarity == 1) }
+                }
+
+                Section {
+                    Button(role: .destructive) {
+                        dismiss()
+                        model.cancelToConnectScreen()
+                    } label: {
+                        Text("断开连接").frame(maxWidth: .infinity)
+                    }
                 }
             }
             .navigationTitle("屏幕布局配置")
