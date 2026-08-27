@@ -173,7 +173,6 @@ struct SessionScreen: View {
             VStack {
                 HStack(spacing: 14) {
                     TransportBadge(linkUp: model.linkUp)
-                        .padding(.leading, -6)
                     Spacer()
                     if chromeVisible {
                         Button {
@@ -185,12 +184,10 @@ struct SessionScreen: View {
                                 .padding(6)
                                 .background(Circle().fill(Color.white.opacity(0.14)))
                         }
-                        .padding(.trailing, -4)
                     }
                 }
-                .padding(.top, 10)
-                .padding(.leading, 8)
-                .padding(.trailing, 12)
+                .padding(.top, 4)
+                .padding(.horizontal, 10)
                 Spacer()
                 if model.showStats && !model.statsLine.isEmpty {
                     HStack {
@@ -203,6 +200,8 @@ struct SessionScreen: View {
                     .padding(10)
                 }
             }
+            // 控制条延伸进状态栏高度区：徽标/设置分别贴最顶左右，中间留给刘海
+            .ignoresSafeArea(edges: .top)
         }
         .contentShape(Rectangle())
         .onTapGesture {
