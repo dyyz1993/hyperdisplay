@@ -814,6 +814,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
         return generated
     }()
     private let bonjour = BonjourAdvertiser()
+    private var mpcDiscovery: MPCDiscovery?
     private let qrPanel = QRPanelController()
     private let permissionPanel = PermissionPanelController()
     private let displayHealth = DisplayHealthMonitor()
@@ -934,6 +935,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
             let hostName = Host.current().localizedName ?? "Mac"
             _ = bonjour.start(name: "Hyperdisplay (\(hostName))", port: udp.port,
                               txt: ["code": String(pairingCode)])
+            // MPC 发现通道（AWDL/直连，不经路由器）：只广播 UDP 端点，视频仍走 UDP。
+            // 客户端 mDNS+单播扫描都找不到时（AP 隔离网络）这是最后的自动发现手段。
+            mpcDiscovery = MPCDiscovery(udpPort: udp.port, pairingCode: pairingCode)
+            mpcDiscovery?.start()
             // USB 隧道桥 + adb reverse 轮询（零点击：插线即用，AGENTS.md §7.1）。
             // adb 不存在时只打一条日志——Wi-Fi 路径完全不受影响。
             usbTunnel.onDeviceCountChange = { [weak self] in self?.rebuildMenu() }

@@ -249,10 +249,24 @@ final class AppModel: ObservableObject {
         // mDNS 与单播扫描并行：mDNS 依赖路由器在设备间转发组播（常被丢弃），
         // 单播扫描不受限。两边谁先发现都算数（按 host id 去重）。
         browser.startSweepFallback()
+        // MPC 近场发现（AWDL/直连，不经路由器）：AP 隔离网络里的最后手段。
+        // host 通过 MPC 会话直接报 UDP 端点+配对码。
+        MPCBrowser.shared.onHost = { [weak self] host in
+            guard let self, self.phase == .connect else { return }
+            Self.diag.log("MPC discovered host \(host.host):\(host.port)")
+            if UserDefaults.standard.integer(forKey: "hd.pairingCode") > 0 || host.pairingCode != 0 {
+                self.connectEntry(host)
+            } else {
+                self.endpointText = "\(host.host):\(host.port)"
+                self.statusText = "已发现 Mac（\(host.host)）：请填写配对码后点连接"
+            }
+        }
+        MPCBrowser.shared.start()
     }
 
     private func stopDiscovery() {
         browser.stop()
+        MPCBrowser.shared.stop()
         discoveredHosts = []
     }
 
