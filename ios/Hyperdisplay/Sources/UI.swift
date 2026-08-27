@@ -24,7 +24,6 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
             switch model.phase {
             case .connect:
                 ConnectScreen(model: model)
@@ -32,6 +31,8 @@ struct ContentView: View {
                 SessionScreen(model: model)
             }
         }
+        // 背景全屏，但内容层尊重安全区：视频顶部从刘海下方开始
+        .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
         // 副屏形态：真全屏。隐藏 iPad 状态栏（时间/电量）与 home 指示条，
         // 画面顶到物理边缘（含刘海区），只保留 Wi-Fi 徽标与设置按钮两个悬浮件。
@@ -173,16 +174,20 @@ struct SessionScreen: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
-
             GeometryReader { geo in
-                LayoutRegionsView(model: model, size: geo.size)
+                // 顶部显式预留刘海行（状态栏隐藏后 safe area 顶为 0，必须手动留）：
+                // 视频从刘海行下方开始，Mac 菜单栏内容不被遮挡；徽标/设置住刘海行
+                let topInset: CGFloat = 44
+                LayoutRegionsView(model: model,
+                                  size: CGSize(width: geo.size.width,
+                                               height: max(0, geo.size.height - topInset)))
+                    .offset(y: topInset)
                     .onChange(of: geo.size) { _ in
                         model.handleViewportChange()
                     }
                     .onAppear { model.handleViewportChange() }
             }
-            .ignoresSafeArea()
+            .ignoresSafeArea(edges: .bottom)
 
             if let title = model.bannerTitle {
                 bannerOverlay(title: title, detail: model.bannerDetail ?? "")
@@ -224,10 +229,6 @@ struct SessionScreen: View {
             }
             // 控制条延伸进状态栏高度区：徽标/设置分别贴最顶左右，中间留给刘海
             .ignoresSafeArea(edges: .top)
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            withAnimation { chromeVisible.toggle() }
         }
         .sheet(isPresented: $showConfigSheet) {
             LayoutConfigSheet(model: model)
