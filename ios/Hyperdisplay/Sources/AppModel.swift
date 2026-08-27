@@ -453,6 +453,11 @@ extension AppModel: HostSessionListener {
             Self.diag.log("WELCOME display=\(displayId) codec=\(codec) \(w)x\(h) fps=\(fps)")
             let pipeline = pipelineOf(id: UInt32(displayId))
             pipeline.handleWelcome(codec: codec, width: Int(w), height: Int(h), fps: Int(fps))
+            // 流尺寸是光标坐标换算的基准：WELCOME 到达时同步给光标层，
+            // 否则尺寸为 0 → streamToView 恒 nil → 光标永远不显示
+            if let overlay = cursorOverlayRefs.first(where: { $0.0 == UInt32(displayId) })?.1.value {
+                overlay.setStreamSize(w: Int(w), h: Int(h))
+            }
 
         case .config(let displayId, _, let paramSets):
             Self.diag.log("CONFIG display=\(displayId) csd=\(paramSets.count) bytes")

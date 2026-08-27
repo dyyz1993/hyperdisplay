@@ -33,6 +33,10 @@ struct ContentView: View {
             }
         }
         .preferredColorScheme(.dark)
+        // 副屏形态：真全屏。隐藏 iPad 状态栏（时间/电量）与 home 指示条，
+        // 画面顶到物理边缘（含刘海区），只保留 Wi-Fi 徽标与设置按钮两个悬浮件。
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
     }
 }
 
