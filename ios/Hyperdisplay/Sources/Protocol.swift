@@ -189,9 +189,12 @@ enum ClientWire {
     /// HELLO：[proto][w][h][code u32][deviceId u32][count u8][w,h]×n[fingerprint u64]
     ///        [layout 15B][nameLen u8][name][ext D2 01 preset clarity transaction u32]。
     /// 扩展尾在名称之后，旧 Host 读完名称即安全忽略。
+    /// layout 为 nil 时省略布局段与 D2 扩展（旧客户端形态）。实测携带 layout 段的
+    /// HELLO 会触发当前 host 拓扑的高频推送循环，恢复前默认不发——savedLayout
+    /// 恢复与显示模式事务暂不可用（多屏订阅不受影响，specs 照常携带）。
     static func hello(clientWidth: UInt16, clientHeight: UInt16, code: UInt32, deviceId: UInt32,
                       fingerprint: UInt64, deviceName: String,
-                      specs: [RequestedDisplaySpec], layout: LayoutWire) -> Data {
+                      specs: [RequestedDisplaySpec], layout: LayoutWire?) -> Data {
         assert(specs.count <= 4)
         var body: [UInt8] = []
         body.reserveCapacity(14 + specs.count * 4 + 8 + LayoutWire.byteCount
@@ -207,11 +210,13 @@ enum ClientWire {
             appendLE(&body, s.height.clamped(to: 480...16_368))
         }
         appendLE(&body, fingerprint)
-        layout.encode(into: &body)
+        if let layout {
+            layout.encode(into: &body)
+        }
         let nameBytes = Array(deviceName.utf8.prefix(64))
         body.append(UInt8(nameBytes.count))
         body.append(contentsOf: nameBytes)
-        layout.encodeExtension(into: &body)
+        layout?.encodeExtension(into: &body)
         return wirePacket(.hello, seq: 0, body: body)
     }
 

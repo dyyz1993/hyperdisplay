@@ -184,16 +184,20 @@ final class HostSession {
     }
 
     private func sendHelloLocked() {
+        // 临时：layout 传 nil（省略布局段+D2 扩展）。实测带布局段的 HELLO 会让当前
+        // host 拓扑进入高频推送循环（见 Protocol.swift hello 注释）；specs 正常携带，
+        // 多屏订阅不受影响。host 侧修复后恢复 config.layout。
         let hello = ClientWire.hello(clientWidth: config.clientWidth, clientHeight: config.clientHeight,
                                      code: config.pairingCode, deviceId: config.deviceId,
                                      fingerprint: config.fingerprint,
                                      deviceName: config.deviceName,
-                                     specs: config.specs, layout: config.layout)
+                                     specs: config.specs, layout: nil)
         sendLocked(hello)
     }
 
     /// 布局/尺寸变更不断开 UDP 会话：更新 HELLO 档案并重发，host 保留旧解码
     /// Surface 到新屏首帧（对照 HostSession.updateDisplayTopology）。
+    /// layout 暂被忽略（见 sendHelloLocked 注释），保留参数以备恢复。
     func updateDisplayTopology(specs: [RequestedDisplaySpec], layout: LayoutWire) {
         sessionQueue.async { [self] in
             config.specs = Array(specs.prefix(4))

@@ -80,7 +80,15 @@ final class AppModel: ObservableObject {
             guard self.phase == .connect, !self.showHostSheet else { return }
             // §7.4 多主机智能选择：发现恰好 1 台直接连，>1 台才弹列表
             if hosts.count == 1 {
-                self.connectEntry(hosts[0])
+                let host = hosts[0]
+                if host.pairingCode == 0,
+                   UserDefaults.standard.integer(forKey: "hd.pairingCode") == 0 {
+                    // 单播扫描发现、且本机没有配对码：只能填地址，配对码需用户补一次
+                    self.endpointText = "\(host.host):\(host.port)"
+                    self.statusText = "已发现 Mac（\(host.host)）：请填写配对码后点连接"
+                } else {
+                    self.connectEntry(host)
+                }
             } else if hosts.count > 1 {
                 self.showHostSheet = true
             }
@@ -237,6 +245,14 @@ final class AppModel: ObservableObject {
     private func startDiscovery() {
         statusText = "正在搜索局域网内的 Mac…"
         browser.start()
+        // mDNS 依赖路由器在设备间转发组播（有线↔无线混布/IGMP Snooping 时常丢弃），
+        // 4.5s 无结果就降级为单播网段扫描——host 的 PONG 应答即暴露其地址。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.5) { [weak self] in
+            guard let self, self.phase == .connect, self.discoveredHosts.isEmpty else { return }
+            Self.diag.log("mDNS no results — starting unicast subnet sweep")
+            self.statusText = "正在直连扫描网段…"
+            self.browser.startSweepFallback()
+        }
     }
 
     private func stopDiscovery() {
@@ -616,14 +632,10 @@ extension AppModel: HostSessionListener {
 
     func requestedDisplaySpecs(config: LayoutConfig) -> [RequestedDisplaySpec] {
         let px = Self.screenPixels()
-        let specs = LayoutGeometry.requestedSpecs(config: config, screenW: px.width, screenH: px.height)
-        // 临时实验：host 当前把虚拟屏落到请求的一半（Retina 2x 被 macOS 26.5 拒后
-        // 降级落在逻辑尺寸），半密度发糊。请求双倍像素，减半后回到本机原生密度。
-        // host 侧降级修复后应移除。
-        return specs.map { spec in
-            RequestedDisplaySpec(width: UInt16(clamping: min(Int(spec.width) * 2, 16_368)),
-                                 height: UInt16(clamping: min(Int(spec.height) * 2, 16_368)))
-        }
+        return LayoutGeometry.requestedSpecs(config: config, screenW: px.width, screenH: px.height)
+        // 注：曾试验「请求双倍像素」抵消 host 的减半降级（画面更清晰），但 host
+        // 尺寸管道对超规请求的落点不可预测（实测落 1024x1474），且与规格校正
+        // 打架形成推送风暴——已回退。清晰度根因待 host 侧降级路径修复。
     }
 
     func currentWireLayout(transaction: UInt32 = 0) -> LayoutWire {

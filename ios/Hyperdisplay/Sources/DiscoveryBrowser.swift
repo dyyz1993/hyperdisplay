@@ -1,9 +1,14 @@
 import Foundation
 import Network
+import Darwin
 
 /// 局域网发现 hyperdisplay host（_hyperdisplay._udp，对照 android/.../NsdFinder.kt）。
 /// 发现 → 解析 IPv4 端点 → 回调 (名字, ip, port, 配对码)。iOS 无 USB 网络共享，
 /// 不需要安卓端的传输类型判定。
+///
+/// mDNS 依赖路由器在设备间转发组播（IGMP Snooping / 有线无线混布时常被丢弃），
+/// 所以 mDNS 一段时间无结果时自动降级为「单播网段扫描」：对 /24 逐个发 PING，
+/// host 的 PONG 应答即暴露其地址——单播不走组播，权限内即可用。
 struct DiscoveredHost: Identifiable, Equatable {
     var id: String { "\(name)|\(host)|\(port)" }
     let name: String
@@ -51,6 +56,110 @@ final class DiscoveryBrowser {
         browser = nil
         resolveConnections.values.forEach { $0.cancel() }
         resolveConnections.removeAll()
+        stopSweep()
+    }
+
+    // MARK: - 单播网段扫描（mDNS 无结果时的兜底）
+
+    private var sweepSocket: Int32 = -1
+    private var sweepActive = false
+
+    /// mDNS 启动 4.5s 仍无结果时调用：对所在 /24 逐个发 PING（12ms 间隔，约 3s），
+    /// 监听 4s 内的 PONG 应答。host 对任何来源都会回 PONG（unknown 标志位），
+    /// 应答地址即 Mac。单播 UDP，不需要组播权限。
+    func startSweepFallback() {
+        guard browser != nil, !sweepActive else { return } // mDNS 仍在跑才值得兜底
+        guard let (basePrefix, _) = Self.localLANIPv4() else {
+            onError?("未获取到 Wi-Fi 地址：请确认已连接无线网络")
+            return
+        }
+        sweepActive = true
+        let queue = DispatchQueue(label: "hyperdisplay.sweep")
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { sweepActive = false; return }
+        sweepSocket = fd
+        var rcvTimeout = timeval(tv_sec: 0, tv_usec: 200_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, socklen_t(MemoryLayout<timeval>.size))
+        queue.async { [weak self] in
+            defer { close(fd); self?.sweepActive = false; self?.sweepSocket = -1 }
+            let ping: [UInt8] = [0x13, 0, 0, 0, 1]
+            for i in 1...254 {
+                guard self?.sweepActive == true else { return }
+                var addr = sockaddr_in()
+                addr.sin_family = sa_family_t(AF_INET)
+                addr.sin_port = UInt16(5277).bigEndian
+                inet_pton(AF_INET, "\(basePrefix)\(i)", &addr.sin_addr)
+                withUnsafeBytes(of: ping) { raw in
+                    withUnsafePointer(to: &addr) { addrPtr in
+                        addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                            _ = sendto(fd, raw.baseAddress, ping.count, 0, $0,
+                                       socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                }
+                usleep(12_000)
+            }
+            var buf = [UInt8](repeating: 0, count: 64)
+            var from = sockaddr_in()
+            var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let deadline = Date().addingTimeInterval(4)
+            var reported = Set<String>()
+            while Date() < deadline, self?.sweepActive == true {
+                let n = withUnsafeMutablePointer(to: &from) { fromPtr -> Int in
+                    fromPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        recvfrom(fd, &buf, buf.count, 0, $0, &fromLen)
+                    }
+                }
+                guard n == 6, buf[0] == 0x06 else { continue } // PONG
+                var addrIn = from.sin_addr
+                var cStr = [CChar](repeating: 0, count: 16)
+                inet_ntop(AF_INET, &addrIn, &cStr, socklen_t(16))
+                let ip = String(cString: cStr)
+                guard ip != basePrefix + "1", !reported.contains(ip) else { continue }
+                reported.insert(ip)
+                let host = DiscoveredHost(name: "Mac（自动发现）", host: ip,
+                                          port: Self.defaultPort, pairingCode: 0)
+                DispatchQueue.main.async { [weak self] in
+                    self?.onUpdate?([host])
+                }
+            }
+        }
+    }
+
+    func stopSweep() {
+        sweepActive = false
+        if sweepSocket >= 0 {
+            close(sweepSocket)
+            sweepSocket = -1
+        }
+    }
+
+    /// 本机 en0/awdl 的 IPv4 与 /24 前缀
+    static func localLANIPv4() -> (prefix: String, ip: String)? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0 else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        var ptr = ifaddr
+        while let p = ptr {
+            let ifa = p.pointee
+            if let sa = ifa.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) {
+                var addr = sockaddr_in()
+                memcpy(&addr, sa, MemoryLayout<sockaddr_in>.size)
+                var cStr = [CChar](repeating: 0, count: 16)
+                inet_ntop(AF_INET, &addr.sin_addr, &cStr, socklen_t(16))
+                let ip = String(cString: cStr)
+                let name = String(cString: ifa.ifa_name)
+                if !ip.hasPrefix("127."), name.hasPrefix("en") {
+                    let parts = ip.split(separator: ".")
+                    if parts.count == 4 {
+                        let prefix = "\(parts[0]).\(parts[1]).\(parts[2])."
+                        return (prefix, ip)
+                    }
+                }
+            }
+            ptr = p.pointee.ifa_next
+        }
+        return nil
     }
 
     var onError: ((String) -> Void)?
