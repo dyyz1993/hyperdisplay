@@ -134,7 +134,8 @@ final class DiscoveryBrowser {
         }
     }
 
-    /// 本机 en0/awdl 的 IPv4 与 /24 前缀
+    /// 本机 en 接口的 IPv4 与 /24 前缀。跳过回环与 169.254 链路本地自分配地址
+    /// （DHCP 失败时的兜底，不在真实局域网内，扫它毫无意义）。
     static func localLANIPv4() -> (prefix: String, ip: String)? {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0 else { return nil }
@@ -149,7 +150,7 @@ final class DiscoveryBrowser {
                 inet_ntop(AF_INET, &addr.sin_addr, &cStr, socklen_t(16))
                 let ip = String(cString: cStr)
                 let name = String(cString: ifa.ifa_name)
-                if !ip.hasPrefix("127."), name.hasPrefix("en") {
+                if !ip.hasPrefix("127."), !ip.hasPrefix("169.254."), name.hasPrefix("en") {
                     let parts = ip.split(separator: ".")
                     if parts.count == 4 {
                         let prefix = "\(parts[0]).\(parts[1]).\(parts[2])."
@@ -160,6 +161,31 @@ final class DiscoveryBrowser {
             ptr = p.pointee.ifa_next
         }
         return nil
+    }
+
+    /// 是否只有 169.254 链路本地地址（Wi-Fi 未真正接入局域网的信号）
+    static func hasOnlyLinkLocal() -> Bool {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0 else { return false }
+        defer { freeifaddrs(ifaddr) }
+        var ptr = ifaddr
+        var sawIPv4 = false
+        while let p = ptr {
+            let ifa = p.pointee
+            if let sa = ifa.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) {
+                var addr = sockaddr_in()
+                memcpy(&addr, sa, MemoryLayout<sockaddr_in>.size)
+                var cStr = [CChar](repeating: 0, count: 16)
+                inet_ntop(AF_INET, &addr.sin_addr, &cStr, socklen_t(16))
+                let ip = String(cString: cStr)
+                if !ip.hasPrefix("127.") {
+                    sawIPv4 = true
+                    if !ip.hasPrefix("169.254.") { return false }
+                }
+            }
+            ptr = p.pointee.ifa_next
+        }
+        return sawIPv4
     }
 
     var onError: ((String) -> Void)?

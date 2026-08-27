@@ -51,6 +51,8 @@ final class AppModel: ObservableObject {
     private var profileSyncRequested: [SizeSpec]?
     /// 主屏等待第二块屏的过渡占位（对照 pendingSecondScreen）
     @Published var awaitingSecondDisplay = false
+    /// 连接页诊断行：本机 IP + 发现通道状态（发给用户排查用）
+    @Published var diagText = ""
 
     /// 连接页输入框（UserDefaults 同步）
     @Published var endpointText: String = UserDefaults.standard.string(forKey: "hd.host") ?? ""
@@ -262,6 +264,14 @@ final class AppModel: ObservableObject {
             }
         }
         MPCBrowser.shared.start()
+        // 诊断：本机 IP 直接决定扫描网段；169.254 = Wi-Fi 没真正接入局域网
+        if let (prefix, ip) = DiscoveryBrowser.localLANIPv4() {
+            diagText = "诊断：本机 \(ip)（扫描 \(prefix)x）· mDNS/扫描/MPC 三通道进行中"
+        } else if DiscoveryBrowser.hasOnlyLinkLocal() {
+            diagText = "诊断：本机只有 169.254 自分配地址 —— Wi-Fi 未接入局域网，请到设置连接路由器 Wi-Fi"
+        } else {
+            diagText = "诊断：本机没有 IPv4 —— 手机可能没连 Wi-Fi（在用蜂窝数据？）"
+        }
     }
 
     private func stopDiscovery() {

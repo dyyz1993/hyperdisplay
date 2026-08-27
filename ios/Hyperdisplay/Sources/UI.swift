@@ -95,6 +95,13 @@ struct ConnectScreen: View {
                     .foregroundColor(.orange)
                     .multilineTextAlignment(.center)
             }
+            if !model.diagText.isEmpty {
+                Text(model.diagText)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.cyan.opacity(0.8))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(3)
+            }
 
             Toggle(isOn: $model.showStats) {
                 Text("显示状态行（调试）").font(.footnote).foregroundColor(.gray)
