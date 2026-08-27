@@ -616,7 +616,14 @@ extension AppModel: HostSessionListener {
 
     func requestedDisplaySpecs(config: LayoutConfig) -> [RequestedDisplaySpec] {
         let px = Self.screenPixels()
-        return LayoutGeometry.requestedSpecs(config: config, screenW: px.width, screenH: px.height)
+        let specs = LayoutGeometry.requestedSpecs(config: config, screenW: px.width, screenH: px.height)
+        // 临时实验：host 当前把虚拟屏落到请求的一半（Retina 2x 被 macOS 26.5 拒后
+        // 降级落在逻辑尺寸），半密度发糊。请求双倍像素，减半后回到本机原生密度。
+        // host 侧降级修复后应移除。
+        return specs.map { spec in
+            RequestedDisplaySpec(width: UInt16(clamping: min(Int(spec.width) * 2, 16_368)),
+                                 height: UInt16(clamping: min(Int(spec.height) * 2, 16_368)))
+        }
     }
 
     func currentWireLayout(transaction: UInt32 = 0) -> LayoutWire {
