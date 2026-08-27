@@ -53,6 +53,9 @@ final class AppModel: ObservableObject {
     @Published var awaitingSecondDisplay = false
     /// 连接页诊断行：本机 IP + 发现通道状态（发给用户排查用）
     @Published var diagText = ""
+    /// 发现失败 12 秒后出现「直连测试」按钮
+    @Published var showDirectTest = false
+    private var directTestTimer: Timer?
 
     /// 连接页输入框（UserDefaults 同步）
     @Published var endpointText: String = UserDefaults.standard.string(forKey: "hd.host") ?? ""
@@ -272,12 +275,21 @@ final class AppModel: ObservableObject {
         } else {
             diagText = "诊断：本机没有 IPv4 —— 手机可能没连 Wi-Fi（在用蜂窝数据？）"
         }
+        directTestTimer?.invalidate()
+        showDirectTest = false
+        let t = Timer.scheduledTimer(withTimeInterval: 12, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.showDirectTest = true }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        directTestTimer = t
     }
 
     private func stopDiscovery() {
         browser.stop()
         MPCBrowser.shared.stop()
         discoveredHosts = []
+        directTestTimer?.invalidate()
+        showDirectTest = false
     }
 
     // MARK: - 周期任务（停滞检测 + 统计）

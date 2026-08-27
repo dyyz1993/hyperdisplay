@@ -89,6 +89,21 @@ struct ConnectScreen: View {
             }
             .buttonStyle(.bordered)
 
+            // 诊断专用：发现失败时一键直连（预填本环境 Mac 地址+配对码）
+            if model.showDirectTest {
+                Button {
+                    model.endpointText = "192.168.0.4:5277"
+                    model.pairingCodeText = "771866"
+                    model.connectFromForm()
+                } label: {
+                    Text("直连测试（192.168.0.4:5277）")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.bordered)
+                .tint(.orange)
+            }
+
             if !model.statusText.isEmpty {
                 Text(model.statusText)
                     .font(.footnote)
