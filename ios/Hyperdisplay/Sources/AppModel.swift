@@ -174,6 +174,7 @@ final class AppModel: ObservableObject {
         profileSyncRequested = nil
         bannerTitle = nil
         bannerDetail = nil
+        lastSentPixels = Self.screenPixels()
         waitingText = "等待 Mac 主机…"
         statusText = ""
         s.start()
@@ -273,6 +274,34 @@ final class AppModel: ObservableObject {
         updateStats()
     }
 
+    // MARK: 旋转重建（安卓 M5 未做的「旋转重建」，iOS 借会话内换拓扑补齐）
+
+    private var lastSentPixels: ScreenPixels?
+    private var rotationDebounceTask: Task<Void, Never>?
+
+    /// 容器尺寸变化（旋转/分屏形态变化）→ 防抖后按新方向受控重建虚拟屏。
+    /// 同一次旋转会触发一串 geometry 变化，只有最终稳定方向真正发出 HELLO。
+    func handleViewportChange() {
+        guard phase == .session, session != nil, linkUp else { return }
+        let pixels = Self.screenPixels()
+        guard pixels != lastSentPixels else { return }
+        rotationDebounceTask?.cancel()
+        rotationDebounceTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard !Task.isCancelled, let self else { return }
+            let stable = Self.screenPixels()
+            guard stable == pixels, stable != self.lastSentPixels,
+                  self.phase == .session, self.session != nil else { return }
+            self.lastSentPixels = stable
+            Self.diag.log("viewport changed -> \(stable.width)x\(stable.height), rebuilding topology")
+            self.bannerTitle = "正在按新方向重建屏幕…"
+            self.bannerDetail = "旋转已识别，画面马上回来"
+            self.beginTopologyTransition()
+            self.session?.updateDisplayTopology(specs: self.requestedDisplaySpecs(),
+                                                layout: self.currentWireLayout())
+        }
+    }
+
     private func updateStats() {
         guard showStats else { return }
         let now = FrameAssembler.nowMs()
@@ -331,15 +360,14 @@ final class AppModel: ObservableObject {
         UInt16(clamping: max(240, Int(screenPixels().height)))
     }
 
-    /// 完整物理像素横屏画布（采集编码与渲染都在像素域；禁止按逻辑点减半——AGENTS.md §4）
-    static func screenPixels() -> (width: Int, height: Int) {
+    /// 当前方向的完整物理像素（不做横屏归一）。旋转后由 handleViewportChange
+    /// 走受控重建：虚拟屏跟随 iPad 的真实方向，而不是固定横屏留黑边。
+    static func screenPixels() -> ScreenPixels {
         let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
         let screen = scene?.screen ?? UIScreen.main
         let bounds = screen.bounds.size
         let scale = screen.scale
-        let w = Int(bounds.width * scale)
-        let h = Int(bounds.height * scale)
-        return (max(w, h), min(w, h))
+        return ScreenPixels(width: Int(bounds.width * scale), height: Int(bounds.height * scale))
     }
 
     /// 屏幕缩放系数（像素/点），PiP 像素域坐标 ↔ UI 点坐标换算用
@@ -696,6 +724,12 @@ extension AppModel: HostSessionListener {
         pipeline.surfaceView = nil
         cursorOverlayRefs.removeAll { $0.0 == pipeline.displayId }
     }
+}
+
+/// 可比较的屏幕像素尺寸
+struct ScreenPixels: Equatable {
+    let width: Int
+    let height: Int
 }
 
 /// 弱引用盒（字典值不能直接 weak）

@@ -151,6 +151,10 @@ struct SessionScreen: View {
 
             GeometryReader { geo in
                 LayoutRegionsView(model: model, size: geo.size)
+                    .onChange(of: geo.size) { _ in
+                        model.handleViewportChange()
+                    }
+                    .onAppear { model.handleViewportChange() }
             }
             .ignoresSafeArea()
 
