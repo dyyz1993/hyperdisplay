@@ -50,6 +50,14 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <!-- Multipeer Connectivity 发现通道（macOS 15+ 本地网络隐私管控：缺声明会被静默拒握手） -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Hyperdisplay 通过本地网络与附近的 iPhone/iPad 副屏客户端互相发现并传输屏幕画面。</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_hyperdisplay._udp</string>
+        <string>_hyperdisplay._tcp</string>
+    </array>
     <key>NSHumanReadableCopyright</key>
     <string>MIT License. CGVirtualDisplay bindings derived from DeskPad (MIT).</string>
     <key>HyperdisplayAndroidReleaseURL</key>

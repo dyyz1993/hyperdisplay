@@ -30,6 +30,7 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_hyperdisplay._udp</string>
+		<string>_hyperdisplay._tcp</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict>
