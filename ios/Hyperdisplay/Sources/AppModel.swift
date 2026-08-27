@@ -454,19 +454,20 @@ final class AppModel: ObservableObject {
 
 // MARK: - HostSessionListener
 
+/// 洪水盾状态（文件级，nonisolated：会话回调线程读写，NSLock 保护）
+private let shieldLock = NSLock()
+private var shieldLastKey = ""
+private var shieldLastAtMs = UInt64(0)
+
 extension AppModel: HostSessionListener {
 
     /// 洪水盾：host 拓扑异常时会对同一 WELCOME/DISPLAYS 状态 kHz 级重推
     /// （伴随 host CPU 134%），每包 Task 跳主线程会把主 actor 饿死 → UI 冻结
     /// （真机实测）。重复包在会话回调线程就地丢弃，同键 500ms 窗口内只放行一次。
-    private static let shieldLock = NSLock()
-    private static var shieldLastKey = ""
-    private static var shieldLastAtMs = UInt64(0)
-
     nonisolated private static func shieldDrop(_ packet: HostPacket, now: UInt64) -> Bool {
         let key: String
         switch packet {
-        case .welcome(let d, let c, let w, let h, let fps, _):
+        case .welcome(let d, _, let c, let w, let h, let fps, _):
             key = "w|\(d)|\(c)|\(w)|\(h)|\(fps)"
         case .displays(let list):
             key = "d|\(list.map { "\($0.id):\($0.width)x\($0.height)" }.joined(separator: ","))"
