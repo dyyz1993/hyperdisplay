@@ -188,7 +188,7 @@ final class AppModel: ObservableObject {
         profileSyncRequested = nil
         bannerTitle = nil
         bannerDetail = nil
-        lastSentPixels = Self.screenPixels()
+        lastSentPixels = Self.videoRegionPixels()
         waitingText = "等待 Mac 主机…"
         statusText = ""
         s.start()
@@ -340,13 +340,13 @@ final class AppModel: ObservableObject {
     /// 同一次旋转会触发一串 geometry 变化，只有最终稳定方向真正发出 HELLO。
     func handleViewportChange() {
         guard phase == .session, session != nil, linkUp else { return }
-        let pixels = Self.screenPixels()
+        let pixels = Self.videoRegionPixels()
         guard pixels != lastSentPixels else { return }
         rotationDebounceTask?.cancel()
         rotationDebounceTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 600_000_000)
             guard !Task.isCancelled, let self else { return }
-            let stable = Self.screenPixels()
+            let stable = Self.videoRegionPixels()
             guard stable == pixels, stable != self.lastSentPixels,
                   self.phase == .session, self.session != nil else { return }
             self.lastSentPixels = stable
@@ -431,6 +431,17 @@ final class AppModel: ObservableObject {
     static func screenScale() -> CGFloat {
         let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
         return (scene?.screen ?? UIScreen.main).scale
+    }
+
+    /// 顶部刘海行预留（UI 与请求规格共用同一常量，保证宽高比一致）
+    static let videoTopInsetPt: CGFloat = 24
+
+    /// 视频可视区的完整物理像素：全宽 ×（全高 − 刘海行）。
+    /// 虚拟屏按这个比例建 → aspect-fit 恰好铺满可视区，四周零黑边。
+    static func videoRegionPixels() -> ScreenPixels {
+        let px = screenPixels()
+        let inset = Int(videoTopInsetPt * screenScale())
+        return ScreenPixels(width: px.width, height: max(240, px.height - inset))
     }
 
     private func parseEndpoint(_ text: String) -> (String, UInt16)? {
@@ -707,7 +718,9 @@ extension AppModel: HostSessionListener {
     }
 
     func requestedDisplaySpecs(config: LayoutConfig) -> [RequestedDisplaySpec] {
-        let px = Self.screenPixels()
+        // 关键：按「可视区」（全宽 × 全高−刘海行）请求虚拟屏比例，
+        // 而不是整机屏幕——否则顶部留条后 aspect-fit 必然左右出黑边
+        let px = Self.videoRegionPixels()
         return LayoutGeometry.requestedSpecs(config: config, screenW: px.width, screenH: px.height)
         // 注：曾试验「请求双倍像素」抵消 host 的减半降级（画面更清晰），但 host
         // 尺寸管道对超规请求的落点不可预测（实测落 1024x1474），且与规格校正
