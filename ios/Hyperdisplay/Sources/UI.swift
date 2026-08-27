@@ -175,19 +175,15 @@ struct SessionScreen: View {
     var body: some View {
         ZStack {
             GeometryReader { geo in
-                // 顶部显式预留刘海行（状态栏隐藏后 safe area 顶为 0，必须手动留）：
-                // 高度取 24pt——够徽标/按钮悬停，且把 aspect-fit 的左右黑边压到最小
-                let topInset: CGFloat = 24
-                LayoutRegionsView(model: model,
-                                  size: CGSize(width: geo.size.width,
-                                               height: max(0, geo.size.height - topInset)))
-                    .offset(y: topInset)
+                LayoutRegionsView(model: model, size: geo.size)
                     .onChange(of: geo.size) { _ in
                         model.handleViewportChange()
                     }
                     .onAppear { model.handleViewportChange() }
             }
-            .ignoresSafeArea(edges: .bottom)
+            // 真全屏：画面铺满整块屏幕（含刘海区，刘海直接压在画面上），
+            // 徽标/设置悬浮在最顶两侧
+            .ignoresSafeArea()
 
             if let title = model.bannerTitle {
                 bannerOverlay(title: title, detail: model.bannerDetail ?? "")
