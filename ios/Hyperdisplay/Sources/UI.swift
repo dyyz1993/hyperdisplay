@@ -169,20 +169,24 @@ struct SessionScreen: View {
             VStack {
                 HStack(spacing: 14) {
                     TransportBadge(linkUp: model.linkUp)
+                        .padding(.leading, -6)
                     Spacer()
                     if chromeVisible {
                         Button {
                             showConfigSheet = true
                         } label: {
                             Image(systemName: "slider.horizontal.3")
-                                .font(.system(size: 22, weight: .semibold))
+                                .font(.system(size: 16, weight: .semibold))
                                 .foregroundColor(.white.opacity(0.75))
-                                .padding(8)
+                                .padding(6)
                                 .background(Circle().fill(Color.white.opacity(0.14)))
                         }
+                        .padding(.trailing, -4)
                     }
                 }
-                .padding(14)
+                .padding(.top, 10)
+                .padding(.leading, 8)
+                .padding(.trailing, 12)
                 Spacer()
                 if model.showStats && !model.statsLine.isEmpty {
                     HStack {
