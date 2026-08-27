@@ -67,7 +67,7 @@ final class CursorOverlayView: UIView {
 
     private enum CursorMode {
         case arrow(shadow: CAShapeLayer, fill: CAShapeLayer, stroke: CAShapeLayer)
-        case bitmap(layer: CALayer)
+        case bitmap(layer: CALayer, hotX: Int, hotY: Int)
     }
 
     private var mode: CursorMode?
@@ -178,10 +178,13 @@ final class CursorOverlayView: UIView {
         let imageLayer = CALayer()
         imageLayer.contents = cgImage
         imageLayer.contentsScale = Self.systemCursorScale
-        imageLayer.frame = CGRect(x: -CGFloat(hx), y: -CGFloat(hy),
-                                  width: CGFloat(w), height: CGFloat(h))
+        // 1 bitmap px = 1 pt（contentsScale 2 → 屏幕上放大 2x）；左上原点，
+        // position 定为「坐标点 − 热点」→ 热点像素精确落在光标坐标上（对照安卓
+        // canvas.translate(cx,cy) + drawBitmap(bitmap, -hotX, -hotY)）
+        imageLayer.bounds = CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h))
+        imageLayer.anchorPoint = CGPoint(x: 0, y: 0)
         imageLayer.masksToBounds = false
-        mode = .bitmap(layer: imageLayer)
+        mode = .bitmap(layer: imageLayer, hotX: hx, hotY: hy)
         rebuildLayers()
         requestAnimationTick()
     }
@@ -226,7 +229,7 @@ final class CursorOverlayView: UIView {
     private func rebuildLayers() {
         layer.sublayers?.removeAll()
         switch mode {
-        case .bitmap(let l):
+        case .bitmap(let l, _, _):
             layer.addSublayer(l)
         case .arrow(let shadow, let fill, let stroke):
             // 阴影画成独立偏移层，成本极小，视频 Surface 上也稳定
@@ -273,10 +276,10 @@ final class CursorOverlayView: UIView {
         CATransaction.begin()
         CATransaction.setDisableActions(true) // 位置自己插值，免 CA 双重动画
         switch mode {
-        case .bitmap(let l):
-            l.position = CGPoint(x: cx, y: cy)
+        case .bitmap(let l, let hotX, let hotY):
+            l.position = CGPoint(x: cx - CGFloat(hotX), y: cy - CGFloat(hotY))
         case .arrow(let shadow, let fill, let stroke):
-            // 尖端即热点：整个箭头组直接以 cx,cy 为原点平移（CATransform3D 无 translatedBy）
+            // 尖端即热点：整个箭头组直接以 cx,cy 为原点平移
             let t = CATransform3DMakeTranslation(cx, cy, 0)
             var shadowT = t
             shadowT.m41 += 1.1
