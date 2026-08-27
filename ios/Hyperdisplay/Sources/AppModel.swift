@@ -246,14 +246,9 @@ final class AppModel: ObservableObject {
     private func startDiscovery() {
         statusText = "正在搜索局域网内的 Mac…"
         browser.start()
-        // mDNS 依赖路由器在设备间转发组播（有线↔无线混布/IGMP Snooping 时常丢弃），
-        // 4.5s 无结果就降级为单播网段扫描——host 的 PONG 应答即暴露其地址。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.5) { [weak self] in
-            guard let self, self.phase == .connect, self.discoveredHosts.isEmpty else { return }
-            Self.diag.log("mDNS no results — starting unicast subnet sweep")
-            self.statusText = "正在直连扫描网段…"
-            self.browser.startSweepFallback()
-        }
+        // mDNS 与单播扫描并行：mDNS 依赖路由器在设备间转发组播（常被丢弃），
+        // 单播扫描不受限。两边谁先发现都算数（按 host id 去重）。
+        browser.startSweepFallback()
     }
 
     private func stopDiscovery() {
