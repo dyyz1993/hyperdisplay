@@ -176,8 +176,8 @@ struct SessionScreen: View {
         ZStack {
             GeometryReader { geo in
                 // 顶部显式预留刘海行（状态栏隐藏后 safe area 顶为 0，必须手动留）：
-                // 视频从刘海行下方开始，Mac 菜单栏内容不被遮挡；徽标/设置住刘海行
-                let topInset: CGFloat = 44
+                // 高度取 24pt——够徽标/按钮悬停，且把 aspect-fit 的左右黑边压到最小
+                let topInset: CGFloat = 24
                 LayoutRegionsView(model: model,
                                   size: CGSize(width: geo.size.width,
                                                height: max(0, geo.size.height - topInset)))
