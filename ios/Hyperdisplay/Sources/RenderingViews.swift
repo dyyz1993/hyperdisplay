@@ -112,6 +112,8 @@ final class CursorOverlayView: UIView {
         guard let p = streamToView(CGFloat(streamX), CGFloat(streamY)) else {
             hide(); return
         }
+        // hide() 之后 mode 保留，但兜底箭头若从未建过（或被系统光标替换流程清掉）需要重建
+        if mode == nil { useFallbackArrow() }
         targetX = p.x
         targetY = p.y
         if !hasPosition {
@@ -124,14 +126,13 @@ final class CursorOverlayView: UIView {
     }
 
     func hide() {
-        guard visible || hasPosition else { return }
+        // 只隐身不销毁：光标离开虚拟屏（host 推 did=0）是高频事件，销毁图层后
+        // moveTo 不重建会导致光标从此永久隐身（安卓 LocalCursorView 同场景只改可见性）
         visible = false
         hasPosition = false
-        subviews.forEach { $0.removeFromSuperview() }
-        layer.sublayers?.removeAll()
+        alpha = 0
         displayLink?.invalidate()
         displayLink = nil
-        mode = nil
     }
 
     /// 流坐标 → 本视图坐标；越界返回 nil（对照 StreamView.streamToView）
