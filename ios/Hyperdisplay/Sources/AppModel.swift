@@ -456,7 +456,35 @@ final class AppModel: ObservableObject {
 
 extension AppModel: HostSessionListener {
 
+    /// 洪水盾：host 拓扑异常时会对同一 WELCOME/DISPLAYS 状态 kHz 级重推
+    /// （伴随 host CPU 134%），每包 Task 跳主线程会把主 actor 饿死 → UI 冻结
+    /// （真机实测）。重复包在会话回调线程就地丢弃，同键 500ms 窗口内只放行一次。
+    private static let shieldLock = NSLock()
+    private static var shieldLastKey = ""
+    private static var shieldLastAtMs = UInt64(0)
+
+    nonisolated private static func shieldDrop(_ packet: HostPacket, now: UInt64) -> Bool {
+        let key: String
+        switch packet {
+        case .welcome(let d, let c, let w, let h, let fps, _):
+            key = "w|\(d)|\(c)|\(w)|\(h)|\(fps)"
+        case .displays(let list):
+            key = "d|\(list.map { "\($0.id):\($0.width)x\($0.height)" }.joined(separator: ","))"
+        default:
+            return false
+        }
+        shieldLock.lock()
+        defer { shieldLock.unlock() }
+        if key == shieldLastKey, now &- shieldLastAtMs < 500 {
+            return true
+        }
+        shieldLastKey = key
+        shieldLastAtMs = now
+        return false
+    }
+
     nonisolated func hostSession(_ session: HostSession, didReceive packet: HostPacket) {
+        if Self.shieldDrop(packet, now: FrameAssembler.nowMs()) { return }
         Task { @MainActor in self.handle(packet: packet) }
     }
 
