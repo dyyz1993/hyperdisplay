@@ -46,8 +46,17 @@ class SessionService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // 从最近任务划掉属于明确“离开副屏”的动作，不等 Activity 的后台宽限。
+        // 回调仍有机会发出 BYE；若 ROM 直接硬杀进程，Mac 端的心跳失活回收兜底。
+        onTaskRemovedCallback?.invoke()
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
+    }
+
     companion object {
         const val CHANNEL_ID = "hyperdisplay_session"
         const val NOTIFICATION_ID = 1
+        @Volatile var onTaskRemovedCallback: (() -> Unit)? = null
     }
 }

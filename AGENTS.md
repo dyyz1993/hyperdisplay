@@ -45,20 +45,29 @@ TCP 拥塞控制会误杀码率。
 
 - 虚拟屏由 `CGVirtualDisplay`（CoreGraphics 私有 API）创建，实例必须常驻进程保活。
 - 进程退出（含崩溃）= 屏自动销毁，这是预期清理语义，不要另做持久化——但这是**最后防线，不是借口**：正常退出路径必须显式 destroy 全部虚拟屏（见 4.1）。
-- 坐标注入 = 流坐标 → 该屏 CGDisplayBounds 全局坐标的线性映射；注入必须 clamp 在屏内。
+- Retina 2x 下必须区分两套尺寸：`CGDisplayBounds`/逻辑模式用于 macOS 桌面排版，
+  `CGDisplayMode.pixelWidth/pixelHeight` 用于 SCK 采集、编码、协议和客户端渲染。
+  禁止因逻辑尺寸减半而把视频也降成半分辨率。
+- 坐标注入 = 流像素坐标 → 该屏 CGDisplayBounds 全局逻辑坐标的线性映射；注入必须 clamp 在屏内。
 
-### 4.2 SCK/CGVirtualDisplay 已知行为（2026-08-21 极简复现判责，修正旧结论）
+### 4.2 SCK/CGVirtualDisplay 已知行为（2026-08-26 极简复现判责）
 
 - **1x 虚拟屏上 applySettings 换模式不生效**（返回 YES 但模式不变；默认 2x 屏上
   生效）——档位切换走 host exec 自重载的依据，极简工具复现坐实，非业务代码 bug。
 - **SCStream.updateConfiguration 不杀流**（回调持续）——旧结论"杀流"系实验污染
   误判，已证伪。
-- **虚拟屏真 2x（视网膜语义）不可达——2026-08-21 干净系统二次复核维持原结论**：
-  不设 settings.hiDPI 得到的"2x"读回实为**大画布 1x**（CGDisplayBounds 点坐标
-  3200x2112 = macOS 按 3200 点 1x 处理，UI 渲染减半，非 1600 点 2x backing）；
-  显式 hiDPI=2 依旧只有 1x 档。所谓"超采样画质"路径不存在，勿再试。
-  （当日实验量大导致 ColorSync 中毒，中毒期数据曾误判为"host 恒 1x 系 bug"，
-  干净系统复核后全部澄清：1x 才是正确配置。）
+- **虚拟屏真 2x 可达，旧结论已被 2026-08-26 单次隔离探针推翻**：正确构造是
+  `descriptor.maxPixelsWide/High = 完整物理像素`、mode 使用一半逻辑尺寸，并明确
+  `settings.hiDPI = 1`。M2 Max / macOS 26.5 实测 2800x1840 物理像素读回
+  mode=1400x920、pixel=2800x1840、CGDisplayBounds=1400x920，两个方向均为 2.00x；
+  释放后在线屏数量恢复，ColorSync 回到 0%。旧实验把 mode 也设成完整物理尺寸，
+  或仅“留空 hiDPI”，测到的是大画布 1x，不能用来否定正确的 Retina 构造。
+- **2x 必须回读验证并无 churn 回退**：当前安全逻辑模式下限为 640x480；只有物理像素
+  至少 1280x960 才尝试 2x。720x960 这类压低档位的分屏应在首次创建前选择 1x。
+  尺寸满足门槛也不保证系统接受：2026-08-27 对 1376x1840 竖向分屏的隔离复现中，
+  对象回读 hiDPI=2，但最终模式仍是同像素 1x。必须回读实际 mode；若完整物理像素
+  可用而仅 2x 被拒绝，应采用同一个 1x 对象并诚实标示，绝不能销毁后循环重试。
+  只有不相关或损坏的实际模式才允许进入失败回收路径。
 - SCK 采集流经 churn 后偶发永久静默：同流 stopCapture→startCapture 可救，
   新建流不可靠（"每进程仅首条流投递"的旧表述不准确——并发多流有时可活，
   判据未定；稳妥起见 host 全程单流永生）。
@@ -89,6 +98,10 @@ TCP 拥塞控制会误杀码率。
 6. **ColorSync 中毒处置预案**（再次发生时）：症状 = colorsync.displayservices 持续高 CPU；
    `kill` 无效属预期（不要反复尝试）；引导用户注销会话，未愈则重启；痊愈判据 = 该进程
    CPU < 1%。
+7. **拓扑状态机必须防主线程重入**：`Process.waitUntilExit`、`CGVirtualDisplay` 等系统调用
+   可能在等待期间泵 AppKit RunLoop，使 1 秒 tick 重入同一建屏事务。所有拓扑推进必须经过
+   单实例 reentrancy gate；重入只登记一次 pending advance，当前推进返回后再异步执行。
+   否则同一 request 会启动两次，第二次会把刚创建的第一块屏误当旧屏销毁。
 
 ## 5. 诚实显示
 

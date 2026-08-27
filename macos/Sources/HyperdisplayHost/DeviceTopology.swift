@@ -33,6 +33,25 @@ enum DeviceTopology: UInt8, CaseIterable, Hashable {
         case .pictureInPicture: return "画中画"
         }
     }
+
+    /// macOS「显示器」列表里直接可辨认的稳定名称。设备名只是人类可读标签，
+    /// 绝不能进入 EDID 身份；后者仍只由 `DeviceTopologyIdentity` 决定。
+    func virtualDisplayName(deviceName: String, slot: Int, screenCount: Int) -> String {
+        let base = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let safeName = base.isEmpty ? "Android 设备" : String(base.prefix(48))
+        guard screenCount > 1 else { return safeName }
+
+        switch self {
+        case .single:
+            return safeName
+        case .splitLeftRight, .splitTopBottom:
+            return "\(safeName) · \(displayName) \(slot + 1)"
+        case .sideBySide:
+            return "\(safeName) · \(slot == 0 ? "主屏" : "侧屏")"
+        case .pictureInPicture:
+            return "\(safeName) · \(slot == 0 ? "主屏" : "画中画")"
+        }
+    }
 }
 
 struct DeviceTopologyProfileKey: Hashable {

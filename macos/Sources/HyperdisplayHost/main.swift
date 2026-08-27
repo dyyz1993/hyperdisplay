@@ -130,6 +130,8 @@ enum CheckMode {
 
 struct Client {
     let addr: sockaddr_in
+    /// Android 系统设备名，仅用于 Mac 菜单的当前会话展示；不写进 EDID/布局档案。
+    let deviceName: String
     /// 用于在健康护栏解除后按原有 EDID 档案恢复同一块副屏。
     let deviceId: UInt32
     /// 当前 Android 安装实例的临时 ID。跨卸载恢复确认仅对这一实例生效。
@@ -191,6 +193,9 @@ private final class DeviceTopologyTransition {
     let topology: DeviceTopology
     let profiles: [DeviceScreenProfile]
     let generation: UInt64
+    /// 明确 1x 与严格 Retina 2x 是不同的显示模式，不能复用彼此的对象。
+    let retina: Bool
+    let transaction: UInt32
     var started = false
     var waitingForRemoval = false
     var cancelled = false
@@ -199,13 +204,17 @@ private final class DeviceTopologyTransition {
     var appearanceDeadline = Date.distantPast
     var screenCaptureCheckInFlight = false
     var screenCaptureVisible = false
+    var modeReadyRecorded = false
     var healthGateUntil = Date.distantPast
 
-    init(deviceId: UInt32, topology: DeviceTopology, profiles: [DeviceScreenProfile], generation: UInt64) {
+    init(deviceId: UInt32, topology: DeviceTopology, profiles: [DeviceScreenProfile], generation: UInt64,
+         retina: Bool, transaction: UInt32) {
         self.deviceId = deviceId
         self.topology = topology
         self.profiles = profiles
         self.generation = generation
+        self.retina = retina
+        self.transaction = transaction
     }
 }
 
@@ -214,6 +223,14 @@ private struct DeviceTopologyRequest {
     let topology: DeviceTopology
     let profiles: [DeviceScreenProfile]
     let generation: UInt64
+    let retina: Bool
+    let transaction: UInt32
+}
+
+private struct PendingDisplayModeStatus {
+    var addr: sockaddr_in
+    let packet: Data
+    var attempts: Int
 }
 
 func clientKey(_ addr: sockaddr_in) -> String {
@@ -278,6 +295,10 @@ final class DisplayStream {
     let qualityCeiling: UInt32
     private(set) var currentBitrate: UInt32
     private(set) var captureScale = 1.0
+    /// 当前真正交给 SCK/VideoToolbox/Android 的像素尺寸。它与 macOS 逻辑点
+    /// 解耦；Retina 2x 不能因为逻辑画布减半而把视频也降成半分辨率。
+    var outputWidth: Int { max(640, Int(Double(display.pixelWidth) * captureScale)) }
+    var outputHeight: Int { max(480, Int(Double(display.pixelHeight) * captureScale)) }
     private let bitrateFloor: UInt32 = 2_000_000
     private var fragmentsSentTotal: UInt64 = 0
     /// 完整帧被 Android 的 latest-frame 接收器放弃的次数。此前只有分片发送总数，
@@ -317,7 +338,7 @@ final class DisplayStream {
     }
 
     private func wireCapture(_ capture: CaptureEngine) {
-        capture.onFrame = { [weak self] pixelBuffer in
+        capture.onFrame = { [weak self, weak capture] pixelBuffer in
             guard let self else { return }
             // 采集侧新鲜像素 = 真实内容活跃（静止锐化的唯一时间戳来源；编码侧
             // 重编码帧不算——见 makeEncoder 注释）。放在订阅门控之前：无人订阅时
@@ -326,7 +347,11 @@ final class DisplayStream {
             // 不只依赖 tick 恰好撞上「最近 300ms 有帧」的窗口。首次连上、窗口
             // 一次性绘制后立刻静止等场景也必须进入待锐化状态；否则会永远留在
             // 实时起流的低延迟画质，用户看到的就是“静态桌面一直不清晰”。
+            let resumedFromStill = !self.refinementWasMoving
             self.refinementWasMoving = true
+            if resumedFromStill {
+                capture?.requestFrameRate(self.fps)
+            }
             self.enterMotionBitrateIfNeeded()
             if self.host?.addressesOfSubscribers(of: self.display.displayID).isEmpty ?? true {
                 return // 订阅门控：无人看时不编码；宽限到期后 tick 会停流并销毁屏
@@ -346,7 +371,10 @@ final class DisplayStream {
     /// 运动期的起始预算：约 5Mbps/MP、5–12Mbps。当前 1440×960 约为 7Mbps；
     /// 足以在 Wi-Fi 上保持 60fps，又比静态质量上限少一半左右的 UDP 分片。
     private func motionBitrateCap() -> UInt32 {
-        let megapixels = Double(display.logicalWidth * display.logicalHeight) / 1_000_000
+        // 局域网/USB 画质优先：没有真实拥塞证据时不因“发生了变化”就预先降画质。
+        // 只有接收端最近明确放弃过完整帧，下一段运动才采用低延迟保护档。
+        guard Date().timeIntervalSince(lastCongestionAt) < 6.0 else { return targetBitrate }
+        let megapixels = Double(outputWidth * outputHeight) / 1_000_000
         let proposed = UInt32(max(5, min(12, megapixels * 5))) * 1_000_000
         return max(bitrateFloor, min(targetBitrate, proposed))
     }
@@ -472,9 +500,8 @@ final class DisplayStream {
         encoder?.stop()
         let newEncoder = makeEncoder()
         encoder = newEncoder
-        let scale = captureScale
-        let w = max(640, Int(Double(display.logicalWidth) * scale))
-        let h = max(480, Int(Double(display.logicalHeight) * scale))
+        let w = outputWidth
+        let h = outputHeight
         let fps = self.fps
         let bitrate = currentBitrate
         let forceH264 = host?.config.forceH264 ?? false
@@ -504,9 +531,8 @@ final class DisplayStream {
 
         let encoder = makeEncoder()
         self.encoder = encoder
-        let scale = captureScale
-        let scaledW = max(640, Int(Double(display.logicalWidth) * scale))
-        let scaledH = max(480, Int(Double(display.logicalHeight) * scale))
+        let scaledW = outputWidth
+        let scaledH = outputHeight
 
         let bitrate = currentBitrate
         let forceH264 = host?.config.forceH264 ?? false
@@ -555,9 +581,8 @@ final class DisplayStream {
     func sendWelcome(codec: VideoEncoder.Codec? = nil) {
         let c = codec ?? encoder?.codec ?? .hevc
         let did = UInt16(display.displayID & 0xFFFF)
-        let scale = captureScale
-        let w = max(640, Int(Double(display.logicalWidth) * scale))
-        let h = max(480, Int(Double(display.logicalHeight) * scale))
+        let w = outputWidth
+        let h = outputHeight
         let data = Wire.welcome(codec: c.rawValue, displayId: did, width: w, height: h, fps: fps,
                                 controlEnabled: false)
         for var addr in host?.addressesOfSubscribers(of: display.displayID) ?? [] {
@@ -570,6 +595,13 @@ final class DisplayStream {
         // 而不是常规 GOP：250ms 的去重上限可将一帧缺口恢复在亚秒内，同时避免
         // Android 每个分片都触发重编码风暴。
         guard Date().timeIntervalSince(lastKeyframeRequestAt) >= 0.25 else { return }
+        forceKeyframeAndReplay()
+    }
+
+    /// 静止锐化自身已经“每次运动周期一次”，不能再被网络恢复请求的 250ms 限流吞掉。
+    /// 否则刚发生过一次 NACK 时，码率虽然升高，却没有静态源帧进入编码器，画面会
+    /// 永久停留在上一张模糊运动帧。
+    private func forceKeyframeAndReplay() {
         lastKeyframeRequestAt = Date()
         encoder?.requestKeyframe()
         capture?.replayLastFrame()
@@ -620,22 +652,23 @@ final class DisplayStream {
             let saved = currentBitrate
             let sourceFrameAt = last
             if saved < targetBitrate {
+                currentBitrate = targetBitrate
                 encoder?.applyBitrate(targetBitrate) // 满码率编码这一帧
             }
             NSLog("[hyperdisplay] refinement IDR for display \(display.displayID) (settled; bitrate \(saved/1000)k->\(targetBitrate/1000)k)")
-            requestKeyframeAndReplay()
-            // 防自触发循环：IDR 编码/replay 都会更新 lastContentFrameAt（立即清空会被
-            // 自己的回放帧填回，实测循环仍存）。1.5s 后（IDR 已编码送达）再清空 +
-            // 还原码率——此后只有真实新采集内容才会重新武装锐化检测。
+            forceKeyframeAndReplay()
+            capture?.requestFrameRate(min(fps, 30))
+            // 1.5s 后（IDR 已编码送达）清空本轮时间戳，此后只有真实新采集内容才会
+            // 重新武装锐化检测。静态零发送，编码器应继续保持高清档；不能在这里
+            // applyBitrate(saved)，否则它留下的“下一帧强制 IDR”会让时钟等微小刷新
+            // 用低码率关键帧覆盖刚恢复的高清画面。下一次真正运动时，
+            // enterMotionBitrateIfNeeded 会根据最近真实拥塞决定是否降档。
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let self else { return }
                 // 这 1.5 秒内若出现了新的真实采集帧，用户已重新滚动：运动回调已
                 // 负责降档，不能再把旧静态事务的低码率/空时间戳写回去。
                 guard self.lastContentFrameAt == sourceFrameAt else { return }
                 self.lastContentFrameAt = nil
-                if saved < self.targetBitrate, self.currentBitrate == self.targetBitrate {
-                    self.encoder?.applyBitrate(saved)
-                }
             }
         }
     }
@@ -741,15 +774,30 @@ final class HostApp: NSObject, NSApplicationDelegate {
     /// CGVirtualDisplay 生命周期由这一个串行事务编排，避免旧屏尚未注销就创建新屏。
     private var pendingTopologyRequests: [UInt32: DeviceTopologyRequest] = [:]
     private var activeTopologyTransition: DeviceTopologyTransition?
+    /// mode 状态走控制通道 ACK；仅在一次明确用户事务的短窗口内存在。
+    private var pendingDisplayModeStatusAcks: [String: PendingDisplayModeStatus] = [:]
     private var topologyGeneration: UInt64 = 0
+    /// `Process.waitUntilExit`/CGVirtualDisplay 这类系统调用可能在主线程等待期间泵一次
+    /// AppKit RunLoop，导致 1 秒 tick 重入拓扑状态机。没有这道门，外层会用同一份
+    /// request 覆盖内层已启动的事务，再把刚创建的第一块屏当旧屏销毁。
+    private var topologyAdvanceGate = TopologyAdvanceGate()
+    /// WindowServer/SCK 的短暂枚举竞态可快速补试一次；连续失败才长熔断。
+    /// 该状态按设备隔离，不能让一台平板的失败拖住另一台手机。
+    private var topologyRetryPolicy = TopologyRetryPolicy()
     /// 已显式销毁、但尚出现在 CGGetActiveDisplayList 的显示器。只要这里非空，绝不
     /// 创建任意新虚拟屏；这比盲等固定秒数更可靠，也避免 USB/后台抖动造成身份竞态。
     private var displayRemovalBarrier: Set<CGDirectDisplayID> = []
+    /// 仅在拓扑请求被门槛阻塞/恢复时写一次诊断时间线；绝不把每秒 tick 变成写盘轮询。
+    private var topologyWaitState: String?
     /// 上次建屏失败时刻：1s 退避，防客户端（弱网重连风暴）把主线程打成重试死循环
     private var lastCreateFailAt: Date?
-    /// ColorSync 护栏拒绝后最多每 30 秒再检查一次；不能把“等待恢复”做成每秒 ps
-    /// 和建屏重试循环，否则监控本身也会制造负载。
+    /// 仅紧急 ColorSync 熔断使用的硬冷却截止点。正常建屏、正常后台恢复绝不能被
+    /// 它阻塞；此前把普通恢复扫描的 30 秒节流复用到这里，导致健康设备也要等下一
+    /// 个窗口才建屏。
     private var nextWaitingRestoreAt = Date.distantPast
+    /// 等待设备的低频补扫节流。它只限制“找有没有等待客户端”的扫描频率，不限制
+    /// 已经收到 HELLO 的拓扑事务；否则会把 30 秒扫描间隔误变成首次出画延迟。
+    private var nextWaitingRestoreScanAt = Date.distantPast
     /// 新建 CGVirtualDisplay 后仅在短窗口内加密采样。私有 API 的异常往往不是
     /// 创建前就可见，而是在 WindowServer 注册新显示器后的几秒内才暴露。
     private var postCreateColorSyncCheckUntil = Date.distantPast
@@ -934,19 +982,84 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     /// 将临时安装 ID 解析为 Host 侧的规范设备身份。指纹仅用于本地查表，绝不参与
     /// EDID 或日志；最终的 EDID 仍由稳定 canonical ID 决定。
-    private func canonicalDeviceIdentity(claimedId: UInt32, fingerprint: UInt64) -> CanonicalDeviceIdentity {
+    /// Android 的 ANDROID_ID 受签名证书作用域影响。用户从一个不同签名的旧 APK
+    /// 卸载并安装新 APK 时，该值会改变；在单用户零点击场景下，允许以「唯一的设备名
+    /// + 已保存屏幕档案」一次性认回旧设备，随后立即把新指纹绑定回旧 canonical ID。
+    /// v2（分屏）档案比刚由新安装创建的单屏档案更有历史价值；这样首次升级曾错误
+    /// 绑定的新指纹，也能在下一次 HELLO 时迁回用户原本的显示器身份。
+    private func reclaimDeviceIdentityByName(_ deviceName: String) -> UInt32? {
+        let normalized = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        let defaults = UserDefaults.standard.dictionaryRepresentation()
+        var candidateScores: [UInt32: Int] = [:]
+        for topology in DeviceTopology.allCases {
+            let prefix = topology == .single
+                ? "hyperdisplay.deviceScreens."
+                : "hyperdisplay.deviceScreens.v2."
+            for (key, value) in defaults where key.hasPrefix(prefix) {
+                if topology == .single && key.hasPrefix("hyperdisplay.deviceScreens.v2.") { continue }
+                let parts = key.split(separator: ".")
+                let idText: Substring?
+                if topology == .single {
+                    idText = parts.last
+                } else {
+                    // v2.<deviceId>.<topology>，只采集当前 topology 的档案。
+                    guard parts.count >= 5, parts.last == Substring(topology.persistenceComponent) else { continue }
+                    idText = parts.dropLast().last
+                }
+                guard let idText, let id = UInt32(idText), let data = value as? Data,
+                      let profiles = try? JSONDecoder().decode([DeviceScreenProfile].self, from: data),
+                      profiles.contains(where: { $0.name.hasPrefix(normalized) }) else { continue }
+                // 旧版单屏档案与新的默认单屏档案可能同名；显式布局档案能保留用户的
+                // 多屏排列，因此优先级更高。相同优先级仍必须唯一，不能猜测。
+                let score = topology == .single ? 1 : 100 + profiles.count
+                candidateScores[id] = max(candidateScores[id] ?? 0, score)
+            }
+        }
+        clientsLock.lock()
+        let inactive = candidateScores.filter { candidate, _ in
+            !clients.values.contains(where: { $0.deviceId == candidate })
+        }
+        clientsLock.unlock()
+        guard let bestScore = inactive.values.max() else { return nil }
+        let best = inactive.filter { $0.value == bestScore }.map(\.key)
+        return best.count == 1 ? best[0] : nil
+    }
+
+    private func persistDeviceFingerprintMappings() {
+        if let data = try? JSONEncoder().encode(deviceFingerprintMappings) {
+            UserDefaults.standard.set(data, forKey: deviceFingerprintDefaultsKey)
+        }
+    }
+
+    private func canonicalDeviceIdentity(claimedId: UInt32, fingerprint: UInt64,
+                                         deviceName: String) -> CanonicalDeviceIdentity {
         guard claimedId != 0, fingerprint != 0 else {
             return CanonicalDeviceIdentity(deviceId: claimedId, restoredAfterReinstall: false)
         }
         loadDeviceFingerprintMappingsIfNeeded()
         let key = deviceFingerprintKey(fingerprint)
         if let canonical = deviceFingerprintMappings[key] {
+            // 早期版本会先把“换签名后新 ANDROID_ID”注册成一个新 canonical ID。
+            // 若现在能从更有历史价值的同名档案唯一找回旧 ID，就原地迁移该映射；
+            // 这是一次性修复，不会让已稳定的正常安装反复创建/销毁显示器。
+            if canonical == claimedId,
+               let reclaimed = reclaimDeviceIdentityByName(deviceName), reclaimed != canonical {
+                deviceFingerprintMappings[key] = reclaimed
+                persistDeviceFingerprintMappings()
+                NSLog("[hyperdisplay] migrated premature fingerprint mapping to remembered device: \(reclaimed)")
+                return CanonicalDeviceIdentity(deviceId: reclaimed, restoredAfterReinstall: true)
+            }
             return CanonicalDeviceIdentity(deviceId: canonical, restoredAfterReinstall: canonical != claimedId)
         }
-        deviceFingerprintMappings[key] = claimedId
-        if let data = try? JSONEncoder().encode(deviceFingerprintMappings) {
-            UserDefaults.standard.set(data, forKey: deviceFingerprintDefaultsKey)
+        if let reclaimed = reclaimDeviceIdentityByName(deviceName) {
+            deviceFingerprintMappings[key] = reclaimed
+            persistDeviceFingerprintMappings()
+            NSLog("[hyperdisplay] reclaimed device identity after cross-signature reinstall: \(reclaimed)")
+            return CanonicalDeviceIdentity(deviceId: reclaimed, restoredAfterReinstall: true)
         }
+        deviceFingerprintMappings[key] = claimedId
+        persistDeviceFingerprintMappings()
         NSLog("[hyperdisplay] registered stable device identity for existing display profile")
         return CanonicalDeviceIdentity(deviceId: claimedId, restoredAfterReinstall: false)
     }
@@ -1048,31 +1161,43 @@ final class HostApp: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(data, forKey: profileDefaultsKey(key))
     }
 
-    private func makeProfiles(deviceId: UInt32, topology: DeviceTopology,
+    private func makeProfiles(deviceId: UInt32, topology: DeviceTopology, deviceName: String,
                               specs: [RequestedDisplaySpec]) -> [DeviceScreenProfile] {
         specs.prefix(4).enumerated().map { index, spec in
             let w = max(640, (Int(spec.width) + 15) & ~15)
             let h = max(480, (Int(spec.height) + 15) & ~15)
-            let suffix = specs.count > 1 ? " · \(topology.displayName) · 屏 \(index + 1)" : " · \(topology.displayName)"
             return DeviceScreenProfile(width: w, height: h,
-                                       name: "Hyperdisplay 设备 \(deviceId % 10000)\(suffix)", slot: index)
+                                       name: topology.virtualDisplayName(deviceName: deviceName,
+                                                                         slot: index, screenCount: specs.count),
+                                       slot: index)
         }
     }
 
     private func deviceProfiles(deviceId: UInt32, topology: DeviceTopology,
+                                deviceName: String,
                                 clientWidth: UInt16, clientHeight: UInt16,
                                 requested: [RequestedDisplaySpec]) -> [DeviceScreenProfile] {
         // 平板自身已保存的布局是最近一次用户选择；新 HELLO 带它即表示主动恢复/更新。
         // 没有尾部规格的旧客户端才优先使用 Mac 上已落盘的档案。
         if !requested.isEmpty {
-            let profiles = makeProfiles(deviceId: deviceId, topology: topology, specs: requested)
+            let profiles = makeProfiles(deviceId: deviceId, topology: topology,
+                                        deviceName: deviceName, specs: requested)
             if loadDeviceProfiles(deviceId, topology: topology) != profiles {
                 saveDeviceProfiles(deviceId, topology: topology, profiles)
             }
             return profiles
         }
-        if let saved = loadDeviceProfiles(deviceId, topology: topology) { return saved }
-        let fallback = makeProfiles(deviceId: deviceId, topology: topology,
+        if let saved = loadDeviceProfiles(deviceId, topology: topology) {
+            let renamed = saved.map { profile in
+                DeviceScreenProfile(width: profile.width, height: profile.height,
+                                    name: topology.virtualDisplayName(deviceName: deviceName,
+                                                                      slot: profile.slot, screenCount: saved.count),
+                                    slot: profile.slot)
+            }
+            if renamed != saved { saveDeviceProfiles(deviceId, topology: topology, renamed) }
+            return renamed
+        }
+        let fallback = makeProfiles(deviceId: deviceId, topology: topology, deviceName: deviceName,
                                     specs: [RequestedDisplaySpec(width: clientWidth, height: clientHeight)])
         saveDeviceProfiles(deviceId, topology: topology, fallback)
         return fallback
@@ -1083,48 +1208,106 @@ final class HostApp: NSObject, NSApplicationDelegate {
     /// → 健康沉降」执行。禁止客户端逐块 CREATE/DESTROY，避免一次 UI 刷新放大成
     /// WindowServer/ColorSync churn。
     private func reconcileDeviceDisplays(deviceId: UInt32, topology: DeviceTopology,
-                                         profiles: [DeviceScreenProfile]) {
+                                         profiles: [DeviceScreenProfile], retina: Bool,
+                                         transaction: UInt32 = 0) {
+        if retina, isStrictRetinaKnownUnsupported(deviceId: deviceId, topology: topology, profiles: profiles) {
+            // 用户已验证过同一设备/系统/布局/尺寸组合。直接诚实回报，不再碰
+            // CGVirtualDisplay，避免每次打开 app 都制造一次无意义的 churn。
+            pushDisplayModeStatus(deviceId: deviceId, transaction: transaction,
+                                  status: .unsupported, requestedScale: 2, effectiveScale: 1)
+            return
+        }
         if let active = activeTopologyTransition, active.deviceId == deviceId {
-            guard active.topology != topology || active.profiles != profiles else { return }
+            if active.cancelled {
+                // 新会话在旧会话的取消/回收窗口内已回来。记录比取消事务更新的意图，
+                // 待 WindowServer 确认旧屏消失后立即续建；不能因档案恰好相同就 return。
+                topologyGeneration &+= 1
+                pendingTopologyRequests[deviceId] = DeviceTopologyRequest(
+                    deviceId: deviceId, topology: topology, profiles: profiles, generation: topologyGeneration,
+                    retina: retina, transaction: transaction)
+                return
+            }
+            guard active.topology != topology || active.profiles != profiles || active.retina != retina else { return }
             // 新 HELLO 代表更晚的用户意图。正在创建的旧布局不再继续扩张；已创建的
             // 部分会走同一条显式销毁 + 消失确认路径，绝不交叠创建。
             active.cancelled = true
         } else if let pending = pendingTopologyRequests[deviceId],
-                  pending.topology == topology, pending.profiles == profiles {
+                  pending.topology == topology, pending.profiles == profiles, pending.retina == retina {
             return
-        } else if topologyMatchesCurrentStreams(deviceId: deviceId, topology: topology, profiles: profiles) {
+        } else if topologyMatchesCurrentStreams(deviceId: deviceId, topology: topology, profiles: profiles, retina: retina) {
             NSLog("[hyperdisplay] device \(deviceId) reconnected → reusing \(profiles.count) remembered \(topology.displayName) display(s)")
             return
         }
 
+        // 这是一条与等待请求不同的新用户意图（例如单屏切左右分屏）。此前失败的
+        // 退避不能让新布局继续背锅；同一档案的重复 HELLO 已在上方 return，不会重置。
+        topologyRetryPolicy.reset(deviceId: deviceId)
         topologyGeneration &+= 1
         pendingTopologyRequests[deviceId] = DeviceTopologyRequest(
-            deviceId: deviceId, topology: topology, profiles: profiles, generation: topologyGeneration)
+            deviceId: deviceId, topology: topology, profiles: profiles, generation: topologyGeneration,
+            retina: retina, transaction: transaction)
+        TopologyTimeline.shared.record("device=\(deviceId) queued topology=\(topology.displayName) screens=\(profiles.count) generation=\(topologyGeneration)")
         advanceTopologyTransition()
     }
 
     private func topologyMatchesCurrentStreams(deviceId: UInt32, topology: DeviceTopology,
-                                                profiles: [DeviceScreenProfile]) -> Bool {
+                                                profiles: [DeviceScreenProfile], retina: Bool) -> Bool {
         let existing = streams.filter { $0.value.deviceId == deviceId && $0.value.topology == topology }
         return existing.count == profiles.count && profiles.allSatisfy { profile in
             guard let stream = existing.first(where: { $0.value.screenSlot == profile.slot })?.value else {
                 return false
             }
-            return stream.display.logicalWidth == profile.width &&
-                   stream.display.logicalHeight == profile.height
+            let sameRequestedProfile = stream.display.requestedPixelWidth == profile.width &&
+                stream.display.requestedPixelHeight == profile.height
+            return sameRequestedProfile && stream.display.backingScale == (retina ? 2 : 1)
         }
+    }
+
+    private func strictRetinaCapabilityKey(deviceId: UInt32, topology: DeviceTopology,
+                                           profiles: [DeviceScreenProfile]) -> String {
+        let geometry = profiles.sorted { $0.slot < $1.slot }
+            .map { "\($0.slot):\($0.width)x\($0.height)" }.joined(separator: ",")
+        let os = ProcessInfo.processInfo.operatingSystemVersionString
+            .replacingOccurrences(of: " ", with: "_")
+        return "hyperdisplay.retina.unsupported.v1.\(deviceId).\(topology.persistenceComponent).\(os).\(geometry)"
+    }
+
+    private func isStrictRetinaKnownUnsupported(deviceId: UInt32, topology: DeviceTopology,
+                                                profiles: [DeviceScreenProfile]) -> Bool {
+        UserDefaults.standard.bool(forKey: strictRetinaCapabilityKey(deviceId: deviceId, topology: topology,
+                                                                       profiles: profiles))
+    }
+
+    private func rememberStrictRetinaUnsupported(_ active: DeviceTopologyTransition) {
+        UserDefaults.standard.set(true, forKey: strictRetinaCapabilityKey(deviceId: active.deviceId,
+                                                                            topology: active.topology,
+                                                                            profiles: active.profiles))
     }
 
     /// `CGGetActiveDisplayList` 是唯一可用于确认 WindowServer 已放下旧显示器的低层
     /// 证据。销毁对象后不等固定秒数：系统快就立刻继续，系统慢就保持零 churn 等待。
     private func refreshDisplayRemovalBarrier() {
         guard !displayRemovalBarrier.isEmpty else { return }
+        let previous = displayRemovalBarrier
         var count: UInt32 = 0
         guard CGGetActiveDisplayList(0, nil, &count) == .success else { return }
         var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
         guard CGGetActiveDisplayList(count, &ids, &count) == .success else { return }
         let active = Set(ids.prefix(Int(count)))
         displayRemovalBarrier = displayRemovalBarrier.intersection(active)
+        if !previous.isEmpty && displayRemovalBarrier.isEmpty {
+            TopologyTimeline.shared.record("removal barrier cleared ids=\(previous.sorted())")
+        }
+    }
+
+    private func setTopologyWaitState(_ state: String?) {
+        guard topologyWaitState != state else { return }
+        topologyWaitState = state
+        if let state {
+            TopologyTimeline.shared.record("topology waiting reason=\(state)")
+        } else {
+            TopologyTimeline.shared.record("topology wait cleared")
+        }
     }
 
     private func removeDeviceDisplays(deviceId: UInt32) {
@@ -1134,6 +1317,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
         })
         for topology in topologies { snapshotDevicePlacements(deviceId: deviceId, topology: topology) }
         let ids = streams.filter { $0.value.deviceId == deviceId }.map(\.key)
+        if !ids.isEmpty {
+            TopologyTimeline.shared.record("device=\(deviceId) removing screens=\(ids.count)")
+        }
         for id in ids { destroyDisplay(id: id, allowLast: true) }
     }
 
@@ -1144,9 +1330,81 @@ final class HostApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 不直接把一次临时 SCK/WindowServer 竞态升级成长时间黑屏。首次仅 5 秒快速补试；
+    /// 连续失败才进入一分钟熔断。ColorSync 中毒另有独立保护，不会走这条快速路径。
+    private func deferTopologyRetry(_ active: DeviceTopologyTransition, now: Date, reason: String) {
+        let retryAt = topologyRetryPolicy.deferRetry(for: active.deviceId, now: now)
+        pendingTopologyRequests[active.deviceId] = DeviceTopologyRequest(
+            deviceId: active.deviceId, topology: active.topology, profiles: active.profiles,
+            generation: active.generation, retina: active.retina, transaction: active.transaction)
+        activeTopologyTransition = nil
+        let seconds = Int(retryAt.timeIntervalSince(now).rounded())
+        NSLog("[hyperdisplay] \(reason); will safely retry device \(active.deviceId) in \(seconds)s")
+        TopologyTimeline.shared.record("device=\(active.deviceId) retry in=\(seconds)s reason=\(reason)")
+    }
+
+    private func displayModeStatusKey(clientKey: String, transaction: UInt32) -> String {
+        "\(clientKey)#\(transaction)"
+    }
+
+    /// 控制状态采用小型 ACK 重传：它只在用户显式切换模式的短窗口运行，不会变成常驻轮询。
+    private func pushDisplayModeStatus(deviceId: UInt32, transaction: UInt32, status: DisplayModeStatus,
+                                       slot: UInt8 = 0xFF, requestedScale: UInt8, effectiveScale: UInt8) {
+        guard transaction != 0 else { return }
+        let packet = Wire.displayModeStatus(transaction: transaction, status: status, slot: slot,
+                                            requestedScale: requestedScale, effectiveScale: effectiveScale)
+        clientsLock.lock()
+        let recipients = clients.compactMap { key, client -> (String, sockaddr_in)? in
+            client.deviceId == deviceId ? (key, client.addr) : nil
+        }
+        clientsLock.unlock()
+        for (key, addr) in recipients {
+            let deliveryKey = displayModeStatusKey(clientKey: key, transaction: transaction)
+            pendingDisplayModeStatusAcks[deliveryKey] = PendingDisplayModeStatus(addr: addr, packet: packet, attempts: 1)
+            var target = addr
+            udp?.send(to: &target, packet)
+            retryDisplayModeStatus(deliveryKey)
+        }
+    }
+
+    private func retryDisplayModeStatus(_ key: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(80)) { [weak self] in
+            guard let self, var delivery = self.pendingDisplayModeStatusAcks[key] else { return }
+            guard delivery.attempts < 4 else {
+                self.pendingDisplayModeStatusAcks.removeValue(forKey: key)
+                return
+            }
+            delivery.attempts += 1
+            self.pendingDisplayModeStatusAcks[key] = delivery
+            var target = delivery.addr
+            self.udp?.send(to: &target, delivery.packet)
+            self.retryDisplayModeStatus(key)
+        }
+    }
+
+    /// 严格 Retina 模式被 WindowServer 改写或拒绝时，停止这次事务且不进入 5s/60s
+    /// 自动重试。Android 收到 status 后会恢复它上一套已提交的标准/Retina 配置。
+    private func rejectStrictRetina(_ active: DeviceTopologyTransition, reason: String) {
+        NSLog("[hyperdisplay] strict Retina unsupported: \(reason)")
+        TopologyTimeline.shared.record("device=\(active.deviceId) strict-retina unsupported reason=\(reason)")
+        rememberStrictRetinaUnsupported(active)
+        removeDeviceDisplays(deviceId: active.deviceId)
+        activeTopologyTransition = nil
+        pushDisplayModeStatus(deviceId: active.deviceId, transaction: active.transaction,
+                              status: .unsupported, requestedScale: 2, effectiveScale: 1)
+    }
+
     /// 同一时刻只能有一个 `CGVirtualDisplay` 拓扑事务。每秒由 tick 驱动，正常空闲时
     /// 零额外线程/子进程；只有用户连接、改分屏或断开后重开才进入这里。
     private func advanceTopologyTransition(now: Date = Date()) {
+        guard topologyAdvanceGate.begin() else { return }
+        defer {
+            if topologyAdvanceGate.end() {
+                DispatchQueue.main.async { [weak self] in
+                    self?.advanceTopologyTransition()
+                }
+            }
+        }
         refreshDisplayRemovalBarrier()
 
         if let active = activeTopologyTransition {
@@ -1161,9 +1419,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
                     activeTopologyTransition = nil
                     advanceTopologyTransition(now: now)
                 } else if now > active.appearanceDeadline {
-                    NSLog("[hyperdisplay] topology cancellation timed out waiting for display removal; holding creation")
-                    activeTopologyTransition = nil
-                    nextWaitingRestoreAt = now.addingTimeInterval(300)
+                    deferTopologyRetry(active, now: now,
+                                       reason: "topology cancellation timed out waiting for display removal")
                 }
                 return
             }
@@ -1182,12 +1439,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
             if active.waitingForRemoval {
                 guard displayRemovalBarrier.isEmpty else {
                     if now > active.appearanceDeadline {
-                        NSLog("[hyperdisplay] topology rebuild timed out waiting for WindowServer to remove old display(s); no retry for 5 minutes")
-                        pendingTopologyRequests[active.deviceId] = DeviceTopologyRequest(
-                            deviceId: active.deviceId, topology: active.topology, profiles: active.profiles,
-                            generation: active.generation)
-                        activeTopologyTransition = nil
-                        nextWaitingRestoreAt = now.addingTimeInterval(300)
+                        deferTopologyRetry(active, now: now,
+                                           reason: "topology rebuild timed out waiting for WindowServer removal")
                     }
                     return
                 }
@@ -1195,15 +1448,51 @@ final class HostApp: NSObject, NSApplicationDelegate {
             }
 
             if let displayID = active.awaitingDisplayID {
+                guard let display = streams[displayID]?.display else {
+                    deferTopologyRetry(active, now: now,
+                                       reason: "created display disappeared from registry")
+                    return
+                }
+                switch display.currentModeState {
+                case .matching:
+                    if !active.modeReadyRecorded {
+                        active.modeReadyRecorded = true
+                        TopologyTimeline.shared.record("device=\(active.deviceId) display id=\(displayID) mode ready in \(Int(display.age * 1000))ms")
+                    }
+                case .mismatch:
+                    if active.retina {
+                        rejectStrictRetina(active, reason: display.currentModeState.diagnosticDescription)
+                    } else if display.adoptActualStandardOneXMode() {
+                        active.modeReadyRecorded = true
+                        TopologyTimeline.shared.record("device=\(active.deviceId) display id=\(displayID) accepted actual standard 1x \(display.pixelWidth)x\(display.pixelHeight) in \(Int(display.age * 1000))ms")
+                    } else if now > active.appearanceDeadline {
+                        let state = display.currentModeState.diagnosticDescription
+                        NSLog("[hyperdisplay] display \(displayID) mode did not settle: \(state)")
+                        removeDeviceDisplays(deviceId: active.deviceId)
+                        deferTopologyRetry(active, now: now,
+                                           reason: "created display mode did not settle: \(state)")
+                    }
+                    return
+                case .unavailable:
+                    if now > active.appearanceDeadline {
+                        let state = display.currentModeState.diagnosticDescription
+                        if active.retina {
+                            rejectStrictRetina(active, reason: state)
+                        } else {
+                            NSLog("[hyperdisplay] display \(displayID) mode did not settle: \(state)")
+                            removeDeviceDisplays(deviceId: active.deviceId)
+                            deferTopologyRetry(active, now: now,
+                                               reason: "created display mode did not settle: \(state)")
+                        }
+                    }
+                    return
+                }
                 if displayRemovalBarrier.contains(displayID) || !isDisplayActive(displayID) {
                     if now > active.appearanceDeadline {
-                        NSLog("[hyperdisplay] created display \(displayID) never appeared; stopping automatic topology retry")
+                        NSLog("[hyperdisplay] created display \(displayID) never appeared")
                         removeDeviceDisplays(deviceId: active.deviceId)
-                        pendingTopologyRequests[active.deviceId] = DeviceTopologyRequest(
-                            deviceId: active.deviceId, topology: active.topology, profiles: active.profiles,
-                            generation: active.generation)
-                        activeTopologyTransition = nil
-                        nextWaitingRestoreAt = now.addingTimeInterval(300)
+                        deferTopologyRetry(active, now: now,
+                                           reason: "created display never appeared in WindowServer")
                     }
                     return
                 }
@@ -1217,13 +1506,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
                                                        generation: active.generation)
                     }
                     if now > active.appearanceDeadline {
-                        NSLog("[hyperdisplay] display \(displayID) never appeared in ScreenCaptureKit; stopping automatic topology retry")
+                        NSLog("[hyperdisplay] display \(displayID) never appeared in ScreenCaptureKit")
                         removeDeviceDisplays(deviceId: active.deviceId)
-                        pendingTopologyRequests[active.deviceId] = DeviceTopologyRequest(
-                            deviceId: active.deviceId, topology: active.topology, profiles: active.profiles,
-                            generation: active.generation)
-                        activeTopologyTransition = nil
-                        nextWaitingRestoreAt = now.addingTimeInterval(300)
+                        deferTopologyRetry(active, now: now,
+                                           reason: "created display never appeared in ScreenCaptureKit")
                     }
                     return
                 }
@@ -1233,13 +1519,19 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 }
                 active.awaitingDisplayID = nil
                 // 第一块屏一旦同时被 WindowServer 与 ScreenCaptureKit 确认，就可以先
-                // 交给平板出画。后续屏仍在 ColorSync 观察窗口里串行创建，不要让主屏
-                // 为画中画的第二块屏白等 8 秒。
+                // 交给平板出画。多屏仍严格串行；先用短观察窗口捕获最常见的注册竞态，
+                // 不再让第二块屏无条件等完整 8 秒。
                 attachDeviceDisplaysToConnectedClients(deviceId: active.deviceId)
-                // 多屏的下一块必须等当前屏通过完整 ColorSync 观察窗口。这样第二块若
-                // 触发系统 bug，会停在已验证的一块而不是并发制造更多显示器事件。
-                active.healthGateUntil = max(postCreateColorSyncCheckUntil, now.addingTimeInterval(8))
-                return
+                // 健康沉降窗口从“对象创建”开始计时，而不是从 SCK 枚举完成后再等
+                // 一遍。模式发布和 SCK 枚举本身已经消耗约 1–2 秒，旧写法因此给每块
+                // 屏重复增加 2 秒黑屏。8 秒 ColorSync 异常监控仍由独立守卫继续运行。
+                if active.nextProfileIndex < active.profiles.count {
+                    active.healthGateUntil = TopologyTimingPolicy.healthGateDeadline(createdAt: display.createdAt)
+                    return
+                }
+                // 最后一块已经被 WindowServer 与 SCK 确认，立即提交整组；后台的 8 秒
+                // ColorSync 守卫继续采样，不需要为了“宣告 ready”再黑屏等待 2 秒。
+                active.healthGateUntil = .distantPast
             }
 
             guard now >= active.healthGateUntil else { return }
@@ -1249,14 +1541,16 @@ final class HostApp: NSObject, NSApplicationDelegate {
                                              name: profile.name, deviceId: active.deviceId,
                                              screenSlot: profile.slot,
                                              topology: active.topology,
-                                             colorSyncPreflighted: true) else {
-                    NSLog("[hyperdisplay] topology creation failed for \(profile.name); stopping automatic retry")
-                    removeDeviceDisplays(deviceId: active.deviceId)
-                    pendingTopologyRequests[active.deviceId] = DeviceTopologyRequest(
-                        deviceId: active.deviceId, topology: active.topology, profiles: active.profiles,
-                        generation: active.generation)
-                    activeTopologyTransition = nil
-                    nextWaitingRestoreAt = now.addingTimeInterval(300)
+                                             colorSyncPreflighted: true,
+                                             retina: active.retina) else {
+                    if active.retina {
+                        rejectStrictRetina(active, reason: "creation rejected for \(profile.name)")
+                    } else {
+                        NSLog("[hyperdisplay] topology creation failed for \(profile.name)")
+                        removeDeviceDisplays(deviceId: active.deviceId)
+                        deferTopologyRetry(active, now: now,
+                                           reason: "topology creation failed")
+                    }
                     return
                 }
                 active.nextProfileIndex += 1
@@ -1264,25 +1558,49 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 active.appearanceDeadline = now.addingTimeInterval(15)
                 active.screenCaptureCheckInFlight = false
                 active.screenCaptureVisible = false
+                active.modeReadyRecorded = false
                 NSLog("[hyperdisplay] topology \(active.generation) created \(profile.name) id=\(id); waiting for WindowServer")
+                TopologyTimeline.shared.record("device=\(active.deviceId) created slot=\(profile.slot) id=\(id) waiting-windowserver")
                 return
             }
 
             let deviceId = active.deviceId
             activeTopologyTransition = nil
+            topologyRetryPolicy.reset(deviceId: deviceId)
             attachDeviceDisplaysToConnectedClients(deviceId: deviceId)
+            pushDisplayModeStatus(deviceId: deviceId, transaction: active.transaction,
+                                  status: .ready, requestedScale: active.retina ? 2 : 1,
+                                  effectiveScale: active.retina ? 2 : 1)
             NSLog("[hyperdisplay] topology \(active.generation) restored \(active.profiles.count) display(s) for device \(deviceId)")
+            TopologyTimeline.shared.record("device=\(deviceId) ready screens=\(active.profiles.count) generation=\(active.generation)")
             advanceTopologyTransition(now: now)
             return
         }
 
-        guard displayRemovalBarrier.isEmpty, now >= nextWaitingRestoreAt else { return }
-        guard let request = pendingTopologyRequests.values.min(by: { $0.generation < $1.generation }) else { return }
-        guard colorSyncAllowsDisplayCreation() else { return }
+        guard displayRemovalBarrier.isEmpty else {
+            setTopologyWaitState("WindowServer removal ids=\(displayRemovalBarrier.sorted())")
+            return
+        }
+        guard now >= nextWaitingRestoreAt else {
+            setTopologyWaitState("ColorSync recovery hold")
+            return
+        }
+        guard let request = pendingTopologyRequests.values
+            .filter({ topologyRetryPolicy.canAttempt(deviceId: $0.deviceId, now: now) })
+            .min(by: { $0.generation < $1.generation }) else { return }
+        guard colorSyncAllowsDisplayCreation() else {
+            setTopologyWaitState("ColorSync not quiescent")
+            return
+        }
+        setTopologyWaitState(nil)
         pendingTopologyRequests.removeValue(forKey: request.deviceId)
         activeTopologyTransition = DeviceTopologyTransition(
             deviceId: request.deviceId, topology: request.topology,
-            profiles: request.profiles, generation: request.generation)
+            profiles: request.profiles, generation: request.generation,
+            retina: request.retina, transaction: request.transaction)
+        TopologyTimeline.shared.record("device=\(request.deviceId) transition started topology=\(request.topology.displayName) screens=\(request.profiles.count) generation=\(request.generation)")
+        pushDisplayModeStatus(deviceId: request.deviceId, transaction: request.transaction,
+                              status: .validating, requestedScale: request.retina ? 2 : 1, effectiveScale: 0)
         advanceTopologyTransition(now: now)
     }
 
@@ -1305,6 +1623,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
                   active.awaitingDisplayID == displayID else { return }
             active.screenCaptureCheckInFlight = false
             active.screenCaptureVisible = visible
+            if visible, let display = self.streams[displayID]?.display {
+                TopologyTimeline.shared.record("device=\(deviceId) display id=\(displayID) ScreenCaptureKit ready in \(Int(display.age * 1000))ms")
+            }
         }
     }
 
@@ -1332,10 +1653,12 @@ final class HostApp: NSObject, NSApplicationDelegate {
     /// 新建都必须从一个真正安静的 ColorSync 状态开始；不能沿用“低于 50% 就继续”。
     private func colorSyncAllowsDisplayCreation() -> Bool {
         let liveColorSync = DisplayHealthMonitor.colorSyncLoad()
-        let liveColorSyncCPU = liveColorSync.peak
-        guard displayHealth.level == .normal,
-              let liveColorSyncCPU,
-              liveColorSyncCPU < 1.0 else {
+        // ColorSync 的三个辅助进程在完全空闲时可能根本不驻留在 ps 列表；这正是
+        // 最安静、可以安全建屏的状态，不能把 peak=nil 误判成“不健康”。只有实际
+        // 采到进程且 CPU >= 1% 时才拒绝；采样到异常高负载仍由 displayHealth.level
+        // 和这一道实时预检共同拦住。
+        let colorSyncIsQuiescent = liveColorSync.peak.map { $0 < 1.0 } ?? true
+        guard displayHealth.level == .normal, colorSyncIsQuiescent else {
             NSLog("[hyperdisplay] refusing virtual-display creation: ColorSync is not quiescent (\(liveColorSync.description)); log out before retrying")
             return false
         }
@@ -1345,7 +1668,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
     private func createDisplay(width: Int, height: Int, name: String, deviceId: UInt32? = nil,
                                screenSlot: Int? = nil,
                                topology: DeviceTopology? = nil,
-                               colorSyncPreflighted: Bool = false) -> CGDirectDisplayID? {
+                               colorSyncPreflighted: Bool = false,
+                               retina: Bool = true) -> CGDirectDisplayID? {
         // 同一份用户档案的多块屏共享一次预检；这样不会在已开始的受控组建过程中，
         // 因瞬时采样把布局留成半组。任何新一轮拓扑仍必须先通过静态预检。
         guard colorSyncPreflighted || colorSyncAllowsDisplayCreation() else { return nil }
@@ -1376,8 +1700,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
         } else {
             edid = (productID: 0x0001, serial: 1)
         }
-        guard let vd = VirtualDisplay(width: w, height: h, refreshRate: Double(config.fps),
-                                      productID: edid.productID, serial: edid.serial) else {
+        guard let vd = VirtualDisplay(width: w, height: h, name: name, refreshRate: Double(config.fps),
+                                      productID: edid.productID, serial: edid.serial, retina: retina) else {
             lastCreateFailAt = Date()
             return nil
         }
@@ -1409,9 +1733,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
         return vd.displayID
     }
 
-    /// 双屏共用同一条 Android Wi-Fi/USB UDP 路径，必须按“设备总预算”而不是每路各自
-    /// 用单屏峰值。16Mbps 是启动预算：真实拥塞仍由接收端反馈继续 AIMD 下调；静止时
-    /// 单帧 IDR 可在各路自身目标内恢复清晰，不会持续抢占队列。
+    /// 同一 Android 设备的多屏共用 UDP 路径，仍需按“设备总预算”分配，避免各路
+    /// 独立冲峰。但该预算必须遵守产品的画质优先政策：按总像素给足 10Mbps/MP，
+    /// 最高 60Mbps；旧的固定 16Mbps 会把原生双屏压到约 3Mbps/MP，静态文字无法
+    /// 恢复锐利。Wi-Fi 真有丢片时再由接收端的 AIMD 回退，USB 隧道不人为限速。
     private func rebalanceDeviceTransportBudget(deviceId: UInt32) {
         let deviceStreams = streams.values
             .filter { $0.deviceId == deviceId }
@@ -1421,7 +1746,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
         let floor: UInt64 = 2_000_000
         let desired = deviceStreams.map { UInt64($0.qualityCeiling) }
         let desiredTotal = desired.reduce(0, +)
-        let budget = min(UInt64(16_000_000), desiredTotal)
+        let budget = min(UInt64(60_000_000), desiredTotal)
         let remaining = max(UInt64(0), budget - floor * UInt64(deviceStreams.count))
         let weights = desired.map { max(UInt64(1), $0 - floor) }
         let weightTotal = weights.reduce(0, +)
@@ -1440,6 +1765,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
         streams[id]?.display.destroy()
         // ObjC shim 已放开对象，也仍须等待 WindowServer 真正注销这个 id，才能创建下一块。
         displayRemovalBarrier.insert(id)
+        TopologyTimeline.shared.record("display destroy requested id=\(id) barrier=\(displayRemovalBarrier.sorted())")
         streamsLock.lock()
         streams[id] = nil
         streamsLock.unlock()
@@ -1476,7 +1802,11 @@ final class HostApp: NSObject, NSApplicationDelegate {
             var a = addr
             udp?.send(to: &a, Wire.pong(seq: seq, known: known))
         case .nack(let displayId, let frameId, let indices):
-            if let stream = snapshotStreams()[CGDirectDisplayID(displayId)] {
+            let id = CGDirectDisplayID(displayId)
+            // NACK 会触发 IDR/码率调整；只能由正在观看该屏的客户端提出，不能让
+            // 另一台设备的过期包把当前会话拉低码率或反复重编码。
+            guard isSubscribed(clientKey: clientKey(addr), to: id) else { return }
+            if let stream = snapshotStreams()[id] {
                 if indices.isEmpty {
                     // Android 端 latest-frame 放弃整帧后的轻量拥塞信号；不可重传。
                     // 以前这里只降码率；若已在码率地板，根本不会产生新的 IDR，
@@ -1499,13 +1829,18 @@ final class HostApp: NSObject, NSApplicationDelegate {
             var a = addr
             udp?.send(to: &a, Wire.inputAck(seq: seq))
         case .keyframeReq(let displayId):
+            // 一个客户端不能通过猜测 displayId 干扰另一台设备的编码/关键帧节奏。
+            let allowed = subscribedDisplayIDs(for: clientKey(addr))
             let snapshot = snapshotStreams()
             if displayId == displayIdBroadcast {
-                for stream in snapshot.values {
-                    stream.requestKeyframeAndReplay()
+                for id in allowed {
+                    snapshot[id]?.requestKeyframeAndReplay()
                 }
-            } else if let stream = snapshot[CGDirectDisplayID(displayId)] {
-                stream.requestKeyframeAndReplay()
+            } else {
+                let id = CGDirectDisplayID(displayId)
+                if allowed.contains(id) {
+                    snapshot[id]?.requestKeyframeAndReplay()
+                }
             }
         case .cursorImageAck(let imageId):
             acknowledgeCursorImage(imageId: imageId, clientKey: clientKey(addr))
@@ -1523,7 +1858,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
         clientsLock.unlock()
 
         switch packet {
-        case .hello(let proto, let cw, let ch, let code, let claimedDeviceId, let requestedDisplays, let deviceFingerprint, let layout):
+        case .hello(let proto, let cw, let ch, let code, let claimedDeviceId, let requestedDisplays, let deviceFingerprint, let layout, let advertisedDeviceName):
             guard code == pairingCode else {
                 NSLog("[hyperdisplay] HELLO from \(addressString(addr)) REJECTED (bad pairing code)")
                 return
@@ -1536,7 +1871,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 udp?.send(to: &a, Wire.pong(seq: 0, known: false))
                 return
             }
-            let identity = canonicalDeviceIdentity(claimedId: claimedDeviceId, fingerprint: deviceFingerprint)
+            let deviceName = sanitizedDeviceName(advertisedDeviceName)
+            let identity = canonicalDeviceIdentity(claimedId: claimedDeviceId, fingerprint: deviceFingerprint,
+                                                   deviceName: deviceName)
             let deviceId = identity.deviceId
             let restoreClaim = DeviceRestoreClaim(deviceId: deviceId, claimedDeviceId: claimedDeviceId)
             let restoringAfterReinstall = identity.restoredAfterReinstall && !acknowledgedRestoreClaims.contains(restoreClaim)
@@ -1546,12 +1883,21 @@ final class HostApp: NSObject, NSApplicationDelegate {
             let effectiveLayout = restoringAfterReinstall ? loadDeviceLayout(deviceId) ?? layout : layout
             let topology = DeviceTopology(layoutKind: effectiveLayout?.kind,
                                           requestedScreenCount: restoringAfterReinstall ? 0 : requestedDisplays.count)
+            // 先登记会话再进入可能同步失败的严格 Retina 事务。这样即使 CGVirtualDisplay
+            // 在首块屏创建前就拒绝几何规格，unsupported 状态也一定有 Android 收件人。
+            clientsLock.lock()
+            clients[key] = Client(addr: addr, deviceName: deviceName,
+                                  deviceId: deviceId, claimedDeviceId: claimedDeviceId,
+                                  topology: topology, displayIds: [], lastSeen: Date())
+            clientsLock.unlock()
             if deviceId != 0 {
                 if !restoringAfterReinstall, let layout { saveDeviceLayout(deviceId, layout) }
-                let profiles = deviceProfiles(deviceId: deviceId, topology: topology,
+                let profiles = deviceProfiles(deviceId: deviceId, topology: topology, deviceName: deviceName,
                                               clientWidth: cw, clientHeight: ch,
                                               requested: restoringAfterReinstall ? [] : requestedDisplays)
-                reconcileDeviceDisplays(deviceId: deviceId, topology: topology, profiles: profiles)
+                reconcileDeviceDisplays(deviceId: deviceId, topology: topology, profiles: profiles,
+                                        retina: effectiveLayout?.requestsStrictRetina ?? true,
+                                        transaction: effectiveLayout?.transaction ?? 0)
             }
             // 目标屏：档案屏优先（剪枝后重入会也能回到自己的屏——setSubscriptions 对
             // 不存在的客户端是空操作，不能依赖它），其次既有订阅，最后默认屏
@@ -1564,9 +1910,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 targets = [first]
             }
             clientsLock.lock()
-            clients[key] = Client(addr: addr, deviceId: deviceId, claimedDeviceId: claimedDeviceId,
-                                  topology: topology,
-                                  displayIds: targets, lastSeen: Date())
+            if clients[key] != nil {
+                clients[key]?.displayIds = targets
+                clients[key]?.lastSeen = Date()
+            }
             clientsLock.unlock()
             if restoringAfterReinstall, let savedLayout = loadDeviceLayout(deviceId) {
                 var target = addr
@@ -1599,8 +1946,10 @@ final class HostApp: NSObject, NSApplicationDelegate {
             // 绿屏自愈最后手段（客户端检测到全零输出且本地解码器重建无效）：
             // 只重建该屏的编码器会话——不碰当前 SCStream/虚拟屏，
             // 2026-08-21 拔线绿屏实测：客户端 2 次自救失败后走此路径
+            let id = CGDirectDisplayID(displayId)
+            guard isSubscribed(clientKey: key, to: id) else { return }
             NSLog("[hyperdisplay] encoder reset requested for display \(displayId)")
-            streams[CGDirectDisplayID(displayId)]?.bounceEncoder()
+            streams[id]?.bounceEncoder()
 
         case .setTier:
             // 新客户端会把尺寸写进 HELLO 档案后执行一次受控重连；不再为档位切换重启 Host。
@@ -1615,6 +1964,9 @@ final class HostApp: NSObject, NSApplicationDelegate {
             clientsLock.unlock()
             NSLog("[hyperdisplay] client confirmed restored layout; subsequent settings are authoritative")
 
+        case .displayModeStatusAck(let transaction):
+            pendingDisplayModeStatusAcks.removeValue(forKey: displayModeStatusKey(clientKey: key, transaction: transaction))
+
         case .bye:
             // 平板真正进入后台/退出就是物理拔线：立即销毁这台设备的整组虚拟屏。
             // USB↔Wi-Fi 换路由不会发 BYE，因此仍可在短暂断链窗口复用原屏。
@@ -1622,37 +1974,68 @@ final class HostApp: NSObject, NSApplicationDelegate {
             clientsLock.lock()
             let deviceId = clients[key]?.deviceId
             clients.removeValue(forKey: key)
+            // 同一平板 USB/Wi-Fi 切换的旧会话可能随后才送到 BYE；只要还有该设备
+            // 的一个活会话，就绝不能把它的屏幕当作“物理拔线”删除。
+            let hasSiblingSession = deviceId.map { id in clients.values.contains { $0.deviceId == id } } ?? false
             clientsLock.unlock()
-            if let deviceId, deviceId != 0 {
+            if let deviceId, deviceId != 0, !hasSiblingSession {
                 let count = streams.values.filter { $0.deviceId == deviceId }.count
                 cancelTopology(for: deviceId)
                 removeDeviceDisplays(deviceId: deviceId)
                 NSLog("[hyperdisplay] background unplug removed \(count) display(s) for device \(deviceId)")
+                TopologyTimeline.shared.record("device=\(deviceId) bye removed screens=\(count)")
             }
             pushDisplays()
         }
     }
 
     private func subscribe(key: String, displayId: CGDirectDisplayID) {
-        guard streams[displayId] != nil else { return }
+        // 所有订阅入口都必须落到同一条“设备只能看自己的屏”规则上。HELLO/旧版
+        // SELECT/SUBSCRIBE 的到达顺序不同，不能只依赖调用方已经过滤。
         clientsLock.lock()
+        guard let client = clients[key], client.deviceId != 0,
+              streams[displayId]?.deviceId == client.deviceId else {
+            clientsLock.unlock()
+            return
+        }
         clients[key]?.displayIds.insert(displayId)
-        let addr = clients[key]?.addr
+        let addr = client.addr
         clientsLock.unlock()
         streams[displayId]?.startIfNeeded()
         streams[displayId]?.sendWelcome()
         // 参数集补发：晚加入的订阅者没有它，解码器永远起不来（黑屏根因）
-        if var a = addr { streams[displayId]?.sendConfigReplay(to: &a) }
+        var target = addr
+        streams[displayId]?.sendConfigReplay(to: &target)
         sendCachedCursorImage(to: key)
     }
 
     /// 单屏/分屏模式的订阅集整体切换
     private func setSubscriptions(key: String, ids: Set<CGDirectDisplayID>) {
         clientsLock.lock()
-        let removed = clients[key]?.displayIds.subtracting(ids) ?? []
-        clients[key]?.displayIds = ids
+        let deviceId = clients[key]?.deviceId ?? 0
         clientsLock.unlock()
-        for id in ids where streams[id] != nil {
+        // DISPLAYS 虽已按设备过滤，但订阅包来自不可靠重连路径，不能把“客户端带来的
+        // id”当作授权依据。否则两台设备同时重连时，旧列表/乱序 SUBSCRIBE 可让平板
+        // 收到手机的编码流；纵横比不同便表现为大黑边、画面错屏。
+        let owned: Set<CGDirectDisplayID>
+        if deviceId == 0 {
+            // 没有稳定设备身份的会话不属于零点击产品路径；宁可重新 HELLO，绝不能
+            // 回退到“默认第一块屏”，否则又会把另一台设备的画面送错终端。
+            owned = []
+        } else {
+            owned = Set(ids.filter { streams[$0]?.deviceId == deviceId })
+        }
+        if owned != ids {
+            let rejected = ids.subtracting(owned).sorted()
+            NSLog("[hyperdisplay] rejected cross-device subscription device=%u ids=%@", deviceId,
+                  rejected.map(String.init).joined(separator: ","))
+            TopologyTimeline.shared.record("device=\(deviceId) rejected foreign subscription ids=\(rejected)")
+        }
+        clientsLock.lock()
+        let removed = clients[key]?.displayIds.subtracting(owned) ?? []
+        clients[key]?.displayIds = owned
+        clientsLock.unlock()
+        for id in owned where streams[id] != nil {
             streams[id]?.startIfNeeded()
             streams[id]?.sendWelcome()
         }
@@ -1681,8 +2064,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
             guard let s = streams[id] else { return nil }
             return DisplayListEntry(
                 id: UInt32(id),
-                width: UInt16(s.display.logicalWidth),
-                height: UInt16(s.display.logicalHeight),
+                width: UInt16(s.display.pixelWidth),
+                height: UInt16(s.display.pixelHeight),
                 name: s.name)
         }
         return entries
@@ -1692,6 +2075,34 @@ final class HostApp: NSObject, NSApplicationDelegate {
         clientsLock.lock()
         defer { clientsLock.unlock() }
         return clients.values.filter { $0.displayIds.contains(displayId) }.map { $0.addr }
+    }
+
+    private func subscribedDisplayIDs(for key: String) -> Set<CGDirectDisplayID> {
+        clientsLock.lock()
+        defer { clientsLock.unlock() }
+        return clients[key]?.displayIds ?? []
+    }
+
+    private func sanitizedDeviceName(_ name: String) -> String {
+        let cleaned = name.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }.map(String.init).joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(cleaned.prefix(48))
+    }
+
+    private func currentDeviceName(for stream: DisplayStream) -> String {
+        guard let deviceId = stream.deviceId else { return "手动显示器" }
+        clientsLock.lock()
+        let name = clients.values
+            .filter { $0.deviceId == deviceId && !$0.deviceName.isEmpty }
+            .max { $0.lastSeen < $1.lastSeen }?.deviceName
+        clientsLock.unlock()
+        return name ?? "Android 设备 \(deviceId % 10_000)"
+    }
+
+    private func isSubscribed(clientKey: String, to displayId: CGDirectDisplayID) -> Bool {
+        clientsLock.lock()
+        defer { clientsLock.unlock() }
+        return clients[clientKey]?.displayIds.contains(displayId) == true
     }
 
     private func cursorImageRecipients(of displayId: CGDirectDisplayID) -> [(String, sockaddr_in)] {
@@ -1825,8 +2236,8 @@ final class HostApp: NSObject, NSApplicationDelegate {
             let subscribers = addressesOfSubscribers(of: id)
             guard !subscribers.isEmpty else { continue }
             let cursorImageRecipients = cursorImageRecipients(of: id)
-            let x = Float((location.x - bounds.minX) / bounds.width * CGFloat(stream.display.logicalWidth))
-            let y = Float((location.y - bounds.minY) / bounds.height * CGFloat(stream.display.logicalHeight))
+            let x = Float((location.x - bounds.minX) / bounds.width * CGFloat(stream.outputWidth))
+            let y = Float((location.y - bounds.minY) / bounds.height * CGFloat(stream.outputHeight))
             let key = "\(id):\(Int(x)),\(Int(y))"
             if key != lastCursorKey {
                 lastCursorKey = key
@@ -1852,28 +2263,39 @@ final class HostApp: NSObject, NSApplicationDelegate {
         enforcePostCreateColorSyncGuard(now: now)
         advanceTopologyTransition(now: now)
         clientsLock.lock()
-        let stale = clients.filter { now.timeIntervalSince($0.value.lastSeen) > 6 }.map { $0.key }
+        let staleClients = clients.filter { now.timeIntervalSince($0.value.lastSeen) > 6 }
+        let stale = staleClients.map(\.key)
+        let staleDeviceIDs = Set(staleClients.values.map(\.deviceId))
         for key in stale { clients.removeValue(forKey: key) }
+        // APK 覆盖安装、进程被系统杀掉时没有机会送 BYE。若该设备正在切换
+        // 单屏/分屏，旧事务绝不能继续悬挂：后续新会话的同一份 HELLO 会因为
+        // “事务仍存在”被去重，从而永久停在「等待 Mac 主机」。只取消已无任何
+        // 存活会话的设备；USB↔Wi‑Fi 双路切换仍会保留至少一个 sibling 会话。
+        let orphanedTopologyDevices = staleDeviceIDs.filter { id in
+            id != 0 && !clients.values.contains { $0.deviceId == id }
+        }
         let clientCount = clients.count
         clientsLock.unlock()
+        for deviceId in orphanedTopologyDevices { cancelTopology(for: deviceId) }
         if !stale.isEmpty {
             NSLog("[hyperdisplay] pruned \(stale.count) stale client(s)")
         }
         restoreWaitingDisplayIfHealthy()
-        // 有会话期间每屏只保留一条 SCStream；看门狗只重启同一流。无人订阅后按
-        // 产品基线回收：BYE 约 5s，异常断链从最后心跳算约 15s。严禁因此做全量重建。
+        // 有会话期间每屏只保留一条 SCStream；看门狗只重启同一流。BYE 立即回收；
+        // 进程被硬杀而来不及 BYE 时，6 秒无心跳即回收，避免用户划掉 app 后长期
+        // 残留不可见显示器。严禁因此做全量重建。
         var expired: [CGDirectDisplayID] = []
         for stream in Array(streams.values) {
             stream.sampleStats()
             stream.adaptQuality(now: now)
             if addressesOfSubscribers(of: stream.display.displayID).isEmpty {
                 if stream.idleSince == nil {
-                    // stale 客户端在 6s 时被剪枝；回拨这 6s，使异常总回收时长约 15s。
+                    // stale 客户端在 6s 时被剪枝；回拨完整阈值使本轮立即回收。
                     stream.idleSince = stale.isEmpty ? now : now.addingTimeInterval(-6)
                 }
                 if !stream.isInitialDisplay,
                    let since = stream.idleSince,
-                   now.timeIntervalSince(since) >= 15 {
+                   now.timeIntervalSince(since) >= 6 {
                     expired.append(stream.display.displayID)
                 }
             } else {
@@ -1930,12 +2352,13 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     /// ColorSync 保护期间，HELLO 会被保留为已连接会话但不建屏。健康恢复后必须由
     /// host 主动补建：Android 会保持同一个 UDP socket 等待，不能要求用户退出再打开。
-    /// v1 只有单平板，因此一次只恢复一个等待中的设备；成功后即停止，避免任何
-    /// "恢复循环"演变成显示器 churn。
+    /// 每次最多恢复一个等待设备，避免任何“恢复循环”演变成显示器 churn；已有
+    /// 其他平板在用不应阻止第二台设备恢复自己的独立副屏。
     private func restoreWaitingDisplayIfHealthy() {
         let now = Date()
-        guard now >= nextWaitingRestoreAt, streams.isEmpty, displayHealth.level == .normal else { return }
-        nextWaitingRestoreAt = now.addingTimeInterval(30)
+        guard now >= nextWaitingRestoreAt,
+              now >= nextWaitingRestoreScanAt,
+              displayHealth.level == .normal else { return }
         clientsLock.lock()
         let waiting = clients.first { _, client in
             client.deviceId != 0 && client.displayIds.isEmpty &&
@@ -1944,7 +2367,15 @@ final class HostApp: NSObject, NSApplicationDelegate {
         clientsLock.unlock()
         guard let (key, client) = waiting,
               let profiles = loadDeviceProfiles(client.deviceId, topology: client.topology) else { return }
-        reconcileDeviceDisplays(deviceId: client.deviceId, topology: client.topology, profiles: profiles)
+        // 找到真正需要恢复的客户端后才开始下一次 30 秒扫描计时；该节流不能阻止
+        // 本轮 reconcile 立即进入拓扑队列。
+        nextWaitingRestoreScanAt = now.addingTimeInterval(30)
+        let savedLayout = loadDeviceLayout(client.deviceId)
+        reconcileDeviceDisplays(deviceId: client.deviceId, topology: client.topology, profiles: profiles,
+                                // 老客户端没有清晰度字段时，安全默认值必须是明确的标准 1x；
+                                // 不能在后台恢复时擅自发起严格 Retina 建屏/失败循环。
+                                retina: savedLayout?.requestsStrictRetina ?? false,
+                                transaction: savedLayout?.transaction ?? 0)
         let restored = Set(streams.filter { $0.value.deviceId == client.deviceId }.map(\.key))
         guard !restored.isEmpty else { return }
         clientsLock.lock()
@@ -2004,11 +2435,13 @@ final class HostApp: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         for (index, id) in displayOrder.enumerated() {
             guard let s = streams[id] else { continue }
+            let deviceName = currentDeviceName(for: s)
             let subscribers = addressesOfSubscribers(of: id).count
             let scalePct = Int(s.captureScale * 100)
             let mb = s.currentBitrate / 1_000_000
             let targetMb = s.targetBitrate / 1_000_000
-            let line = "屏 \(index + 1): \(s.display.pixelWidth)×\(s.display.pixelHeight)"
+            let density = s.display.backingScale == 2 ? "Retina 2x" : "兼容 1x"
+            let line = "屏 \(index + 1) · \(deviceName): \(s.display.pixelWidth)×\(s.display.pixelHeight) · \(density)"
                 + (s.started ? " · \(s.effectiveFps)fps · \(mb)/\(targetMb)M · 采集\(scalePct)% · \(subscribers)客户端" : " · 待客户端")
             menu.addItem(withTitle: line, action: nil, keyEquivalent: "")
         }

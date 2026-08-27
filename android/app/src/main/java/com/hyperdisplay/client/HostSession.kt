@@ -2,6 +2,7 @@ package com.hyperdisplay.client
 
 import android.util.Log
 import android.provider.Settings
+import android.os.Build
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -9,6 +10,8 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -26,6 +29,8 @@ class HostSession private constructor(
     private val deviceId: Int,
     /** 不可逆的系统设备指纹；Host 用它把卸载后的新随机 ID 归并回原有显示器档案。 */
     private val deviceFingerprint: Long,
+    /** 设备的系统显示名，仅用于 Host 菜单的当前会话标识，不参与设备身份。 */
+    private val deviceName: String,
     /** 当前平板持久布局对应的目标副屏组；可在同一会话内随 HELLO 更新。 */
     @Volatile private var requestedDisplays: List<Pair<Int, Int>>,
     /** 由 Host 备份的跨卸载布局快照；与目标屏组一起原子语义地更新。 */
@@ -42,6 +47,10 @@ class HostSession private constructor(
         fun onDisplays(displays: List<DisplayInfo>)
         /** 卸载重装后，Host 回传该平板此前保存的布局；普通重连不会收到。 */
         fun onSavedLayout(layout: LayoutState)
+        /** Host 的实测显示模式状态。只有 actualScale=2 的 ready 才能称为 Retina。 */
+        fun onDisplayModeStatus(transaction: Int, status: Int, slot: Int, requestedScale: Int, actualScale: Int)
+        /** 连续 unknown PONG：保存的地址/配对码可能已指向旧 Host，会话无法自愈。 */
+        fun onSessionNeedsRediscovery()
         fun onLinkEvent(connected: Boolean)
     }
 
@@ -59,7 +68,12 @@ class HostSession private constructor(
         val pipCustomH: Int = 0,
         val displayLongEdge: Int = 0,
         val pipLeft: Int = -1,
-        val pipTop: Int = -1
+        val pipTop: Int = -1,
+        /** 固定 15B 布局之后的向后兼容扩展。 */
+        val displaySizePreset: Int = 0,
+        /** 0=明确 1x，1=严格请求实际 Retina 2x。 */
+        val clarity: Int = 0,
+        val transaction: Int = 0
     ) {
         fun writeTo(out: ByteBuffer) {
             out.put(kind.coerceIn(0, 4).toByte())
@@ -121,6 +135,14 @@ class HostSession private constructor(
             // 0 是协议中的“旧客户端未提供指纹”保留值，极低概率碰到时改成 1。
             return if (fingerprint == 0L) 1L else fingerprint
         }
+
+        fun loadDeviceDisplayName(ctx: android.content.Context): String {
+            val customName = try {
+                Settings.Global.getString(ctx.contentResolver, "device_name")
+            } catch (_: Exception) { null }
+            val fallback = Build.MODEL?.trim().orEmpty().ifBlank { "Android 设备" }
+            return (customName?.trim().takeUnless { it.isNullOrBlank() } ?: fallback).take(48)
+        }
         private const val TYPE_WELCOME = 0x01
         private const val TYPE_VIDEO_FRAG = 0x02
         private const val TYPE_CONFIG = 0x03
@@ -130,6 +152,7 @@ class HostSession private constructor(
         private const val TYPE_CURSOR = 0x08
         private const val TYPE_CURSOR_IMAGE = 0x09
         private const val TYPE_SAVED_LAYOUT = 0x0A
+        private const val TYPE_DISPLAY_MODE_STATUS = 0x0B
         private const val TYPE_HELLO = 0x10
         private const val TYPE_KEYFRAME_REQ = 0x11
         private const val TYPE_INPUT = 0x12
@@ -142,6 +165,7 @@ class HostSession private constructor(
         private const val TYPE_CURSOR_IMAGE_ACK = 0x19
         private const val TYPE_BYE = 0x1A
         private const val TYPE_LAYOUT_RESTORE_ACK = 0x1D
+        private const val TYPE_DISPLAY_MODE_STATUS_ACK = 0x1E
         private const val DISPLAY_ID_BROADCAST = 0xFFFF
         private const val PROTO_VERSION = 1
         private const val RETRANSMIT_MS = 40L
@@ -155,6 +179,7 @@ class HostSession private constructor(
             code: Int = 0,
             deviceId: Int = 0,
             deviceFingerprint: Long = 0L,
+            deviceName: String = "",
             requestedDisplays: List<Pair<Int, Int>> = emptyList(),
             layout: LayoutState = LayoutState(),
             network: android.net.Network? = null
@@ -164,7 +189,7 @@ class HostSession private constructor(
                 val parts = host.split(".").map { it.toInt() }
                 require(parts.size == 4 && parts.all { it in 0..255 })
                 val addr = InetAddress.getByAddress(parts.map { it.toByte() }.toByteArray())
-                HostSession(addr, port, listener, code, deviceId, deviceFingerprint,
+                HostSession(addr, port, listener, code, deviceId, deviceFingerprint, deviceName,
                     requestedDisplays.take(4), layout, network)
             } catch (e: Exception) {
                 Log.e(TAG, "invalid host address: $host", e)
@@ -190,6 +215,14 @@ class HostSession private constructor(
     @Volatile private var running = true
     @Volatile private var threadLinkUp = false
     @Volatile private var lastPongAt = System.currentTimeMillis()
+    /** unknown PONG 应只覆盖建屏期间的短窗口；连续多次才判定保存的 Host 已过期。 */
+    @Volatile private var consecutiveUnknownPongs = 0
+    /**
+     * 合法 Host 会在接受 HELLO 后立即回一份 DISPLAYS（即使暂时是空列表）。
+     * 因此「收到了 DISPLAYS，但还在建虚拟屏」不能被误判成保存的 Host 过期；否则
+     * 客户端会在 macOS 正常回收旧屏的窗口里反复切 mDNS，反而把首次出画拖慢。
+     */
+    @Volatile private var receivedDisplaysForSession = false
     @Volatile private var remoteControlEnabled = true
     private val inputSeq = AtomicInteger(1)
     private val pingSeq = AtomicInteger(1)
@@ -256,6 +289,8 @@ class HostSession private constructor(
     private val thread = Thread({
         threadLinkUp = false // 每条新会话从「未连通」开始（否则旧会话的 true 会吞掉新会话的 onLinkEvent）
         lastPongAt = System.currentTimeMillis()
+        consecutiveUnknownPongs = 0
+        receivedDisplaysForSession = false
         if (useTcpTunnel) {
             // 独立心跳：TCP 读循环在有视频流时永不空闲，靠读超时触发 PING 会饿死
             // （链路永远判定不通 → 反复重连闪屏）。启动即 HELLO+PING，之后每 1.5s 一个 PING。
@@ -432,11 +467,44 @@ class HostSession private constructor(
                             list.add(DisplayInfo(id, w, h, name))
                             off += 9 + nameLen
                         }
-                        if (ok) listener.onDisplays(list)
+                        if (ok) {
+                            receivedDisplaysForSession = true
+                            listener.onDisplays(list)
+                        }
                     }
                     TYPE_SAVED_LAYOUT -> {
                         if (len >= 5 + LayoutState.WIRE_BYTES) {
-                            listener.onSavedLayout(LayoutState.readFrom(bb, 5))
+                            val base = LayoutState.readFrom(bb, 5)
+                            // [D2][version][size][clarity] 是新 Host 可选尾部；旧包仍按基础布局恢复。
+                            val restored = if (len >= 5 + LayoutState.WIRE_BYTES + 4 &&
+                                (buf[5 + LayoutState.WIRE_BYTES].toInt() and 0xFF) == 0xD2 &&
+                                (buf[6 + LayoutState.WIRE_BYTES].toInt() and 0xFF) == 1) {
+                                LayoutState(
+                                    kind = base.kind, fractionPermille = base.fractionPermille,
+                                    sideLeft = base.sideLeft, pipRatio = base.pipRatio,
+                                    pipCustomW = base.pipCustomW, pipCustomH = base.pipCustomH,
+                                    displayLongEdge = base.displayLongEdge, pipLeft = base.pipLeft,
+                                    pipTop = base.pipTop,
+                                    displaySizePreset = buf[7 + LayoutState.WIRE_BYTES].toInt() and 0xFF,
+                                    clarity = buf[8 + LayoutState.WIRE_BYTES].toInt() and 0xFF
+                                )
+                            } else base
+                            listener.onSavedLayout(restored)
+                        }
+                    }
+                    TYPE_DISPLAY_MODE_STATUS -> {
+                        // [transaction seq u32][status][slot][requestedScale][actualScale]
+                        if (len >= 9) {
+                            val transaction = bb.getInt(1)
+                            listener.onDisplayModeStatus(
+                                transaction,
+                                buf[5].toInt() and 0xFF,
+                                buf[6].toInt() and 0xFF,
+                                buf[7].toInt() and 0xFF,
+                                buf[8].toInt() and 0xFF
+                            )
+                            // 状态属于控制通道：必须确认，Host 才停止短暂重发。
+                            send(buildPacket(TYPE_DISPLAY_MODE_STATUS_ACK, transaction))
                         }
                     }
                     TYPE_CURSOR -> {
@@ -483,8 +551,20 @@ class HostSession private constructor(
                             // 不把 unknown PONG 当作“链路已正常”：等待下一枚 known PONG
                             // 才对 UI 宣布连通，避免空会话遮住等待提示。
                             threadLinkUp = false
+                            // 合法 Host 建屏通常只会短暂返回 unknown。若连续约 9 秒仍无
+                            // 可用屏，保存的地址或配对码大概率属于旧 Host；交给 Activity
+                            // 重新 mDNS 发现，而不是无限发 HELLO 占用网络和 UI。
+                            consecutiveUnknownPongs += 1
+                            if (consecutiveUnknownPongs >= 6 && !receivedDisplaysForSession) {
+                                consecutiveUnknownPongs = 0
+                                listener.onSessionNeedsRediscovery()
+                            } else if (receivedDisplaysForSession) {
+                                // 建屏还未完成时只继续 HELLO/PING 等待，不能重发现。
+                                consecutiveUnknownPongs = 0
+                            }
                             return
                         }
+                        consecutiveUnknownPongs = 0
                         if (known && !threadLinkUp) {
                             threadLinkUp = true
                             listener.onLinkEvent(true)
@@ -501,7 +581,10 @@ class HostSession private constructor(
     fun close(sendBye: Boolean = true) {
         // 只有平板真正离开（后台/关闭）才发 BYE 并移除虚拟屏；USB↔Wi-Fi
         // 换路由时静默换 socket，让 Host 复用同一个稳定 EDID 的显示器对象。
-        if (sendBye) send(buildPacket(TYPE_BYE, 0))
+        // BYE 不能复用普通异步 send：若先把它入队、随即 running=false，发送线程
+        // 会把这枚包当作已关闭会话直接丢弃，Mac 只能等心跳超时才回收显示器。
+        // 仍由专用发送线程执行网络 I/O；这里只等待很短的确认，避免主线程网络操作。
+        if (sendBye && running) sendBeforeClose(buildPacket(TYPE_BYE, 0))
         running = false
         // 幂等：重连流程可能多次 close（自动降级/升级路径）
         if (!socket.isClosed) {
@@ -545,18 +628,43 @@ class HostSession private constructor(
         sendHandler.post {
             if (!running) return@post
             try {
-                val out = tcpOut
-                if (useTcpTunnel && out != null) {
-                    val frame = ByteBuffer.allocate(4 + packet.size).order(ByteOrder.LITTLE_ENDIAN)
-                        .putInt(packet.size).put(packet).array()
-                    out.write(frame)
-                    out.flush()
-                } else {
-                    socket.send(DatagramPacket(packet, packet.size, address, port))
-                }
+                writePacket(packet)
             } catch (e: Exception) {
                 if (running) Log.w(TAG, "send failed: ${e.javaClass.simpleName}: ${e.message}")
             }
+        }
+    }
+
+    private fun sendBeforeClose(packet: ByteArray) {
+        val written = CountDownLatch(1)
+        sendHandler.post {
+            try {
+                writePacket(packet)
+            } catch (e: Exception) {
+                Log.w(TAG, "final BYE send failed: ${e.javaClass.simpleName}: ${e.message}")
+            } finally {
+                written.countDown()
+            }
+        }
+        try {
+            if (!written.await(250, TimeUnit.MILLISECONDS)) {
+                Log.w(TAG, "final BYE send timed out; Host stale-session cleanup will handle it")
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    @Throws(java.io.IOException::class)
+    private fun writePacket(packet: ByteArray) {
+        val out = tcpOut
+        if (useTcpTunnel && out != null) {
+            val frame = ByteBuffer.allocate(4 + packet.size).order(ByteOrder.LITTLE_ENDIAN)
+                .putInt(packet.size).put(packet).array()
+            out.write(frame)
+            out.flush()
+        } else {
+            socket.send(DatagramPacket(packet, packet.size, address, port))
         }
     }
 
@@ -564,11 +672,12 @@ class HostSession private constructor(
         val metrics = android.content.res.Resources.getSystem().displayMetrics
         val w = maxOf(metrics.widthPixels, metrics.heightPixels)
         val h = minOf(metrics.widthPixels, metrics.heightPixels)
-        // [proto][w][h][code][deviceId][目标屏数][w,h]×n[fingerprint u64][layout 15B]。
+        // [proto][w][h][code][deviceId][目标屏数][w,h]×n[fingerprint u64][layout 15B][name][extension]。
         // 首次默认一块平板尺寸；后续分屏/画中画则一次性让 Host 创建整组，避免先黑屏
         // 再逐块补建和错误地把它们当成新显示器。
         val specs = requestedDisplays.take(4)
-        val body = ByteBuffer.allocate(14 + specs.size * 4 + Long.SIZE_BYTES + LayoutState.WIRE_BYTES)
+        val nameBytes = deviceName.toByteArray(Charsets.UTF_8).copyOf(minOf(64, deviceName.toByteArray(Charsets.UTF_8).size))
+        val body = ByteBuffer.allocate(14 + specs.size * 4 + Long.SIZE_BYTES + LayoutState.WIRE_BYTES + 1 + nameBytes.size + 8)
             .order(ByteOrder.LITTLE_ENDIAN)
             .put(PROTO_VERSION.toByte()).putShort(w.toShort()).putShort(h.toShort())
             .putInt(pairingCode).putInt(deviceId).put(specs.size.toByte())
@@ -578,6 +687,10 @@ class HostSession private constructor(
         }
         body.putLong(deviceFingerprint)
         layout.writeTo(body)
+        body.put(nameBytes.size.toByte()).put(nameBytes)
+        // 放在 name 之后，旧 Host 仍会正确读取人类设备名并忽略本尾部。
+        body.put(0xD2.toByte()).put(1).put(layout.displaySizePreset.coerceIn(0, 4).toByte())
+            .put(layout.clarity.coerceIn(0, 1).toByte()).putInt(layout.transaction)
         send(buildPacket(TYPE_HELLO, 0, body.array()))
     }
 

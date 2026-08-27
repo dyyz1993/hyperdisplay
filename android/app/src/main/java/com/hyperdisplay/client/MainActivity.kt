@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
@@ -41,6 +42,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     // MARK: 会话状态
 
     private var session: HostSession? = null
+    /** 防止旧 Host 持续回 unknown PONG 时重复启动多个发现会话。 */
+    private var staleHostRecoveryInFlight = false
+    /** 本会话中已提交的自动规格校正，防止旧屏尚未销毁时每枚 DISPLAYS 都重复建屏。 */
+    private var profileSyncRequested: List<Pair<Int, Int>>? = null
     private var statsOverlay: TextView? = null
     private var chromeHandle: TextView? = null
     private var chromeHideRunnable: Runnable? = null
@@ -115,11 +120,18 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val pipRatio: String = "16:10",   // 画中画宽高比（初始形状）
         val pipCustomW: Int = 0,          // 手指自由缩放后的画中画尺寸（0=按比例默认）
         val pipCustomH: Int = 0,
-        /** 0=平板原生尺寸；其余为虚拟屏长边档位，随设备布局一起持久化。 */
-        val displayLongEdge: Int = 0
+        /** 0=本机原生尺寸；其余为虚拟屏长边档位，仅随本机布局持久化。 */
+        val displayLongEdge: Int = 0,
+        /** 0=明确标准 1x；1=严格请求实际 Retina 2x。 */
+        val clarity: Int = 0
     )
 
     private var layoutConfig = LayoutConfig()
+    /** 仅在 Host 实测成功后才落盘的最后有效配置。 */
+    private var committedLayoutConfig = layoutConfig
+    private var pendingLayoutConfig: LayoutConfig? = null
+    private var pendingModeTransaction = 0
+    private var nextModeTransaction = 1
 
     private fun loadLayoutConfig(): LayoutConfig {
         val p = getSharedPreferences("hyperdisplay", MODE_PRIVATE)
@@ -133,8 +145,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             pipRatio = p.getString("layout.pipRatio", "16:10") ?: "16:10",
             pipCustomW = p.getInt("layout.pipCustomW", 0).coerceAtLeast(0),
             pipCustomH = p.getInt("layout.pipCustomH", 0).coerceAtLeast(0),
-            displayLongEdge = p.getInt("layout.displayLongEdge", 0)
-                .takeIf { it in listOf(1440, 1600, 1920, 2240) } ?: 0
+            displayLongEdge = DisplayResolution.normalize(p.getInt("layout.displayLongEdge", 0)),
+            clarity = p.getInt("layout.clarity", 0).coerceIn(0, 1)
         )
     }
 
@@ -147,12 +159,13 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             .putInt("layout.pipCustomW", cfg.pipCustomW)
             .putInt("layout.pipCustomH", cfg.pipCustomH)
             .putInt("layout.displayLongEdge", cfg.displayLongEdge)
+            .putInt("layout.clarity", cfg.clarity)
             .putInt("layout.pipLeft", pipLeft)
             .putInt("layout.pipTop", pipTop)
             .apply()
     }
 
-    private fun layoutStateForHost(cfg: LayoutConfig): HostSession.LayoutState {
+    private fun layoutStateForHost(cfg: LayoutConfig, transaction: Int = 0): HostSession.LayoutState {
         val ratio = when (cfg.pipRatio) {
             "3:2" -> 1
             "4:3" -> 2
@@ -168,7 +181,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             pipCustomH = cfg.pipCustomH,
             displayLongEdge = cfg.displayLongEdge,
             pipLeft = pipLeft,
-            pipTop = pipTop
+            pipTop = pipTop,
+            displaySizePreset = DisplayResolution.presetId(cfg.displayLongEdge),
+            clarity = cfg.clarity,
+            transaction = transaction
         )
     }
 
@@ -183,11 +199,13 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             pipRatio = ratio,
             pipCustomW = state.pipCustomW,
             pipCustomH = state.pipCustomH,
-            displayLongEdge = state.displayLongEdge.takeIf { it in listOf(1440, 1600, 1920, 2240) } ?: 0
+            displayLongEdge = DisplayResolution.normalize(state.displayLongEdge),
+            clarity = state.clarity.coerceIn(0, 1)
         )
         pipLeft = state.pipLeft
         pipTop = state.pipTop
         saveLayoutConfig(layoutConfig)
+        committedLayoutConfig = layoutConfig
         updateConfigButton()
         updateOverlay()
         // UDP 不保证这个恢复包一定先于 DISPLAYS 到达。若默认单屏视图已经建好，
@@ -208,6 +226,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     /** 常驻传输角标（右上，与配置按钮同行）：一眼区分有线/无线。 */
     private var transportBadge: TextView? = null
     private var localCursor: LocalCursorView? = null
+    private var systemBarRehide: Runnable? = null
     private var pipRoot: FrameLayout? = null
     private var pipLeft = -1
     private var pipTop = -1
@@ -395,7 +414,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        configureDisplayViewport()
         layoutConfig = loadLayoutConfig()
+        committedLayoutConfig = layoutConfig
         val layoutPrefs = getSharedPreferences("hyperdisplay", MODE_PRIVATE)
         pipLeft = layoutPrefs.getInt("layout.pipLeft", -1)
         pipTop = layoutPrefs.getInt("layout.pipTop", -1)
@@ -576,6 +597,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     /** 发现结果直接连接：主机地址 + TXT 配对码一并记住（零点击，AGENTS.md §7） */
     private fun connectEntry(e: NsdFinder.HostEntry, isSwitch: Boolean = false) {
+        staleHostRecoveryInFlight = false
         val editor = getPreferences(MODE_PRIVATE).edit()
             .putString("host", "${e.host}:${e.port}")
         if (e.code != 0) editor.putInt("pairingCode", e.code)
@@ -605,7 +627,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val code = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
         val deviceId = HostSession.loadOrCreateDeviceId(this)
         val deviceFingerprint = HostSession.loadDeviceFingerprint(this)
-        val s = HostSession.create(host, port, sessionListener, code, deviceId, deviceFingerprint,
+        val deviceName = HostSession.loadDeviceDisplayName(this)
+        val s = HostSession.create(host, port, sessionListener, code, deviceId, deviceFingerprint, deviceName,
             requestedDisplaySpecs(), layoutStateForHost(layoutConfig), network)
         if (s == null) {
             showConnectView()
@@ -641,14 +664,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val (sw, sh) = screenDims()
         val raw = if (config.kind == LayoutKind.SINGLE) listOf(sw to sh)
         else regionSizes(config).ifEmpty { listOf(sw to sh) }.take(4)
-        val longEdge = config.displayLongEdge
-        if (longEdge == 0) return raw
-        return raw.map { (w, h) ->
-            val scale = longEdge.toFloat() / maxOf(sw, sh).toFloat()
-            val rw = (((w * scale).toInt() + 15) and 15.inv()).coerceAtLeast(640)
-            val rh = (((h * scale).toInt() + 15) and 15.inv()).coerceAtLeast(480)
-            rw to rh
-        }
+        val longEdge = DisplayResolution.normalize(config.displayLongEdge)
+        val deviceCanvasLongEdge = maxOf(sw, sh)
+        return raw.map { (w, h) -> DisplayResolution.scale(w, h, deviceCanvasLongEdge, longEdge) }
     }
 
     // MARK: 通道/布局切换过渡层（旧画面保留，中心卡片解释正在做什么）
@@ -731,6 +749,19 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     /** 走 adb 有线隧道（TCP 127.0.0.1:5280，AGENTS.md §1 有线例外）。
      *  不写入 host/lastWifiHost 偏好——隧道总是活体探测，不该被当成 UDP 地址复用。 */
     private fun connectTunnel(isSwitch: Boolean = false) {
+        // ADB reverse 只证明物理链路可达，无法携带 Host 的配对码。首次安装若先命中
+        // USB、而本地还没有配对码，Host 会拒绝 HELLO，客户端便会循环收到 unknown
+        // PONG，也不会创建副屏。先经 mDNS 自动发现唯一的局域网 Host，读到其广播的
+        // 配对码并保存；随后本次走 Wi-Fi 接入，后续插线则会自动升级回 USB 隧道。
+        if (getPreferences(MODE_PRIVATE).getInt("pairingCode", 0) == 0) {
+            Log.i(TAG, "USB tunnel ready but pairing code missing; discovering host first")
+            if (session != null) {
+                disconnectSession()
+                showConnectView()
+            }
+            startAutoDiscovery()
+            return
+        }
         Log.i(TAG, "connecting via adb USB tunnel (127.0.0.1:5280)")
         openSession("127.0.0.1", 5280, isSwitch, transport = NsdFinder.Transport.TUNNEL)
     }
@@ -1020,11 +1051,28 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 remoteControlEnabled = false
                 session?.setRemoteControlEnabled(false)
                 val p = pipelineOf(displayId)
+                // WELCOME 是这一路编码流的格式边界。拓扑/分辨率切换后 Host 会用同一
+                // displayId 建立新的 VideoToolbox 会话；若继续拿旧 MediaCodec（例如
+                // 720x960）去解新 1072x1088 流，Android 会把旧 clean aperture 等比
+                // 放进新 Surface，留下看似“视频有黑边”的大块空白。清空旧 CSD 后等待
+                // 新 CONFIG，绝不以旧参数集抢跑新尺寸的解码器。
+                val formatChanged = p.width != width || p.height != height || p.codec != codec
+                if (formatChanged) {
+                    synchronized(pipelineLock) {
+                        p.decoder?.release()
+                        p.decoder = null
+                        p.csd = null
+                        p.lastRendered = 0
+                        p.assembler?.reset()
+                    }
+                    Log.i(TAG, "stream format changed: display=$displayId -> ${width}x${height} codec=$codec")
+                }
                 p.fps = fps.coerceIn(1, 144)
                 p.codec = codec
                 p.width = width
                 p.height = height
                 regionViews.firstOrNull { it.displayId == displayId }?.updateStreamSize(width, height)
+                if (formatChanged) session?.requestKeyframe(displayId)
                 updateOverlay()
             }
         }
@@ -1107,6 +1155,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     }
                 }
                 if (list.isEmpty()) waitingForDisplay = true
+                reconcileCurrentDeviceDisplayProfile(list)
                 updateConfigButton()
             }
         }
@@ -1117,6 +1166,66 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 // 即便 UDP 极端乱序，后续 onDisplays 也会按新布局重新选择完整屏组。
                 restoreLayoutFromHost(layout)
                 session?.acknowledgeSavedLayout()
+                // Host 收到 ACK 前会保护旧档案；确认后再提交本机真实画布。这样旧 APK
+                // 遗留的规格不会在重装恢复后永久造成等比黑边。延迟只保证 ACK 先到达，
+                // 不会中断当前 UDP 会话。
+                mainHandler.postDelayed({
+                    session?.updateDisplayTopology(requestedDisplaySpecs(), layoutStateForHost(layoutConfig))
+                }, 250L)
+            }
+        }
+
+        override fun onDisplayModeStatus(transaction: Int, status: Int, slot: Int,
+                                         requestedScale: Int, actualScale: Int) {
+            mainHandler.post {
+                // 旧事务的 UDP 重传不能反过来改掉用户刚刚选择的新配置。
+                if (transaction == 0 || transaction != pendingModeTransaction) return@post
+                when (status) {
+                    0 -> {
+                        switchingBannerTitle?.text = "正在验证 Retina…"
+                        switchingBannerDetail?.text = "正在确认 Mac 是否真正提供 2x"
+                    }
+                    1 -> {
+                        if (requestedScale == 2 && actualScale != 2) return@post
+                        pendingLayoutConfig = null
+                        pendingModeTransaction = 0
+                        committedLayoutConfig = layoutConfig
+                        saveLayoutConfig(layoutConfig)
+                        switchingBannerDetail?.text = "实测 ${actualScale}x，正在恢复画面…"
+                    }
+                    2, 3 -> {
+                        val restore = committedLayoutConfig
+                        layoutConfig = restore
+                        pendingLayoutConfig = null
+                        pendingModeTransaction = 0
+                        saveLayoutConfig(restore)
+                        updateConfigButton(); updateOverlay()
+                        switchingBannerTitle?.text = if (status == 2) "当前组合不支持 Retina" else "切换未完成"
+                        switchingBannerDetail?.text = "已恢复上一套有效显示配置"
+                        // Host 已停止失败事务；用上一套“已提交”配置只恢复一次，不进入自动重试。
+                        beginTopologyTransition()
+                        session?.updateDisplayTopology(requestedDisplaySpecs(restore), layoutStateForHost(restore))
+                    }
+                }
+            }
+        }
+
+        override fun onSessionNeedsRediscovery() {
+            mainHandler.post {
+                if (staleHostRecoveryInFlight || isFinishing) return@post
+                staleHostRecoveryInFlight = true
+                Log.w(TAG, "saved host has no usable displays; clearing stale route and rediscovering")
+                // 这是切换连接候选，而不是用户拔掉设备：不可发 BYE，否则可能把当前
+                // Host 正在恢复的同一设备屏幕又立即销毁。新的 mDNS HostEntry 会原子
+                // 覆盖地址与配对码，后续 USB 探测仍会自动升级到有线隧道。
+                getPreferences(MODE_PRIVATE).edit()
+                    .remove("host")
+                    .remove("lastWifiHost")
+                    .remove("lastUsbHost")
+                    .remove("pairingCode")
+                    .apply()
+                disconnectSession()
+                startAutoDiscovery()
             }
         }
 
@@ -1149,7 +1258,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     // CONFIG 已作为 MediaFormat 的 csd-0 配置解码器；把同一份 VPS/SPS/PPS
                     // 再拼到 IDR 前会让部分华为 HEVC 解码器偶发进入“有输出但全绿”的坏
                     // 状态。若 CONFIG 与 IDR 乱序，FrameAssembler 会请求下一帧关键帧。
-                    p.decoder?.submit(VideoDecoder.Frame(keyframe, data))
+                    val decoder = p.decoder ?: return
+                    if (!decoder.submit(VideoDecoder.Frame(keyframe, data))) {
+                        // 完整 P 帧一旦因解码背压被拒绝，后续依赖帧不能继续跨过缺口。
+                        // FrameAssembler 会丢到下一张 IDR，同时把拥塞反馈给 Host。
+                        p.assembler?.requireKeyframeAfterDecoderBackpressure(frameId)
+                    }
                 }
                 override fun onKeyframeNeeded(reason: String) {
                     session?.requestKeyframe(p.id)
@@ -1189,9 +1303,22 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private fun showSessionView() {
         root.removeAllViews()
         connectView = null
-        hideSystemBars()
+        hideSystemBarsSoon()
+        fun dp(value: Int): Int = (value * resources.displayMetrics.density + 0.5f).toInt()
 
         val container = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        // 部分 OEM 会在沉浸式切换完成后异步改变可用画布。这里只重新布局客户端的
+        // SurfaceView（保留同一解码器/同一虚拟显示器），不能把一次系统 inset 变化
+        // 升级成 Mac 端的建屏 churn。
+        container.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+            if ((right - left) != (oldRight - oldLeft) || (bottom - top) != (oldBottom - oldTop)) {
+                container.post {
+                    if (sessionRoot === container && container.width > 0 && container.height > 0) {
+                        rebuildRegionViews()
+                    }
+                }
+            }
+        }
         root.addView(container, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         sessionRoot = container
@@ -1207,7 +1334,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val card = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setPadding(52, 36, 52, 34)
+            // 全部使用 dp：高密度平板上 raw px 会让进度圈与卡片显得极小、贴边时更像被裁掉。
+            setPadding(dp(26), dp(18), dp(26), dp(17))
             background = android.graphics.drawable.GradientDrawable().apply {
                 setColor(0xE6202938.toInt())
                 cornerRadius = 28f
@@ -1216,7 +1344,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
         card.addView(android.widget.ProgressBar(this).apply {
             isIndeterminate = true
-        }, android.widget.LinearLayout.LayoutParams(42, 42).apply { bottomMargin = 16 })
+            contentDescription = "正在处理显示模式"
+        }, android.widget.LinearLayout.LayoutParams(dp(28), dp(28)).apply { bottomMargin = dp(10) })
         val title = android.widget.TextView(this).apply {
             text = "正在切换通道…"
             textSize = 18f
@@ -1239,6 +1368,18 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         root.addView(banner, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT))
+        // 沉浸式/刘海/手势导航会让 root 覆盖到物理边缘。状态层收缩到真实安全区后再
+        // 居中，任何 OEM 的边缘裁剪都不会只露出半个 loading 圆环。
+        root.setOnApplyWindowInsetsListener { _, insets ->
+            val lp = banner.layoutParams as FrameLayout.LayoutParams
+            lp.leftMargin = insets.systemWindowInsetLeft
+            lp.topMargin = insets.systemWindowInsetTop
+            lp.rightMargin = insets.systemWindowInsetRight
+            lp.bottomMargin = insets.systemWindowInsetBottom
+            banner.layoutParams = lp
+            insets
+        }
+        root.requestApplyInsets()
         switchingBanner = banner
         switchingBannerTitle = title
         switchingBannerDetail = detail
@@ -1377,16 +1518,55 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
-    /** 把子视图内坐标换算为窗口坐标（本地光标用） */
+    /**
+     * 把子视图内坐标换算为本地光标叠加层的坐标。
+     *
+     * 不能把 `getLocationInWindow` 的结果直接喂给 `LocalCursorView`：后者是 root
+     * 内的子 View，不是窗口本身。手机的状态栏/挖孔 inset 会令两个原点不同，表现为
+     * 鼠标已经指到目标，手机叠加箭头却稳定偏下；平板的 inset 接近零，所以不明显。
+     */
     private fun windowPos(view: View, x: Float, y: Float): FloatArray {
-        val loc = IntArray(2)
-        view.getLocationInWindow(loc)
-        return floatArrayOf(loc[0] + x, loc[1] + y)
+        val viewLoc = IntArray(2)
+        val overlayLoc = IntArray(2)
+        view.getLocationInWindow(viewLoc)
+        (localCursor ?: sessionRoot ?: root).getLocationInWindow(overlayLoc)
+        return mapPointToOverlay(x, y, viewLoc[0], viewLoc[1], overlayLoc[0], overlayLoc[1])
     }
 
     private fun screenDims(): Pair<Int, Int> {
-        val m = Resources.getSystem().displayMetrics
-        return maxOf(m.widthPixels, m.heightPixels) to minOf(m.widthPixels, m.heightPixels)
+        // 使用 Android 已授予本 app 的稳定画布，而不是未经授权可覆盖的物理面板。
+        // Redmi Note 7 的 MIUI 横屏会保留一条右侧系统手势区（2131×1080）；按完整
+        // 2340×1080 建屏会让等比渲染必然留黑。getMetrics 在沉浸式完成后反映的是
+        // 实际可渲染区域，且同一设备/同一系统设置下稳定。
+        @Suppress("DEPRECATION")
+        val display = windowManager.defaultDisplay
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        display.getMetrics(metrics)
+        return DisplayResolution.landscapeCanvas(metrics.widthPixels, metrics.heightPixels)
+    }
+
+    /**
+     * 重装恢复会优先保留 Host 端的旧显示器档案，保证桌面位置不丢；但旧版本可能
+     * 把 MIUI 的可用区域误写成像素规格。检测到规格与当前真实设备不一致时，仅在
+     * 本会话发起一次受控替换，保留同一 EDID 身份和 macOS 编排位置。
+     */
+    private fun reconcileCurrentDeviceDisplayProfile(list: List<HostSession.DisplayInfo>) {
+        val desired = requestedDisplaySpecs()
+        if (list.size < desired.size || desired.isEmpty()) return
+        val actual = list.take(desired.size).map { it.width to it.height }
+        // HELLO 发送的是逻辑请求值，Host 在 CGVirtualDisplay 前会按 16px 对齐。
+        // 必须与该规则比较，否则 1064×1080 ↔ 1072×1088 会被误判成永久拓扑切换。
+        val expected = desired.map { (width, height) -> DisplayResolution.hostAligned(width, height) }
+        if (actual == expected) {
+            profileSyncRequested = null
+            return
+        }
+        if (profileSyncRequested == expected) return
+        profileSyncRequested = expected
+        Log.i(TAG, "correcting stale display profile $actual -> $expected")
+        beginTopologyTransition()
+        session?.updateDisplayTopology(desired, layoutStateForHost(layoutConfig))
     }
 
     private fun evenOf(v: Int) = (v / 2) * 2
@@ -1406,6 +1586,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     /** 布局 → 各区域虚拟屏像素尺寸（顺序即订阅顺序，第一个是主屏） */
     private fun regionSizes(cfg: LayoutConfig): List<Pair<Int, Int>> {
+        // 这里故意使用整机物理尺寸：它决定 macOS 虚拟屏的原生像素规格。
+        // Android 的实际内容区尺寸只用于下面 rebuildRegionViews 的本地排版。
         val (sw, sh) = screenDims()
         val f = cfg.fraction.coerceIn(0.2f, 0.8f)
         return when (cfg.kind) {
@@ -1535,6 +1717,18 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     @SuppressLint("ClickableViewAccessibility")
     private fun rebuildRegionViews() {
         val container = sessionRoot ?: return
+        // MIUI 10 横屏的 View 测量宽度可能仍是完整面板，而 WindowSurface 实际会在
+        // 右侧裁掉系统手势区。副屏规格与视图排版必须共同使用 screenDims() 的稳定
+        // 可见画布；否则第二块 SurfaceView 会被裁短，aspect-fit 便留下大面积黑边。
+        val (canvasW, canvasH) = screenDims()
+        val sw = minOf(container.width, canvasW)
+        val sh = minOf(container.height, canvasH)
+        if (sw <= 0 || sh <= 0) {
+            container.post {
+                if (sessionRoot === container) rebuildRegionViews()
+            }
+            return
+        }
         for (v in regionWrappers) container.removeView(v)
         regionWrappers.clear()
         for (v in regionViews) container.removeView(v)
@@ -1548,7 +1742,6 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         pipSelected = false
         val ids = subscribedIds.ifEmpty { displays.take(1).map { it.id } }
         if (ids.isEmpty()) return
-        val (sw, sh) = screenDims()
 
         fun makeView(id: Int): StreamView {
             val view = StreamView(this)
@@ -1911,14 +2104,17 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
         panel.addView(radio)
 
-        // 显示大小写入平板设备档案；下一次 HELLO 由 Host 受控恢复整组屏幕。
+        // 显示大小与清晰度是两件事：前者决定 Mac 内容看起来多大，后者只决定
+        // 真实 1x/2x backing。Retina 失败时绝不悄悄降级，Host 会回报实际倍率。
         panel.addView(TextView(this).apply {
-            val current = if (layoutConfig.displayLongEdge == 0) "原生" else "${layoutConfig.displayLongEdge}p"
-            text = "显示大小（当前：$current；切换会短暂断流约 3 秒）"
+            val nativeLongEdge = maxOf(screenDims().first, screenDims().second)
+            val current = if (layoutConfig.displayLongEdge == 0) "原生 ${nativeLongEdge}p" else "${layoutConfig.displayLongEdge}p"
+            text = "显示大小（当前：${DisplayResolution.label(layoutConfig.displayLongEdge)} · $current）"
             textSize = 13f
             setPadding(0, 20, 0, 4)
         })
-        val tiers = listOf("特大" to 1440, "大" to 1600, "标准" to 1920, "锐利" to 2240)
+        val tiers = listOf("原生" to DisplayResolution.NATIVE, "特大" to 1440,
+            "大" to 1600, "标准" to 1920, "紧凑" to 2240)
         val tierRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         tiers.forEach { (label, longEdge) ->
             tierRow.addView(android.widget.Button(this).apply {
@@ -1932,6 +2128,27 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
         panel.addView(tierRow)
+
+        panel.addView(TextView(this).apply {
+            val current = if (layoutConfig.clarity == 1) "Retina 2x（需实测支持）" else "标准 1x"
+            text = "显示清晰度（当前：$current）"
+            textSize = 13f
+            setPadding(0, 16, 0, 4)
+        })
+        val clarityRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        listOf("标准 1x" to 0, "Retina 2x" to 1).forEach { (label, clarity) ->
+            clarityRow.addView(android.widget.Button(this).apply {
+                text = label
+                textSize = 13f
+                setOnClickListener {
+                    if (clarity == 1) {
+                        scheduleSwitchingBanner("正在验证 Retina…", "只有实际 2x 才会应用", 0)
+                    }
+                    applyLayout(layoutConfig.copy(clarity = clarity))
+                }
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        panel.addView(clarityRow)
 
         // 参数区（随所选布局刷新）
         var frac = layoutConfig.fraction
@@ -2017,17 +2234,29 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val previous = layoutConfig
         val changed = previous != cfg
         val virtualScreenChange = previous.kind != cfg.kind ||
+            previous.clarity != cfg.clarity ||
             requestedDisplaySpecs(previous) != requestedDisplaySpecs(cfg)
         layoutConfig = cfg
-        saveLayoutConfig(cfg)
         greenRecoveries = 0
         updateConfigButton(); updateOverlay()
         // 真实虚拟屏尺寸仍需 Host 受控替换，但无需断开 Android 的 UDP 会话，更不能
         // 预先释放旧 Surface/解码器。旧画面保留到完整新屏组出现后才一次性切换。
         if (changed && session != null) {
             Log.i(TAG, "display profile changed: in-session topology update")
-            if (virtualScreenChange) beginTopologyTransition()
-            session?.updateDisplayTopology(requestedDisplaySpecs(), layoutStateForHost(cfg))
+            if (virtualScreenChange) {
+                pendingLayoutConfig = cfg
+                pendingModeTransaction = nextModeTransaction++
+                beginTopologyTransition()
+                session?.updateDisplayTopology(requestedDisplaySpecs(), layoutStateForHost(cfg, pendingModeTransaction))
+            } else {
+                saveLayoutConfig(cfg)
+                committedLayoutConfig = cfg
+                session?.updateDisplayTopology(requestedDisplaySpecs(), layoutStateForHost(cfg))
+            }
+        } else if (changed) {
+            // 离线只保存用户已明确选择的布局；下一次连接仍会对 Retina 做严格验证。
+            saveLayoutConfig(cfg)
+            committedLayoutConfig = cfg
         }
     }
 
@@ -2266,10 +2495,28 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
-    /** 后台自动断开：切走/锁屏超过 10s 还没回来 → 断开会话（发 BYE，host 回收副屏、
-     *  窗口弹回 Mac 主屏可见）。10s 内回来不中断（保留「短暂切换不断流」的体验） */
-    // 后台即等同拔掉平板：onStop 立即发 BYE，Host 回收该设备的全部副屏。
+    /** 普通退后台的短暂宽限；期间回来直接续用同一虚拟屏，不制造 CGVirtualDisplay churn。 */
+    private val backgroundGraceMillis = 5_000L
     private var autoDisconnectedByBg = false
+    private var backgroundDisconnectPending = false
+    private val backgroundDisconnect = Runnable {
+        backgroundDisconnectPending = false
+        if (session != null && !isChangingConfigurations) {
+            autoDisconnectedByBg = true
+            Log.i(TAG, "background grace elapsed — disconnecting (bye, remove virtual displays)")
+            disconnectSession(removeDisplay = true)
+        }
+    }
+
+    private fun disconnectImmediatelyForTaskRemoval() {
+        mainHandler.removeCallbacks(backgroundDisconnect)
+        backgroundDisconnectPending = false
+        if (session != null && !isChangingConfigurations) {
+            autoDisconnectedByBg = true
+            Log.i(TAG, "task removed — disconnecting immediately (bye, remove virtual displays)")
+            disconnectSession(removeDisplay = true)
+        }
+    }
 
     override fun onPause() {
         super.onPause()
@@ -2279,16 +2526,26 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        // onStop 才表示用户真正离开/锁屏，避免权限弹窗等短暂 onPause 误拔屏。
+        // 普通切换应用不立刻拆屏：5 秒内回来可直接续流。超过宽限才等同物理拔线。
         if (session != null && !isChangingConfigurations) {
-            autoDisconnectedByBg = true
-            Log.i(TAG, "background — disconnect immediately (bye, remove virtual displays)")
-            disconnectSession(removeDisplay = true)
+            backgroundDisconnectPending = true
+            mainHandler.removeCallbacks(backgroundDisconnect)
+            mainHandler.postDelayed(backgroundDisconnect, backgroundGraceMillis)
+            Log.i(TAG, "background — holding display for ${backgroundGraceMillis}ms before BYE")
         }
     }
 
     override fun onResume() {
         super.onResume()
+        // 短暂切换应用回来：取消待执行的后台拔屏，沿用原会话/虚拟屏/解码器。
+        if (backgroundDisconnectPending) {
+            mainHandler.removeCallbacks(backgroundDisconnect)
+            backgroundDisconnectPending = false
+            Log.i(TAG, "resumed within background grace — keeping existing virtual displays")
+        }
+        SessionService.onTaskRemovedCallback = {
+            mainHandler.post { disconnectImmediatelyForTaskRemoval() }
+        }
         // 插线（POWER_CONNECTED）：前台已运行只做升级探测（含 adb 隧道）；断连状态
         // 直接走 smart——隧道优先、无隧道回 Wi-Fi 历史/发现。
         UsbPlugReceiver.onPlugged = {
@@ -2311,6 +2568,30 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
     }
 
+    override fun onDestroy() {
+        mainHandler.removeCallbacks(backgroundDisconnect)
+        SessionService.onTaskRemovedCallback = null
+        super.onDestroy()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // 配置弹窗、权限页或 OEM 的边缘手势会暂时拉出状态栏/三键导航。会话画面
+        // 必须在焦点回来后重新进入沉浸式，否则手机内容区会改变，造成顶部漏出、
+        // 分屏黑边和光标视觉坐标再次漂移。这里只改 Android chrome，绝不重建 Host 屏。
+        if (hasFocus && sessionRoot != null) hideSystemBarsSoon(180)
+    }
+
+    private fun hideSystemBarsSoon(delayMs: Long = 0L) {
+        systemBarRehide?.let { mainHandler.removeCallbacks(it) }
+        val task = Runnable {
+            systemBarRehide = null
+            if (sessionRoot != null && !isFinishing) hideSystemBars()
+        }
+        systemBarRehide = task
+        mainHandler.postDelayed(task, delayMs)
+    }
+
     private fun hideSystemBars() {
         if (Build.VERSION.SDK_INT >= 30) {
             window.setDecorFitsSystemWindows(false)
@@ -2320,8 +2601,29 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             }
         } else {
             @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            window.decorView.systemUiVisibility = legacyEdgeToEdgeFlags() or (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 or View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION)
         }
     }
+
+    private fun configureDisplayViewport() {
+        // 小米 Android 10 即使已经请求 immersive，仍可能把导航手势区从普通 app
+        // content 中扣掉。副屏无需在该边缘承接系统手势，允许窗口完整参与布局。
+        window.addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS)
+        if (Build.VERSION.SDK_INT >= 28) {
+            val attrs = window.attributes
+            attrs.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            window.attributes = attrs
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false)
+        } else {
+            @Suppress("DEPRECATION")
+            run { window.decorView.systemUiVisibility = legacyEdgeToEdgeFlags() }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun legacyEdgeToEdgeFlags() = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+        View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
 }

@@ -4,6 +4,16 @@ import Darwin
 /// 单 UDP socket 的 host 端：接收线程解析报文，发送侧非阻塞 sendto 到指定客户端地址。
 /// 客户端注册表由上层（HostApp）管理。
 final class UdpHost {
+    private struct VideoRoute: Hashable {
+        let address: UInt32
+        let port: in_port_t
+
+        init(_ addr: sockaddr_in) {
+            address = addr.sin_addr.s_addr
+            port = addr.sin_port
+        }
+    }
+
     private struct PendingVideoFrame {
         let streamId: UInt32
         var addr: sockaddr_in
@@ -14,18 +24,15 @@ final class UdpHost {
 
     private let fd: Int32
     private let sendLock = NSLock()
-    /// 视频分片必须按“完整帧”全局串行出 socket。两个编码器的输出回调会并发：
-    /// 若各自逐片发送，帧 A 尚未收完时帧 B 的第一片即可抵达 Android，latest-frame
-    /// 接收器便只能丢弃 A，最终两路都没有完整帧可解码。控制包不走此锁。
-    private let videoFrameLock = NSLock()
     /// 编码后的 P 帧不能再按“最新帧”覆盖：HEVC/H.264 的下一张 P 帧依赖前一张
-    /// 已编码帧，覆盖会在接收端制造引用缺口，使它只能等待 IDR，滚动时便表现为
-    /// 周期性卡顿。发送队列因此保持编码顺序；背压在编码前由 `canAcceptVideoFrame`
-    /// 丢采集帧，既没有积压，也不破坏码流依赖链。
+    /// 已编码帧，覆盖会在接收端制造引用缺口。队列因此只保证“同一接收端”的
+    /// 编码顺序；不同设备绝不能共享一个 FIFO，否则 Wi-Fi 的节流会阻塞 USB。
     private let videoPendingLock = NSLock()
-    private var pendingVideoFrames: [PendingVideoFrame] = []
-    private var videoDrainActive = false
-    private let videoSendQueue = DispatchQueue(label: "hyperdisplay-udp-video-send", qos: .userInteractive)
+    private var pendingVideoFrames = VideoRouteQueue<VideoRoute, PendingVideoFrame>()
+    private var activeVideoRoutes: Set<VideoRoute> = []
+    private let videoSendQueue = DispatchQueue(label: "hyperdisplay-udp-video-send",
+                                               qos: .userInteractive,
+                                               attributes: .concurrent)
     private(set) var port: UInt16
 
     /// 解析成功的入站报文 + 来源地址（在接收线程上回调）
@@ -116,8 +123,6 @@ final class UdpHost {
     /// 最新帧会自然覆盖它；只有控制包才允许可靠性语义。
     func sendVideoFrame(to addr: inout sockaddr_in, fragments: [Data], perFragmentDelay: useconds_t) {
         guard !fragments.isEmpty else { return }
-        videoFrameLock.lock()
-        defer { videoFrameLock.unlock() }
         for (index, fragment) in fragments.enumerated() {
             guard send(to: &addr, fragment) else { return }
             if index < fragments.count - 1 && perFragmentDelay > 0 {
@@ -130,38 +135,36 @@ final class UdpHost {
     /// 新采集帧；这是安全的 latest-frame 策略，因为编码器的参考链完全未发生缺口。
     func canAcceptVideoFrame(streamId: UInt32) -> Bool {
         videoPendingLock.lock()
-        let queued = pendingVideoFrames.reduce(into: 0) { count, frame in
-            if frame.streamId == streamId { count += 1 }
-        }
+        let queued = pendingVideoFrames.maxCount { $0.streamId == streamId }
         videoPendingLock.unlock()
         return queued < 2
     }
 
-    /// 严格保持已编码帧的顺序。`streamId` 仅用于编码前背压计数；v1 只有一个
-    /// 平板客户端，所有屏幕共享这一条 UDP 出口，因此全局 FIFO 也避免帧分片交错。
+    /// 同一接收端严格 FIFO；不同接收端各自异步 drain。Android 按 displayId 独立
+    /// 重组帧，跨 display/跨设备的 UDP 包可以交错；若把它们做成全局 FIFO，一台
+    /// Wi-Fi 客户端的 `usleep` 会直接让 USB 客户端出现秒级延迟。
     func enqueueVideoFrame(streamId: UInt32, to addr: sockaddr_in, fragments: [Data],
                            keyframe: Bool, perFragmentDelay: useconds_t) {
         guard !fragments.isEmpty else { return }
+        let route = VideoRoute(addr)
         videoPendingLock.lock()
         pendingVideoFrames.append(PendingVideoFrame(
             streamId: streamId, addr: addr, fragments: fragments,
-            perFragmentDelay: perFragmentDelay, keyframe: keyframe))
-        if !videoDrainActive {
-            videoDrainActive = true
-            videoSendQueue.async { [weak self] in self?.drainVideoFrames() }
+            perFragmentDelay: perFragmentDelay, keyframe: keyframe), to: route)
+        if activeVideoRoutes.insert(route).inserted {
+            videoSendQueue.async { [weak self] in self?.drainVideoFrames(to: route) }
         }
         videoPendingLock.unlock()
     }
 
-    private func drainVideoFrames() {
+    private func drainVideoFrames(to route: VideoRoute) {
         while true {
             videoPendingLock.lock()
-            guard !pendingVideoFrames.isEmpty else {
-                videoDrainActive = false
+            guard let pending = pendingVideoFrames.popFirst(from: route) else {
+                activeVideoRoutes.remove(route)
                 videoPendingLock.unlock()
                 return
             }
-            let pending = pendingVideoFrames.removeFirst()
             videoPendingLock.unlock()
             var frame = pending
             sendVideoFrame(to: &frame.addr, fragments: frame.fragments,

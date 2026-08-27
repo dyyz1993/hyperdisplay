@@ -14,7 +14,8 @@ import Foundation
 //   CURSOR_IMAGE  seq=imageId [fragIdx u16][fragCount u16][w u16][h u16][hotX i16][hotY i16][BGRA payload]
 // client→host：
 //   HELLO         seq=0        [proto u8][clientW u16][clientH u16][code u32][deviceId u32]
-//                                  [screenCount u8][w,h]×n[fingerprint u64 optional]
+//                                  [screenCount u8][w,h]×n[fingerprint u64][layout 15B]
+//                                  [deviceNameLen u8][UTF-8 deviceName optional]
 //   KEYFRAME_REQ               [displayId u16]（0xFFFF = 全部）
 //   NACK          seq=0        [displayId u16][frameId u32][count u16][fragIdx u16 × count]
 //   SELECT_DISPLAY id u32       —— 订阅集 = {id}（单屏模式）
@@ -27,13 +28,14 @@ import Foundation
 //     wheel  dx f32 dy f32 x f32 y f32
 //   PING
 //   CURSOR_IMAGE_ACK seq=imageId —— 光标图像分片已完整收到
+//   DISPLAY_MODE_STATUS 可靠状态（Host→client，client 以 DISPLAY_MODE_STATUS_ACK 确认）
 //   LAYOUT_RESTORE_ACK —— 客户端已应用 Host 回传的重装恢复布局
 
 enum PacketType: UInt8 {
-    case welcome = 0x01, videoFrag = 0x02, config = 0x03, inputAck = 0x05, pong = 0x06, displays = 0x07, cursor = 0x08, cursorImage = 0x09, savedLayout = 0x0A
+    case welcome = 0x01, videoFrag = 0x02, config = 0x03, inputAck = 0x05, pong = 0x06, displays = 0x07, cursor = 0x08, cursorImage = 0x09, savedLayout = 0x0A, displayModeStatus = 0x0B
     case hello = 0x10, keyframeReq = 0x11, input = 0x12, ping = 0x13
     case selectDisplay = 0x14, createDisplay = 0x15, destroyDisplay = 0x16, nack = 0x17, subscribeDisplays = 0x18
-    case cursorImageAck = 0x19, bye = 0x1A, encoderReset = 0x1B, setTier = 0x1C, layoutRestoreAck = 0x1D
+    case cursorImageAck = 0x19, bye = 0x1A, encoderReset = 0x1B, setTier = 0x1C, layoutRestoreAck = 0x1D, displayModeStatusAck = 0x1E
 }
 
 /// 0xFFFF 表示「全部显示屏」（KEYFRAME_REQ 专用）
@@ -67,11 +69,42 @@ struct DeviceLayoutState: Codable, Equatable {
     let displayLongEdge: UInt16
     let pipLeft: Int16
     let pipTop: Int16
+    /// 可选扩展：固定 15-byte 基础布局保持不变，旧安装/旧 Host 可以忽略尾部。
+    let displaySizePreset: UInt8?
+    /// 0=明确标准 1x，1=严格请求 Retina 2x；nil=旧客户端，保留历史默认行为。
+    let clarity: UInt8?
+    /// 一次用户发起的显示模式变更标识，用于让迟到 UDP 状态不能覆盖新意图。
+    let transaction: UInt32?
+
+    init(kind: UInt8, fractionPermille: UInt16, sideLeft: Bool, pipRatio: UInt8,
+         pipCustomW: UInt16, pipCustomH: UInt16, displayLongEdge: UInt16,
+         pipLeft: Int16, pipTop: Int16, displaySizePreset: UInt8? = nil,
+         clarity: UInt8? = nil, transaction: UInt32? = nil) {
+        self.kind = kind
+        self.fractionPermille = fractionPermille
+        self.sideLeft = sideLeft
+        self.pipRatio = pipRatio
+        self.pipCustomW = pipCustomW
+        self.pipCustomH = pipCustomH
+        self.displayLongEdge = displayLongEdge
+        self.pipLeft = pipLeft
+        self.pipTop = pipTop
+        self.displaySizePreset = displaySizePreset
+        self.clarity = clarity
+        self.transaction = transaction
+    }
+
+    var requestsStrictRetina: Bool { clarity == 1 }
+}
+
+enum DisplayModeStatus: UInt8 {
+    case validating = 0, ready = 1, unsupported = 2, failed = 3
 }
 
 enum Packet {
     case hello(proto: UInt8, clientWidth: UInt16, clientHeight: UInt16, code: UInt32, deviceId: UInt32,
-               requestedDisplays: [RequestedDisplaySpec], deviceFingerprint: UInt64, layout: DeviceLayoutState?)
+               requestedDisplays: [RequestedDisplaySpec], deviceFingerprint: UInt64, layout: DeviceLayoutState?,
+               deviceName: String)
     case keyframeReq(displayId: UInt16)
     case nack(displayId: UInt16, frameId: UInt32, indices: [UInt16])
     case inputMove(displayId: UInt16, seq: UInt32, x: Float32, y: Float32)
@@ -86,6 +119,7 @@ enum Packet {
     case setTier(displayId: UInt16, width: UInt16, height: UInt16)
     case cursorImageAck(imageId: UInt32)
     case layoutRestoreAck
+    case displayModeStatusAck(transaction: UInt32)
     case bye
 }
 
@@ -172,6 +206,24 @@ enum Wire {
         d.appendLE(layout.displayLongEdge)
         d.appendLE(UInt16(bitPattern: layout.pipLeft))
         d.appendLE(UInt16(bitPattern: layout.pipTop))
+        // Host→client 的 saved-layout 没有设备名称，扩展紧跟固定基础布局。
+        if let size = layout.displaySizePreset, let clarity = layout.clarity {
+            d.appendLE(UInt8(0xD2))
+            d.appendLE(UInt8(1))
+            d.appendLE(size)
+            d.appendLE(clarity)
+        }
+        return d
+    }
+
+    /// 可靠的小控制状态：Android 收到后必须回 ACK(transaction)。slot=255 表示整组完成。
+    static func displayModeStatus(transaction: UInt32, status: DisplayModeStatus, slot: UInt8,
+                                  requestedScale: UInt8, effectiveScale: UInt8) -> Data {
+        var d = Data(header(.displayModeStatus, seq: transaction))
+        d.appendLE(status.rawValue)
+        d.appendLE(slot)
+        d.appendLE(requestedScale)
+        d.appendLE(effectiveScale)
         return d
     }
 
@@ -353,9 +405,9 @@ enum Wire {
             let fingerprintOffset = 14 + requested.count * 4
             let deviceFingerprint: UInt64 = body >= fingerprintOffset + 8 ? u64(fingerprintOffset) : 0
             let layoutOffset = fingerprintOffset + 8
-            let layout: DeviceLayoutState?
+            let baseLayout: DeviceLayoutState?
             if body >= layoutOffset + 15 {
-                layout = DeviceLayoutState(
+                baseLayout = DeviceLayoutState(
                     kind: u8(layoutOffset), fractionPermille: u16(layoutOffset + 1),
                     sideLeft: (u8(layoutOffset + 3) & 1) != 0, pipRatio: u8(layoutOffset + 4),
                     pipCustomW: u16(layoutOffset + 5), pipCustomH: u16(layoutOffset + 7),
@@ -363,10 +415,33 @@ enum Wire {
                     pipLeft: Int16(bitPattern: u16(layoutOffset + 11)),
                     pipTop: Int16(bitPattern: u16(layoutOffset + 13)))
             } else {
-                layout = nil
+                baseLayout = nil
+            }
+            let nameOffset = layoutOffset + (baseLayout == nil ? 0 : 15)
+            var deviceName = ""
+            var extensionOffset = nameOffset
+            if body > nameOffset {
+                let nameLength = Int(u8(nameOffset))
+                guard nameLength <= 64, body >= nameOffset + 1 + nameLength else { return nil }
+                deviceName = String(data: data.subdata(in: (Wire.headerSize + nameOffset + 1)..<(Wire.headerSize + nameOffset + 1 + nameLength)),
+                                    encoding: .utf8) ?? ""
+                extensionOffset = nameOffset + 1 + nameLength
+            }
+            var layout = baseLayout
+            // HELLO 扩展放在名称之后，因此旧 Host 会完整读到名称并安全忽略尾部。
+            // [marker D2][version 1][size preset][clarity][transaction u32]
+            if let base = baseLayout, body >= extensionOffset + 8,
+               u8(extensionOffset) == 0xD2, u8(extensionOffset + 1) == 1 {
+                layout = DeviceLayoutState(
+                    kind: base.kind, fractionPermille: base.fractionPermille, sideLeft: base.sideLeft,
+                    pipRatio: base.pipRatio, pipCustomW: base.pipCustomW, pipCustomH: base.pipCustomH,
+                    displayLongEdge: base.displayLongEdge, pipLeft: base.pipLeft, pipTop: base.pipTop,
+                    displaySizePreset: u8(extensionOffset + 2), clarity: u8(extensionOffset + 3),
+                    transaction: u32(extensionOffset + 4))
             }
             return .hello(proto: u8(0), clientWidth: u16(1), clientHeight: u16(3), code: code, deviceId: deviceId,
-                          requestedDisplays: requested, deviceFingerprint: deviceFingerprint, layout: layout)
+                          requestedDisplays: requested, deviceFingerprint: deviceFingerprint, layout: layout,
+                          deviceName: deviceName)
         case PacketType.keyframeReq.rawValue:
             guard body >= 2 else { return nil }
             return .keyframeReq(displayId: u16(0))
@@ -414,6 +489,8 @@ enum Wire {
             return .cursorImageAck(imageId: seq)
         case PacketType.layoutRestoreAck.rawValue:
             return .layoutRestoreAck
+        case PacketType.displayModeStatusAck.rawValue:
+            return .displayModeStatusAck(transaction: seq)
         case PacketType.bye.rawValue:
             return .bye
         case PacketType.input.rawValue:

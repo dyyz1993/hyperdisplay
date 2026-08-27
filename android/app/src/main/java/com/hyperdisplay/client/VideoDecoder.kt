@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * MediaCodec 同步解码循环：
- * - 输入侧容量 3 的最新帧队列（满则丢最旧——解码前丢帧，安全边界）；
+ * - 输入侧保留已编码帧 FIFO；队列满时拒绝新帧并要求上层等待 IDR，绝不跨过 P 帧；
  * - 输出侧一次吐多帧时只渲染最新，其余 release(false) 丢弃。
  */
 class VideoDecoder(
@@ -25,12 +25,15 @@ class VideoDecoder(
 ) {
     companion object {
         private const val TAG = "VideoDecoder"
+        private const val IDLE_INPUT_WAIT_MS = 50L
+        private const val INPUT_BUFFER_WAIT_US = 2_000L
+        private const val OUTPUT_WAIT_AFTER_INPUT_US = 5_000L
     }
 
     class Frame(val keyframe: Boolean, val data: ByteArray)
 
     private val codec: MediaCodec = MediaCodec.createDecoderByType(mime)
-    private val queue = ArrayBlockingQueue<Frame>(3)
+    private val queue = ArrayBlockingQueue<Frame>(4)
     private val running = AtomicBoolean(false)
     private val thread = Thread({ loop() }, "hyperdisplay-decoder")
     private var ptsIndex = 0L
@@ -62,16 +65,14 @@ class VideoDecoder(
         thread.start()
     }
 
-    fun submit(frame: Frame): Boolean = queue.offer(frame) || run {
-        queue.poll() // 丢最旧
-        queue.offer(frame)
-    }
+    fun submit(frame: Frame): Boolean = queue.offer(frame)
 
     /** 供死亡检测用：累计提交进解码器的帧数 */
     fun snapshotInputCount(): Long = inputSubmitted
 
     fun release() {
         running.set(false)
+        thread.interrupt()
         try { thread.join(500) } catch (_: InterruptedException) { }
         try { codec.stop() } catch (_: Exception) { }
         try { codec.release() } catch (_: Exception) { }
@@ -83,14 +84,20 @@ class VideoDecoder(
         var statInputOk = 0L
         var statOutput = 0L
         var lastStatLog = 0L
+        var lastLoggedInput = 0L
+        var lastLoggedOutput = 0L
+        var pendingFrame: Frame? = null
         while (running.get()) {
             try {
-                val frame = queue.poll(10, TimeUnit.MILLISECONDS)
+                // 静态画面不应让每块屏每 10ms 空转一次。50ms 只影响“完全无输入”
+                // 时的尾部输出检查；有视频帧时 offer 会使 poll 立即返回。
+                val frame = pendingFrame ?: queue.poll(IDLE_INPUT_WAIT_MS, TimeUnit.MILLISECONDS)
+                var submittedInput = false
                 if (frame != null) {
-                    statInput++
-                    inputSubmitted++
-                    val inIdx = codec.dequeueInputBuffer(10)
+                    if (pendingFrame == null) statInput++
+                    val inIdx = codec.dequeueInputBuffer(INPUT_BUFFER_WAIT_US)
                     if (inIdx >= 0) {
+                        pendingFrame = null
                         statInputOk++
                         val buf = codec.getInputBuffer(inIdx)!!
                         buf.clear()
@@ -101,17 +108,24 @@ class VideoDecoder(
                             ptsIndex++
                             codec.queueInputBuffer(inIdx, 0, frame.data.size, pts,
                                 if (frame.keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+                            inputSubmitted++
+                            submittedInput = true
                         } else {
                             Log.w(TAG, "frame too large for input buffer (${frame.data.size}), dropped")
                             codec.queueInputBuffer(inIdx, 0, 0, 0, 0)
                         }
                     } else {
-                        Thread.sleep(5) // 解码器输入拥堵，这一帧只能丢（最新帧已在队列顶部）
+                        // 这是已经编码完成的依赖帧，不能因 MediaCodec 暂时没空位就丢。
+                        // 保留为 pending，先不从 FIFO 取下一帧；若外层队列随后填满，
+                        // submit 会显式失败并让 FrameAssembler 请求 IDR。
+                        pendingFrame = frame
+                        Thread.sleep(2)
                     }
                 }
 
                 // 输出：聚合同批所有可用帧，只渲染最新
-                var idx = codec.dequeueOutputBuffer(info, 0)
+                var idx = codec.dequeueOutputBuffer(
+                    info, if (submittedInput) OUTPUT_WAIT_AFTER_INPUT_US else 0)
                 if (idx >= 0) {
                     while (true) {
                         val next = codec.dequeueOutputBuffer(info, 0)
@@ -124,8 +138,11 @@ class VideoDecoder(
                     statOutput++
                 }
                 val now = System.currentTimeMillis()
-                if (now - lastStatLog > 3000) {
+                if (now - lastStatLog > 10_000 &&
+                    (statInput != lastLoggedInput || statOutput != lastLoggedOutput)) {
                     lastStatLog = now
+                    lastLoggedInput = statInput
+                    lastLoggedOutput = statOutput
                     Log.i(TAG, "stats in=$statInput inOk=$statInputOk out=$statOutput rendered=$renderedFrames")
                 }
             } catch (e: Exception) {

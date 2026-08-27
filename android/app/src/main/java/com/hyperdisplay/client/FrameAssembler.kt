@@ -7,7 +7,10 @@ package com.hyperdisplay.client
  *   限频请求 IDR；
  * - 当前帧分片停滞超时同样视为丢失处理。
  */
-class FrameAssembler(private val callback: Callback) {
+class FrameAssembler(
+    private val callback: Callback,
+    private val debugLog: (String) -> Unit = { android.util.Log.d("FrameAssembler", it) }
+) {
     interface Callback {
         fun onFrame(frameId: Int, keyframe: Boolean, data: ByteArray)
         fun onKeyframeNeeded(reason: String)
@@ -24,7 +27,6 @@ class FrameAssembler(private val callback: Callback) {
     private var lastFragmentAt = 0L
     private var waitingForKeyframe = true   // 仅用于会话最初：第一帧必须是 IDR
     private var everGotKeyframe = false
-    private var degraded = false            // 丢包后降级续播：增量帧照放（允许糊/花），后台刷新 IDR
     private var lastKeyframeRequestAt = 0L
     /** 整帧放弃的轻量反馈限流。空 NACK 表示拥塞，不代表“补 0 片”。 */
     private var lastCongestionReportAt = 0L
@@ -33,10 +35,18 @@ class FrameAssembler(private val callback: Callback) {
     fun onFragment(frameId: Int, fragIdx: Int, fragCount: Int, keyframe: Boolean, payload: ByteArray) {
         synchronized(lock) {
             val now = System.currentTimeMillis()
-            lastFragmentAt = now
 
             if (frameId < currentFrameId) return // 过期分片
             if (frameId > currentFrameId) {
+                // 起流/丢帧恢复时，正在接收的 IDR 是唯一能重建解码参考链的锚点。
+                // 旧逻辑把它立刻让给后来抵达的 P 帧；在手机 Wi-Fi 上一个 IDR 往往
+                // 需要数十毫秒到数百毫秒，结果每次还没收完就被下一帧抢走，形成
+                // “丢 IDR → 再要 IDR → 再被 P 帧抢走”的黑屏循环。只在等 IDR 且
+                // 当前 IDR 尚未完成时忽略后续非关键帧；更新的 IDR 仍可替换旧 IDR。
+                if (waitingForKeyframe && currentKeyframe && !deliveredCurrent &&
+                    !isComplete() && !keyframe) {
+                    return
+                }
                 // 新帧开始；旧帧未投递且缺分片才视为丢弃（latest-frame policy）
                 if (currentFrameId >= 0 && !deliveredCurrent && !isComplete()) {
                     onAbandoned()
@@ -63,6 +73,7 @@ class FrameAssembler(private val callback: Callback) {
             }
 
             if (fragIdx >= fragments.size) return
+            lastFragmentAt = now
             if (fragments[fragIdx] == null) fragments[fragIdx] = payload
 
             if (isComplete()) {
@@ -85,7 +96,7 @@ class FrameAssembler(private val callback: Callback) {
                     waitingForKeyframe = false
                 }
                 if (keyframe) {
-                    degraded = false
+                    waitingForKeyframe = false
                 }
                 callback.onFrame(frameId, keyframe, out)
             }
@@ -97,7 +108,7 @@ class FrameAssembler(private val callback: Callback) {
         synchronized(lock) {
             if (currentFrameId < 0) {
                 // 等关键帧但没有任何分片到达（如首帧全丢）：NACK 无从触发，周期性请求 IDR
-                if (waitingForKeyframe || degraded) requestKeyframeRateLimited("idle-wait", System.currentTimeMillis())
+                if (waitingForKeyframe) requestKeyframeRateLimited("idle-wait", System.currentTimeMillis())
                 return
             }
             if (deliveredCurrent || isComplete()) return
@@ -129,7 +140,16 @@ class FrameAssembler(private val callback: Callback) {
             fragments = arrayOfNulls(0)
             waitingForKeyframe = true
             everGotKeyframe = false
-            degraded = false
+        }
+    }
+
+    /** 已编码帧进不了解码 FIFO 时，后续 P 帧不能跨过缺口继续送硬解。 */
+    fun requireKeyframeAfterDecoderBackpressure(frameId: Int) {
+        synchronized(lock) {
+            val now = System.currentTimeMillis()
+            waitingForKeyframe = true
+            reportCongestionRateLimited(frameId, "decoder queue full", now)
+            requestKeyframeRateLimited("decoder queue full at $frameId", now)
         }
     }
 
@@ -144,7 +164,7 @@ class FrameAssembler(private val callback: Callback) {
     private fun reportCongestionRateLimited(frameId: Int, reason: String, now: Long) {
         if (now - lastCongestionReportAt < 750) return
         lastCongestionReportAt = now
-        android.util.Log.d("FrameAssembler", "receiver congested: $reason")
+        debugLog("receiver congested: $reason")
         callback.onNackKeyframeFragments(frameId, emptyList())
     }
 
@@ -160,7 +180,7 @@ class FrameAssembler(private val callback: Callback) {
         // 500ms 既不给关键帧在途制造请求风暴，也能在首次请求丢失时快速补救。
         if (now - lastKeyframeRequestAt < 500) return
         lastKeyframeRequestAt = now
-        android.util.Log.d("FrameAssembler", "keyframe requested: $reason")
+        debugLog("keyframe requested: $reason")
         callback.onKeyframeNeeded(reason)
     }
 }

@@ -7,11 +7,14 @@
 NS_ASSUME_NONNULL_BEGIN
 
 /// 创建一块虚拟显示器。成功返回 CGDirectDisplayID（>0），失败返回 0。
-/// width/height 为 1x 逻辑尺寸；hiDPI 非零只保留给隔离实验，生产传 0。
+/// pixelWidth/pixelHeight 是 ScreenCaptureKit 应采集的完整物理像素；
+/// logicalWidth/logicalHeight 是 macOS 排版使用的逻辑点。两者相同为 1x，
+/// 物理像素恰好为逻辑点 2 倍时启用真正的 Retina 2x。
 /// 实例由 shim 内部持有，进程退出时全部自动销毁。
-CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t width, uint32_t height,
+CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t pixelWidth, uint32_t pixelHeight,
+                                                    uint32_t logicalWidth, uint32_t logicalHeight,
                                                     double refreshRate, NSString *name,
-                                                    uint32_t productID, uint32_t serialNum, uint8_t hiDPI);
+                                                    uint32_t productID, uint32_t serialNum);
 
 /// 销毁一块由本进程创建的虚拟显示器。
 void hyperdisplayDestroyVirtualDisplay(CGDirectDisplayID displayID);

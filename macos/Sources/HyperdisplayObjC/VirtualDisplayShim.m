@@ -14,20 +14,29 @@ static void ensureInit(void) {
     });
 }
 
-CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t width, uint32_t height,
+CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t pixelWidth, uint32_t pixelHeight,
+                                                    uint32_t logicalWidth, uint32_t logicalHeight,
                                                     double refreshRate, NSString *name,
-                                                    uint32_t productID, uint32_t serialNum, uint8_t hiDPI) {
+                                                    uint32_t productID, uint32_t serialNum) {
     ensureInit();
+
+    const BOOL is1x = pixelWidth == logicalWidth && pixelHeight == logicalHeight;
+    const BOOL is2x = (uint64_t)pixelWidth == (uint64_t)logicalWidth * 2 &&
+                      (uint64_t)pixelHeight == (uint64_t)logicalHeight * 2;
+    if (!is1x && !is2x) {
+        return 0;
+    }
 
     CGVirtualDisplayDescriptor *descriptor = [[CGVirtualDisplayDescriptor alloc] init];
     descriptor.queue = gQueue;
     descriptor.name = name ?: @"Hyperdisplay";
-    descriptor.maxPixelsWide = 16384;
-    descriptor.maxPixelsHigh = 16384;
-    // 物理尺寸申报：实测对模式列表无影响（237DPI 也不生成 HiDPI 档——CGVirtualDisplay
-    // 无驱动支持，2x 渲染不可达），保持大屏口径即可
-    // 密度申报：与极简复现工具完全一致（判责工具上默认 2x 渲染的变量对齐）
-    descriptor.sizeInMillimeters = CGSizeMake(600.0, 400.0);
+    // Chromium/force-hidpi 同款构造：descriptor 上限是完整物理像素，mode 则是
+    // macOS 逻辑点。此前固定 16384 + 物理尺寸 mode 只会得到大画布 1x。
+    descriptor.maxPixelsWide = pixelWidth;
+    descriptor.maxPixelsHigh = pixelHeight;
+    const double nominalPPI = 237.0;
+    descriptor.sizeInMillimeters = CGSizeMake(pixelWidth * 25.4 / nominalPPI,
+                                               pixelHeight * 25.4 / nominalPPI);
     descriptor.vendorID = 0x1A2B;
     descriptor.productID = productID;
     // EDID serial 恒定：macOS 按 (vendor,product,serial) 记忆显示器——排列位置、
@@ -39,18 +48,14 @@ CGDirectDisplayID hyperdisplayCreateVirtualDisplay(uint32_t width, uint32_t heig
         return 0;
     }
 
-    CGVirtualDisplayMode *mode = [[CGVirtualDisplayMode alloc] initWithWidth:width
-                                                                      height:height
+    CGVirtualDisplayMode *mode = [[CGVirtualDisplayMode alloc] initWithWidth:logicalWidth
+                                                                      height:logicalHeight
                                                                  refreshRate:refreshRate];
     CGVirtualDisplaySettings *settings = [[CGVirtualDisplaySettings alloc] init];
     settings.modes = @[ mode ];
-    // hiDPI 语义（2026-08-21 干净系统复核）：
-    //   0 = 显式 1x，当前唯一生产路径。
-    //   非 0 留空曾读回更大像素画布，但 CGDisplayBounds 同样变大，实际仍是
-    //   大画布 1x，不是真 Retina 2x；只保留给隔离实验。
-    if (hiDPI == 0) {
-        settings.hiDPI = 0;
-    } // 非 0：实验路径，留空该属性
+    // 2026-08-26 M2 Max / macOS 26.5 单次隔离探针确认：设置 1 后对象回读
+    // hiDPI=2，CGDisplayMode 为 logical，pixelWidth/Height 为其 2 倍。
+    settings.hiDPI = is2x ? 1 : 0;
 
     if (![display applySettings:settings]) {
         return 0;
