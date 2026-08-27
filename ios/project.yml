@@ -1,0 +1,49 @@
+name: hyperdisplay-ios
+options:
+  bundleIdPrefix: com.hyperdisplay
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "2"
+    CODE_SIGN_STYLE: Automatic
+targets:
+  Hyperdisplay:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: Hyperdisplay/Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hyperdisplay.client.ios
+        GENERATE_INFOPLIST_FILE: "NO"
+        INFOPLIST_FILE: Hyperdisplay/Info.plist
+        MARKETING_VERSION: "0.4.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ENABLE_PREVIEWS: "NO"
+        SUPPORTS_MACCATALYST: "NO"
+  HyperdisplayTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: Hyperdisplay/Tests
+    dependencies:
+      - target: Hyperdisplay
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hyperdisplay.client.tests
+        GENERATE_INFOPLIST_FILE: "YES"
+schemes:
+  Hyperdisplay:
+    build:
+      targets:
+        Hyperdisplay: all
+        HyperdisplayTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - HyperdisplayTests
