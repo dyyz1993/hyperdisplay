@@ -46,6 +46,7 @@ final class AppModel: ObservableObject {
     /// 布局替换必须等整组新屏都至少渲染一帧才能收横幅
     private var topologyTransitionInFlight = false
     private var topologyExpectedIds: Set<UInt32> = []
+    private var topologyBannerSinceMs = UInt64(0)
     /// 防止旧屏尚未销毁时每枚 DISPLAYS 都重复发起规格校正
     private var profileSyncRequested: [SizeSpec]?
     /// 主屏等待第二块屏的过渡占位（对照 pendingSecondScreen）
@@ -279,13 +280,22 @@ final class AppModel: ObservableObject {
 
     private func stallTick() {
         for p in pipelines.values { p.assembler.stallCheck() }
-        // 布局替换横幅：整组新屏都出过一帧才能收（旧屏仍在播放时不能提前撤）
-        if topologyTransitionInFlight && !topologyExpectedIds.isEmpty,
-           topologyExpectedIds.allSatisfy({ (pipelines[$0]?.framesRendered ?? 0) > 0 }) {
-            topologyTransitionInFlight = false
-            topologyExpectedIds = []
-            bannerTitle = nil
-            bannerDetail = nil
+        // 布局替换横幅：整组新屏都出过一帧才能收（旧屏仍在播放时不能提前撤）；
+        // 但 host 只建出部分屏（或建屏失败）时不能永远挂着——12s 强制收起。
+        if topologyTransitionInFlight {
+            if !topologyExpectedIds.isEmpty,
+               topologyExpectedIds.allSatisfy({ (pipelines[$0]?.framesRendered ?? 0) > 0 }) {
+                topologyTransitionInFlight = false
+                topologyExpectedIds = []
+                bannerTitle = nil
+                bannerDetail = nil
+            } else if FrameAssembler.nowMs() &- topologyBannerSinceMs > 12_000 {
+                Self.diag.log("topology banner timeout — host may have built only part of the screens")
+                topologyTransitionInFlight = false
+                topologyExpectedIds = []
+                bannerTitle = nil
+                bannerDetail = nil
+            }
         }
         updateStats()
     }
@@ -605,6 +615,7 @@ extension AppModel: HostSessionListener {
 
     private func beginTopologyTransition() {
         topologyTransitionInFlight = true
+        topologyBannerSinceMs = FrameAssembler.nowMs()
         bannerTitle = "正在应用新的屏幕布局"
         bannerDetail = "保留当前画面，正在优化副屏…"
     }
