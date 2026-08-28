@@ -177,11 +177,13 @@ final class CursorOverlayView: UIView {
         layer.sublayers?.removeAll()
         let imageLayer = CALayer()
         imageLayer.contents = cgImage
-        imageLayer.contentsScale = Self.systemCursorScale
-        // 1 bitmap px = 1 pt（contentsScale 2 → 屏幕上放大 2x）；左上原点，
-        // position 定为「坐标点 − 热点」→ 热点像素精确落在光标坐标上（对照安卓
-        // canvas.translate(cx,cy) + drawBitmap(bitmap, -hotX, -hotY)）
-        imageLayer.bounds = CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h))
+        // 缩放对齐安卓：安卓 systemCursorScale=2 画在物理像素画布（平板 2x 密度）
+        // 上；iOS CALayer 在逻辑坐标，等效物理观感 = 逻辑 × 屏幕密度。
+        // 逻辑尺寸 = 位图像素 × 2 ÷ 屏幕密度，光标物理大小与安卓平板一致。
+        let density = UIScreen.main.scale
+        let logicalW = CGFloat(w) * Self.systemCursorScale / density
+        let logicalH = CGFloat(h) * Self.systemCursorScale / density
+        imageLayer.bounds = CGRect(x: 0, y: 0, width: logicalW, height: logicalH)
         imageLayer.anchorPoint = CGPoint(x: 0, y: 0)
         imageLayer.masksToBounds = false
         mode = .bitmap(layer: imageLayer, hotX: hx, hotY: hy)

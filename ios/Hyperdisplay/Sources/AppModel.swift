@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import UIKit
 import AVFoundation
+import Network
 import os.log
 
 /// 会话编排（对照 MainActivity 的连接状态机，产品口径：纯显示、单屏优先）。
@@ -65,6 +66,11 @@ final class AppModel: ObservableObject {
     }()
     @AppStorage("hd.showStats") var showStats = true // 调试期默认开：光标/尺寸问题需要真实数字
     @Published var statsLine = ""
+    /// 传输徽标文案：跟随 NWPathMonitor 的真实出口接口（Wi-Fi/有线/蜂窝）。
+    /// 徽标只代表 UDP 链路已建立；接口名才回答"流量走的是什么网"——
+    /// 手机当热点、Wi-Fi 图标误判等场景下，硬编码 "Wi-Fi" 会误导排查。
+    @Published private(set) var transportLabel = "…"
+    private let pathMonitor = NWPathMonitor()
     /// 光标包到达速率（诊断光标卡顿：网络抖动 vs 渲染问题）
     private var cursorPacketCount = 0
     private var cursorRate = 0
@@ -106,12 +112,29 @@ final class AppModel: ObservableObject {
             self?.statusText = message
             self?.stopDiscovery()
         }
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let label: String
+            switch path.status {
+            case .satisfied:
+                if path.usesInterfaceType(.wifi) { label = "Wi-Fi" }
+                else if path.usesInterfaceType(.wiredEthernet) { label = "有线" }
+                else if path.usesInterfaceType(.cellular) { label = "蜂窝" }
+                else { label = "网络" }
+            case .unsatisfied, .requiresConnection:
+                label = "无网络"
+            @unknown default:
+                label = "网络"
+            }
+            Task { @MainActor [weak self] in self?.transportLabel = label }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "hyperdisplay-path-monitor"))
     }
 
     deinit {
         session = nil // goodbye 走显式路径；deinit 只保证连接取消
         stallTimer?.invalidate()
         browser.stop()
+        pathMonitor.cancel()
     }
 
     // MARK: - 连接入口
@@ -295,6 +318,12 @@ final class AppModel: ObservableObject {
         showDirectTest = false
     }
 
+    /// 紧凑高清实验：显示长边切 2240 档（清晰度↑，桌面逻辑更大）
+    func setCompactTier() {
+        layoutConfig.displayLongEdge = 2240
+        layoutConfig.save(pipLeft: pipLeft, pipTop: pipTop)
+    }
+
     // MARK: - 周期任务（停滞检测 + 统计）
 
     private func startStallTimer() {
@@ -383,11 +412,20 @@ final class AppModel: ObservableObject {
 
     // MARK: - 工具
 
+    /// 关键帧请求限频：同屏 2s 内只发一次。host 的静止锐化会周期性自发 IDR，
+    /// 客户端密集请求只会放大突发（真机实测 2s 一个巨型 IDR 挤爆 WiFi，
+    /// 光标包被挤到卡成幻灯片）。
+    private var lastKeyframeRequestAt: [UInt32: UInt64] = [:]
+
     func pipelineOf(id: UInt32) -> VideoPipeline {
         if let existing = pipelines[id] { return existing }
         let p = VideoPipeline(displayId: id, callbacks: .init(
             requestKeyframe: { [weak self] displayId in
-                self?.session?.requestKeyframe(displayId: UInt16(clamping: Int(displayId)))
+                guard let self else { return }
+                let now = FrameAssembler.nowMs()
+                if let last = self.lastKeyframeRequestAt[displayId], now &- last < 2_000 { return }
+                self.lastKeyframeRequestAt[displayId] = now
+                self.session?.requestKeyframe(displayId: UInt16(clamping: Int(displayId)))
             },
             sendNack: { [weak self] displayId, frameId, missing in
                 self?.session?.sendNack(displayId: UInt16(clamping: Int(displayId)),

@@ -214,7 +214,7 @@ struct SessionScreen: View {
 
             VStack {
                 HStack(spacing: 14) {
-                    TransportBadge(linkUp: model.linkUp)
+                    TransportBadge(linkUp: model.linkUp, transport: model.transportLabel)
                     Spacer()
                     if chromeVisible {
                         Button {
@@ -288,22 +288,35 @@ struct SessionScreen: View {
 }
 
 /// 常驻传输标识（对照安卓 transportBadge）：一眼区分链路状态。
-/// iOS 无有线通道，固定 Wi-Fi；断链时降为灰色未连接态。
+/// iOS 无有线通道；文案来自 NWPathMonitor 的真实出口接口，而不是硬编码——
+/// 手机当热点/误关 Wi-Fi 等场景下，徽标才能如实回答"流量走的是什么网"。
+/// 断链时降为灰色未连接态。
 struct TransportBadge: View {
     let linkUp: Bool
+    let transport: String
+
+    private var symbolName: String {
+        guard linkUp else { return "wifi.exclamationmark" }
+        switch transport {
+        case "Wi-Fi": return "wifi"
+        case "有线": return "cable_connector"
+        case "蜂窝": return "antenna_radiowaves_left_right"
+        default: return "network"
+        }
+    }
 
     var body: some View {
         HStack(spacing: 5) {
-            Image(systemName: linkUp ? "wifi" : "wifi.exclamationmark")
+            Image(systemName: symbolName)
                 .font(.system(size: 11, weight: .semibold))
-            Text(linkUp ? "Wi‑Fi" : "未连接")
+            Text(linkUp ? transport : "未连接")
                 .font(.system(size: 11, weight: .semibold))
         }
         .foregroundColor(linkUp ? .white : .white.opacity(0.5))
         .padding(.horizontal, 9)
         .padding(.vertical, 5)
         .background(Capsule().fill(Color.black.opacity(0.45)))
-        .accessibilityLabel(linkUp ? "已通过 Wi-Fi 连接" : "未连接")
+        .accessibilityLabel(linkUp ? "已通过\(transport)连接" : "未连接")
     }
 }
 
@@ -375,8 +388,6 @@ struct LayoutRegionsView: View {
         let sideW = size.width * CGFloat(fraction)
         let sideOnLeft = model.layoutConfig.sideLeft
         let mainW = size.width - sideW
-        let sideX = sideOnLeft ? CGFloat(0) : mainW
-        let mainX = sideOnLeft ? sideW : CGFloat(0)
         let dividerX = sideOnLeft ? sideW : mainW
         return ZStack(alignment: .topLeading) {
             if sideOnLeft {
