@@ -63,8 +63,11 @@ final class AppModel: ObservableObject {
         let code = UserDefaults.standard.integer(forKey: "hd.pairingCode")
         return code > 0 ? String(code) : ""
     }()
-    @AppStorage("hd.showStats") var showStats = false
+    @AppStorage("hd.showStats") var showStats = true // 调试期默认开：光标/尺寸问题需要真实数字
     @Published var statsLine = ""
+    /// 光标包到达速率（诊断光标卡顿：网络抖动 vs 渲染问题）
+    private var cursorPacketCount = 0
+    private var cursorRate = 0
 
     // MARK: 内部状态
 
@@ -364,13 +367,16 @@ final class AppModel: ObservableObject {
         let now = FrameAssembler.nowMs()
         guard now &- lastStatTickAtMs >= 1000 else { return }
         lastStatTickAtMs = now
+        cursorRate = cursorPacketCount
+        cursorPacketCount = 0
         var parts: [String] = []
-        parts.append(linkUp ? "链路 OK" : "未连通")
+        parts.append(linkUp ? "链路OK" : "断")
+        parts.append("标\(cursorRate)/s")
         for p in pipelines.values.sorted(by: { $0.displayId < $1.displayId }) {
             let previous = lastRenderedSnapshot[p.displayId] ?? p.framesRendered
             let fps = p.framesRendered &- previous
             lastRenderedSnapshot[p.displayId] = p.framesRendered
-            parts.append("屏\(p.displayId) \(p.width)x\(p.height) ~\(fps)fps 渲\(p.framesRendered)")
+            parts.append("屏\(p.displayId) \(p.width)x\(p.height) ~\(fps)fps")
         }
         statsLine = parts.joined(separator: "  ")
     }
@@ -546,6 +552,7 @@ extension AppModel: HostSessionListener {
             handleDisplays(list)
 
         case .cursor(let displayId, let x, let y):
+            cursorPacketCount += 1
             if displayId == 0 {
                 cursorOverlays.values.forEach { $0.hide() }
             } else if let overlay = cursorOverlays[UInt32(displayId)] {
