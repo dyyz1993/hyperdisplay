@@ -1,6 +1,9 @@
 import Foundation
 import Network
 import Darwin
+import os.log
+
+private let sweepLog = Logger(subsystem: "com.hyperdisplay.session", category: "sweep")
 
 /// 局域网发现 hyperdisplay host（_hyperdisplay._udp，对照 android/.../NsdFinder.kt）。
 /// 发现 → 解析 IPv4 端点 → 回调 (名字, ip, port, 配对码)。iOS 无 USB 网络共享，
@@ -68,11 +71,16 @@ final class DiscoveryBrowser {
     /// 监听 4s 内的 PONG 应答。host 对任何来源都会回 PONG（unknown 标志位），
     /// 应答地址即 Mac。单播 UDP，不需要组播权限。
     func startSweepFallback() {
-        guard browser != nil, !sweepActive else { return } // mDNS 仍在跑才值得兜底
-        guard let (basePrefix, _) = Self.localLANIPv4() else {
+        guard browser != nil, !sweepActive else {
+            sweepLog.log("sweep skip: browser=\(self.browser != nil) active=\(self.sweepActive)")
+            return
+        }
+        guard let (basePrefix, ip) = Self.localLANIPv4() else {
+            sweepLog.error("sweep: no local IPv4")
             onError?("未获取到 Wi-Fi 地址：请确认已连接无线网络")
             return
         }
+        sweepLog.log("sweep start: local=\(ip) prefix=\(basePrefix)x")
         sweepActive = true
         let queue = DispatchQueue(label: "hyperdisplay.sweep")
         let fd = socket(AF_INET, SOCK_DGRAM, 0)
@@ -83,27 +91,32 @@ final class DiscoveryBrowser {
         queue.async { [weak self] in
             defer { close(fd); self?.sweepActive = false; self?.sweepSocket = -1 }
             let ping: [UInt8] = [0x13, 0, 0, 0, 1]
+            var sent = 0
+            var sendErrors = 0
             for i in 1...254 {
                 guard self?.sweepActive == true else { return }
                 var addr = sockaddr_in()
                 addr.sin_family = sa_family_t(AF_INET)
                 addr.sin_port = UInt16(5277).bigEndian
                 inet_pton(AF_INET, "\(basePrefix)\(i)", &addr.sin_addr)
-                withUnsafeBytes(of: ping) { raw in
+                let r = withUnsafeBytes(of: ping) { raw in
                     withUnsafePointer(to: &addr) { addrPtr in
                         addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                            _ = sendto(fd, raw.baseAddress, ping.count, 0, $0,
-                                       socklen_t(MemoryLayout<sockaddr_in>.size))
+                            sendto(fd, raw.baseAddress, ping.count, 0, $0,
+                                   socklen_t(MemoryLayout<sockaddr_in>.size))
                         }
                     }
                 }
+                if r >= 0 { sent += 1 } else { sendErrors += 1 }
                 usleep(12_000)
             }
+            sweepLog.log("sweep sent=\(sent) errors=\(sendErrors)")
             var buf = [UInt8](repeating: 0, count: 64)
             var from = sockaddr_in()
             var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
             let deadline = Date().addingTimeInterval(4)
             var reported = Set<String>()
+            var replies = 0
             while Date() < deadline, self?.sweepActive == true {
                 let n = withUnsafeMutablePointer(to: &from) { fromPtr -> Int in
                     fromPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -111,18 +124,21 @@ final class DiscoveryBrowser {
                     }
                 }
                 guard n == 6, buf[0] == 0x06 else { continue } // PONG
+                replies += 1
                 var addrIn = from.sin_addr
                 var cStr = [CChar](repeating: 0, count: 16)
                 inet_ntop(AF_INET, &addrIn, &cStr, socklen_t(16))
                 let ip = String(cString: cStr)
                 guard ip != basePrefix + "1", !reported.contains(ip) else { continue }
                 reported.insert(ip)
+                sweepLog.log("sweep PONG from \(ip)")
                 let host = DiscoveredHost(name: "Mac（自动发现）", host: ip,
                                           port: Self.defaultPort, pairingCode: 0)
                 DispatchQueue.main.async { [weak self] in
                     self?.onUpdate?([host])
                 }
             }
+            sweepLog.log("sweep done: replies=\(replies) reported=\(reported.count)")
         }
     }
 

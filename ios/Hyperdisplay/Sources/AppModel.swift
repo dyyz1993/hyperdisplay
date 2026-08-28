@@ -447,12 +447,29 @@ final class AppModel: ObservableObject {
     /// 宽高向下取整到 16 的倍数：host 建 CGVirtualDisplay 前按 16px 对齐，
     /// 请求值先对齐可消除对齐取整带来的比例漂移（漂移=可见黑边）。
     static func videoRegionPixels() -> ScreenPixels {
+        // 可视区（全宽 × 全高−刘海行），但发请求前先在「16 的倍数」约束下搜索
+        // 比例最接近可视区的组合——host makeProfiles 会对 spec 做 (v+15)&~15
+        // 向上对齐，两端独立取整会让宽高比漂移 1%（iPhone 实测 = 肉眼可见的
+        // 左右黑边）。搜索让请求值=host 最终建屏值且比例误差最小（<0.1%）。
         let px = screenPixels()
         let inset = Int(videoTopInsetPt * screenScale())
-        let h = max(240, px.height - inset)
-        let alignedW = px.width & ~15
-        let alignedH = h & ~15
-        return ScreenPixels(width: alignedW, height: alignedH)
+        let rawW = max(640, px.width)
+        let rawH = max(480, px.height - inset)
+        let target = Double(rawW) / Double(rawH)
+        func floor16(_ v: Int) -> Int { max(640, v & ~15) }
+        func ceil16(_ v: Int) -> Int { max(640, (v + 15) & ~15) }
+        func round16(_ v: Double) -> Int { max(480, (Int(v.rounded()) + 8) & ~15) }
+        var best = (w: ceil16(rawW), h: ceil16(rawH))
+        var bestErr = Double.greatestFiniteMagnitude
+        for w in [floor16(rawW), ceil16(rawW)] {
+            let h = round16(Double(w) / target)
+            let err = abs(Double(w) / Double(h) - target)
+            if err < bestErr {
+                bestErr = err
+                best = (w, h)
+            }
+        }
+        return ScreenPixels(width: best.w, height: best.h)
     }
 
     private func parseEndpoint(_ text: String) -> (String, UInt16)? {

@@ -1881,7 +1881,13 @@ final class HostApp: NSObject, NSApplicationDelegate {
                                                    deviceName: deviceName)
             let deviceId = identity.deviceId
             let restoreClaim = DeviceRestoreClaim(deviceId: deviceId, claimedDeviceId: claimedDeviceId)
-            let restoringAfterReinstall = identity.restoredAfterReinstall && !acknowledgedRestoreClaims.contains(restoreClaim)
+            // 恢复的前提是确实存过布局档案可下发；没有档案时若仍停留在恢复态，
+            // 客户端永远收不到 savedLayout、无法 ACK，请求会被永久清空（死锁：
+            // 实测 iPhone 重装后 specs 恒被忽略、屏幕尺寸永不更新）。
+            let hasRestorableLayout = loadDeviceLayout(deviceId) != nil
+            let restoringAfterReinstall = identity.restoredAfterReinstall
+                && !acknowledgedRestoreClaims.contains(restoreClaim)
+                && hasRestorableLayout
             currentDeviceId = deviceId
             // 每个 HELLO 携带该平板上次保存的目标屏幕组。首次只带当前平板尺寸，
             // Host 因此直接建一块默认屏；之后若用户选过分屏，则一次复建完整两块/多块。
@@ -1925,7 +1931,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 udp?.send(to: &target, Wire.savedLayout(savedLayout))
                 NSLog("[hyperdisplay] restored remembered layout after client reinstall")
             }
-            NSLog("[hyperdisplay] HELLO proto=\(proto) client=\(cw)x\(ch) from \(addressString(addr))")
+            NSLog("[hyperdisplay] HELLO proto=\(proto) client=\(cw)x\(ch) from \(addressString(addr)) specs=\(requestedDisplays) count=\(requestedDisplays.count) name=\(advertisedDeviceName)")
             pushDisplays()
             for id in targets { subscribe(key: key, displayId: id) }
 
