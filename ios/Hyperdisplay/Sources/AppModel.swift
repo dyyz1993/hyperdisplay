@@ -459,9 +459,14 @@ final class AppModel: ObservableObject {
         func floor16(_ v: Int) -> Int { max(640, v & ~15) }
         func ceil16(_ v: Int) -> Int { max(640, (v + 15) & ~15) }
         func round16(_ v: Double) -> Int { max(480, (Int(v.rounded()) + 8) & ~15) }
-        var best = (w: ceil16(rawW), h: ceil16(rawH))
+        // 宽度至少 1280：host 的 2x 几何要求物理像素 ≥1280x960，否则只能建 1x
+        // 巨画布（手机上 UI 缩成 1/3、且高像素推高码率需求）。宽度达标即得 2x：
+        // 逻辑减半（UI 正常大小）、像素高清。iPhone13: 1280x2688 → 逻辑 640x1344。
+        let wFloor = floor16(rawW)
+        let wCeil = ceil16(rawW)
+        var best = (w: wCeil, h: round16(Double(wCeil) / target))
         var bestErr = Double.greatestFiniteMagnitude
-        for w in [floor16(rawW), ceil16(rawW)] {
+        for w in [wFloor, wCeil] {
             let h = round16(Double(w) / target)
             let err = abs(Double(w) / Double(h) - target)
             if err < bestErr {
@@ -545,9 +550,9 @@ extension AppModel: HostSessionListener {
             pipeline.handleWelcome(codec: codec, width: Int(w), height: Int(h), fps: Int(fps))
             // 流尺寸是光标坐标换算的基准：WELCOME 到达时同步给光标层，
             // 否则尺寸为 0 → streamToView 恒 nil → 光标永远不显示
-            if let overlay = cursorOverlayRefs.first(where: { $0.0 == UInt32(displayId) })?.1.value {
-                overlay.setStreamSize(w: Int(w), h: Int(h))
-            }
+            let overlay = cursorOverlayRefs.first(where: { $0.0 == UInt32(displayId) })?.1.value
+                ?? cursorOverlayRefs.first?.1.value
+            overlay?.setStreamSize(w: Int(w), h: Int(h))
 
         case .config(let displayId, _, let paramSets):
             Self.diag.log("CONFIG display=\(displayId) csd=\(paramSets.count) bytes")
@@ -567,8 +572,11 @@ extension AppModel: HostSessionListener {
             cursorPacketCount += 1
             if displayId == 0 {
                 cursorOverlays.values.forEach { $0.hide() }
-            } else if let overlay = cursorOverlays[UInt32(displayId)] {
-                overlay.moveTo(streamX: x, streamY: y)
+            } else {
+                // host 的拓扑回退（如 2x 被拒换 1x）会更换 CGDirectDisplayID；
+                // 精确匹配失败时回落到当前唯一 overlay，光标才不会因 id 变换消失
+                let overlay = cursorOverlays[UInt32(displayId)] ?? cursorOverlays.values.first
+                overlay?.moveTo(streamX: x, streamY: y)
             }
 
         case .cursorBitmap(let image):
