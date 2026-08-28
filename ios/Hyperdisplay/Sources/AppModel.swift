@@ -447,6 +447,15 @@ final class AppModel: ObservableObject {
         return max(24, scene?.keyWindow?.safeAreaInsets.top ?? 24)
     }
 
+    /// 紧凑显示档：虚拟屏长边抬到 2240（DisplayResolution 档位 4），逻辑桌面
+    /// 变大 → 同尺寸屏上字体更细腻。为清晰度调试加的请求端开关，默认关。
+    static func requestedDisplaySpecs(config: LayoutConfig, compact: Bool) -> [RequestedDisplaySpec] {
+        var cfg = config
+        if compact { cfg.displayLongEdge = 2240 }
+        let px = Self.videoRegionPixels()
+        return LayoutGeometry.requestedSpecs(config: cfg, screenW: px.width, screenH: px.height)
+    }
+
     /// 视频可视区的完整物理像素：全宽 ×（全高 − 刘海行）。
     /// 虚拟屏按这个比例建 → aspect-fit 恰好铺满可视区，四周零黑边。
     /// 宽高向下取整到 16 的倍数：host 建 CGVirtualDisplay 前按 16px 对齐，

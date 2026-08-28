@@ -103,6 +103,19 @@ struct ConnectScreen: View {
                 }
                 .buttonStyle(.bordered)
                 .tint(.orange)
+                Button {
+                    // 紧凑高清实验：显示长边抬到 2240 档（逻辑桌面更大，字体更细腻）
+                    model.setCompactTier()
+                    model.endpointText = "192.168.0.4:5277"
+                    model.pairingCodeText = "771866"
+                    model.connectFromForm()
+                } label: {
+                    Text("紧凑高清（2240 长边）实验")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.bordered)
+                .tint(.teal)
             }
 
             if !model.statusText.isEmpty {
@@ -215,7 +228,8 @@ struct SessionScreen: View {
                         }
                     }
                 }
-                .padding(.top, 4)
+                // 在刘海行内垂直居中：顶部让出 (安全区顶-行高)/2，不再贴死边缘
+                .padding(.top, max(2, (AppModel.videoTopInsetPt - 30) / 2))
                 .padding(.horizontal, 10)
                 Spacer()
                 if model.showStats && !model.statsLine.isEmpty {
