@@ -93,4 +93,33 @@ final class FrameAssemblerTests: XCTestCase {
         // 重连后没有参考帧，delta 必须被丢弃
         XCTAssertEqual(recorder.delivered, [1])
     }
+
+    /// 回归（真机 0x8BADF00D 根因，2026-08-29）：解码背压时 onFrame 回调会在
+    /// 同一线程同步重入 requireKeyframeAfterDecoderBackpressure。NSLock 不可
+    /// 重入，旧实现在持锁期间直接发回调 → 主线程自死锁 → watchdog 杀进程。
+    /// 本测试在 onFrame 里原样重放该重入路径；若回归为死锁，onFragment 不会
+    /// 在超时内返回。
+    func testOnFrameCallbackMayReenterRequireKeyframeWithoutDeadlock() {
+        let recorder = Recorder()
+        var assembler: FrameAssembler!
+        assembler = FrameAssembler(callbacks: .init(
+            onFrame: { _, _, _ in
+                assembler.requireKeyframeAfterDecoderBackpressure(frameId: 1)
+                recorder.delivered.append(1)
+            },
+            onKeyframeNeeded: { reason in recorder.keyframeReasons.append(reason) },
+            onNackKeyframeFragments: { frameId, _ in recorder.congestionFrames.append(frameId) },
+            debugLog: { _ in }
+        ))
+
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            assembler.onFragment(frameId: 1, fragIdx: 0, fragCount: 1, keyframe: true,
+                                 payload: Data([9]))
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 3), .success,
+                       "onFragment 自死锁：onFrame 回调持锁重入 requireKeyframeAfterDecoderBackpressure")
+        XCTAssertEqual(recorder.delivered, [1])
+    }
 }

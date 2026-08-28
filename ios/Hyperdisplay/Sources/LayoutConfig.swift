@@ -69,6 +69,23 @@ struct LayoutConfig: Equatable, Codable {
     var clarity: Int = 0
 
     static let `default` = LayoutConfig()
+
+    // 定义了 init(from:) 后 Swift 不再合成无参构造，这里补回
+    init() {}
+
+    // 种子 JSON 可能由 defaults CLI 或旧版本写入，缺字段必须回落默认值而不是
+    // 整份拒绝（testSeedJSONDecodesSplit 固化此语义）；合成 Codable 做不到。
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try c.decodeIfPresent(LayoutKind.self, forKey: .kind) ?? .single
+        fraction = try c.decodeIfPresent(Float.self, forKey: .fraction) ?? 0.5
+        sideLeft = try c.decodeIfPresent(Bool.self, forKey: .sideLeft) ?? false
+        pipRatio = try c.decodeIfPresent(PipRatio.self, forKey: .pipRatio) ?? .r1610
+        pipCustomW = try c.decodeIfPresent(Int.self, forKey: .pipCustomW) ?? 0
+        pipCustomH = try c.decodeIfPresent(Int.self, forKey: .pipCustomH) ?? 0
+        displayLongEdge = try c.decodeIfPresent(Int.self, forKey: .displayLongEdge) ?? 0
+        clarity = try c.decodeIfPresent(Int.self, forKey: .clarity) ?? 0
+    }
 }
 
 /// 副屏像素档位（对照 DisplayResolution.kt）。0 表示按本机当前原生画布请求。
