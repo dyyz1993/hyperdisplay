@@ -637,9 +637,12 @@ final class DisplayStream {
 
     /// 静止锐化入口（tick 每秒调）：内容静止 ≥0.5s 且此前在动 → 重编码 IDR。
     /// 运动末帧是低质量帧（码率被运动分摊 + AIMD 可能已砍码率），不重编码就糊着
-    /// 停在屏幕上。锐化帧**无视 AIMD 直接用满目标码率**：静止单帧是一次性开销，
-    /// 不占持续带宽（LAN 带宽不稀缺原则，AGENTS §7.5）——修「停止后 10s 才恢复」
-    /// 的根因（旧逻辑锐化帧沿用被砍码率 + AIMD 12s/步爬回）。
+    /// 停在屏幕上。
+    /// 锐化 IDR **沿用 AIMD 收敛后的当前码率**。⚠️ WiFi 场景（iPhone）实测：
+    /// 「无视 AIMD 直接用满目标码率」会制造每 2s 一次 27M 突发 → 丢片 → AIMD
+    /// 砍回 → 再锐化再拉满的死亡螺旋（光标 60Hz 包被挤爆，客户端整屏冻结）。
+    /// 静止帧有充足编码时间，收敛码率的静态 IDR 依旧清晰；码率回升交给
+    /// adaptQuality 的稳定窗口逐级进行。
     /// 限频：每次运动周期只锐化一次。
     func refineIfSettled(now: Date) {
         guard let last = lastContentFrameAt else { return }
@@ -649,24 +652,19 @@ final class DisplayStream {
         } else if still > 0.5 && refinementWasMoving {
             refinementWasMoving = false
             motionBitrateActive = false // 下一次真实内容到来立刻重新进入运动档
-            let saved = currentBitrate
             let sourceFrameAt = last
-            if saved < targetBitrate {
-                currentBitrate = targetBitrate
-                encoder?.applyBitrate(targetBitrate) // 满码率编码这一帧
-            }
-            NSLog("[hyperdisplay] refinement IDR for display \(display.displayID) (settled; bitrate \(saved/1000)k->\(targetBitrate/1000)k)")
+            NSLog("[hyperdisplay] refinement IDR for display \(display.displayID) (settled; bitrate \(currentBitrate/1000)k)")
             forceKeyframeAndReplay()
             capture?.requestFrameRate(min(fps, 30))
             // 1.5s 后（IDR 已编码送达）清空本轮时间戳，此后只有真实新采集内容才会
-            // 重新武装锐化检测。静态零发送，编码器应继续保持高清档；不能在这里
-            // applyBitrate(saved)，否则它留下的“下一帧强制 IDR”会让时钟等微小刷新
-            // 用低码率关键帧覆盖刚恢复的高清画面。下一次真正运动时，
-            // enterMotionBitrateIfNeeded 会根据最近真实拥塞决定是否降档。
+            // 重新武装锐化检测。静态零发送；此事务全程不动码率，也没有任何需要在
+            // 延迟回调里恢复的状态——任何“延迟恢复”逻辑都会让时钟等微小刷新
+            // 覆盖刚锐化的画面。
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let self else { return }
                 // 这 1.5 秒内若出现了新的真实采集帧，用户已重新滚动：运动回调已
-                // 负责降档，不能再把旧静态事务的低码率/空时间戳写回去。
+                // 负责码率档位，不能清掉新内容的时间戳。下一次真正运动时，
+                // enterMotionBitrateIfNeeded 会根据最近真实拥塞决定是否降档。
                 guard self.lastContentFrameAt == sourceFrameAt else { return }
                 self.lastContentFrameAt = nil
             }
