@@ -439,8 +439,13 @@ final class AppModel: ObservableObject {
         return (scene?.screen ?? UIScreen.main).scale
     }
 
-    /// 顶部刘海行预留（UI 与请求规格共用同一常量，保证宽高比一致）
-    static let videoTopInsetPt: CGFloat = 24
+    /// 顶部刘海行预留 = 系统真实安全区顶（刘海/灵动岛高度，iPhone13≈47pt）。
+    /// UI 与请求规格共用同一来源，保证宽高比严格一致（此前固定 24pt 与
+    /// 安全区叠加，双重预留让实际区域变"矮胖"→ aspect-fit 左右留黑边）。
+    static var videoTopInsetPt: CGFloat {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        return max(24, scene?.keyWindow?.safeAreaInsets.top ?? 24)
+    }
 
     /// 视频可视区的完整物理像素：全宽 ×（全高 − 刘海行）。
     /// 虚拟屏按这个比例建 → aspect-fit 恰好铺满可视区，四周零黑边。

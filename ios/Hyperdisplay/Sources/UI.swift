@@ -175,7 +175,10 @@ struct SessionScreen: View {
     var body: some View {
         ZStack {
             GeometryReader { geo in
-                // 顶部预留刘海行（与请求规格用同一常量：虚拟屏比例=可视区比例 → 零黑边）
+                // 全屏画布（ignoresSafeArea 后 geo=物理整屏），顶部让出真实刘海
+                // 高度（动态读系统值）：可视区=全宽×(全高-刘海)，与请求比例同源。
+                // 此前 safe area+固定 24pt 双重预留，区域比请求比例"矮胖"，
+                // aspect-fit 被迫左右留边——用户反复看到的黑边即此。
                 let topInset: CGFloat = AppModel.videoTopInsetPt
                 LayoutRegionsView(model: model,
                                   size: CGSize(width: geo.size.width,
@@ -186,7 +189,7 @@ struct SessionScreen: View {
                     }
                     .onAppear { model.handleViewportChange() }
             }
-            .ignoresSafeArea(edges: .bottom)
+            .ignoresSafeArea()
 
             if let title = model.bannerTitle {
                 bannerOverlay(title: title, detail: model.bannerDetail ?? "")
