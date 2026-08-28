@@ -328,7 +328,8 @@ struct LayoutRegionsView: View {
                     StreamContainer(model: model, pipeline: model.pipelineOf(id: id))
                 }
             } else {
-                PendingSecondScreenView()
+                // 单屏布局未订阅到屏时走这里：等待遮罩已解释状态，占位不重复说话
+                Color.black
             }
         }
     }

@@ -591,6 +591,8 @@ extension AppModel: HostSessionListener {
         let selected = list.prefix(wanted)
         let desiredIds = selected.map(\.id)
         awaitingSecondDisplay = desiredIds.count < wanted
+        // 第二屏占位视图自己会说明"正在建立"，等待遮罩别再叠一层文字（会重叠成乱码）
+        if awaitingSecondDisplay { waitingText = nil }
 
         if subscribedIds.isEmpty {
             subscribedIds = desiredIds
