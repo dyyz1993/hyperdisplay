@@ -544,11 +544,6 @@ extension AppModel: HostSessionListener {
                                                              keyframe: keyframe, payload: payload)
 
         case .displays(let list):
-            guard !list.isEmpty else {
-                // Host 尚在建虚拟屏：保持等待提示，不误判成保存的 Host 过期
-                waitingText = linkUp ? "Mac 正在建立虚拟屏…" : "等待 Mac 主机…"
-                return
-            }
             handleDisplays(list)
 
         case .cursor(let displayId, let x, let y):
@@ -583,6 +578,13 @@ extension AppModel: HostSessionListener {
     /// 订阅集不变时绝不重复 selectDisplay/requestKeyframe——host 会为每次订阅变更
     /// 重推 DISPLAYS+WELCOME，无条件的重订阅会形成 kHz 级正反馈风暴。
     private func handleDisplays(_ list: [DisplayInfo]) {
+        guard !list.isEmpty else {
+            // Host 在跑但没有任何屏：明确提示"Mac 服务未启动/未建屏"，
+            // 不给"等待/正在建立"的模糊态（用户无法区分服务没开还是正在建）
+            waitingText = "Mac 服务未启动 —— 请在 Mac 菜单栏打开 Hyperdisplay"
+            statusText = "Mac 在线但未创建虚拟屏"
+            return
+        }
         let wanted = max(LayoutGeometry.requestedSpecs(config: layoutConfig,
                                                        screenW: Self.screenPixels().width,
                                                        screenH: Self.screenPixels().height).count, 1)
