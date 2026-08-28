@@ -438,10 +438,15 @@ final class AppModel: ObservableObject {
 
     /// 视频可视区的完整物理像素：全宽 ×（全高 − 刘海行）。
     /// 虚拟屏按这个比例建 → aspect-fit 恰好铺满可视区，四周零黑边。
+    /// 宽高向下取整到 16 的倍数：host 建 CGVirtualDisplay 前按 16px 对齐，
+    /// 请求值先对齐可消除对齐取整带来的比例漂移（漂移=可见黑边）。
     static func videoRegionPixels() -> ScreenPixels {
         let px = screenPixels()
         let inset = Int(videoTopInsetPt * screenScale())
-        return ScreenPixels(width: px.width, height: max(240, px.height - inset))
+        let h = max(240, px.height - inset)
+        let alignedW = px.width & ~15
+        let alignedH = h & ~15
+        return ScreenPixels(width: alignedW, height: alignedH)
     }
 
     private func parseEndpoint(_ text: String) -> (String, UInt16)? {
