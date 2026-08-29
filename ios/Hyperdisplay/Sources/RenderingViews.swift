@@ -88,7 +88,25 @@ final class CursorOverlayView: UIView {
 
     func setStreamSize(w: Int, h: Int) {
         streamSize = CGSize(width: w, height: h)
+        recomputeCursorScale()
         layoutStreamMapping()
+    }
+
+    /// 本机原生档的流尺寸（AppModel.videoRegionPixels）：光标物理大小的基准。
+    /// macOS 在低分辨率虚拟屏上会把光标位图按比例放大（720 宽的特大档约 ×1.63），
+    /// 若 1:1 直显，档位越低光标越大。任何档位下都按 streamSize/原生档 反向
+    /// 补偿，保持用户在原生档认可的物理大小。
+    private var nativeStreamWidth: CGFloat = 0
+    private var cursorScaleFactor: CGFloat = 1
+
+    func setNativeStreamSize(w: Int, h: Int) {
+        nativeStreamWidth = CGFloat(max(1, w))
+        recomputeCursorScale()
+    }
+
+    private func recomputeCursorScale() {
+        guard streamSize.width > 0, nativeStreamWidth > 0 else { return }
+        cursorScaleFactor = min(2.0, max(0.4, streamSize.width / nativeStreamWidth))
     }
 
     private func layoutStreamMapping() {
@@ -222,13 +240,6 @@ final class CursorOverlayView: UIView {
 
     // MARK: 绘制
 
-    /**
-     * 光标位图绘制倍率：手机端视频≈1:1 映射物理像素，×1 即 macOS 光标在该屏的
-     * 自然比例（安卓平板是 ×2——高分大画布上 1:1 会过小，两端观感需求不同）。
-     * 热点偏移与绘制同倍率（applyPosition）。
-     */
-    private static let systemCursorScale: CGFloat = 1
-
     /// Android ARGB_8888 little-endian 内存顺序正是 BGRA，故零转换解释 macOS 系统光标像素
     func setSystemCursorBitmap(width w: Int, height h: Int, hotX hx: Int, hotY hy: Int, bgra: Data) {
         guard (1...256).contains(w), (1...256).contains(h), bgra.count == w * h * 4 else { return }
@@ -244,13 +255,12 @@ final class CursorOverlayView: UIView {
         layer.sublayers?.removeAll()
         let imageLayer = CALayer()
         imageLayer.contents = cgImage
-        // 自然大小：手机端视频≈1:1 映射物理像素，位图即视频像素尺寸，×1 直接
-        // 对应 macOS 光标在该屏上的真实比例。安卓平板用 ×2（systemCursorScale=2）
-        // 是因为其高分画布远大于光标位图；手机上照搬 ×2 实测观感偏大（2026-08-29
-        // 用户反馈"为什么把光标放大了"）。
+        // 物理大小 = 位图像素 × cursorScaleFactor（原生档=1 即自然大小；低分辨率档
+        // macOS 会放大光标位图，反向补偿保持恒定观感——见 recomputeCursorScale）。
+        // 安卓平板用 ×2（其高分大画布上 1:1 过小）；手机原生档 1:1 即 macOS 比例。
         let density = UIScreen.main.scale
-        let logicalW = CGFloat(w) * Self.systemCursorScale / density
-        let logicalH = CGFloat(h) * Self.systemCursorScale / density
+        let logicalW = CGFloat(w) * cursorScaleFactor / density
+        let logicalH = CGFloat(h) * cursorScaleFactor / density
         imageLayer.bounds = CGRect(x: 0, y: 0, width: logicalW, height: logicalH)
         imageLayer.anchorPoint = CGPoint(x: 0, y: 0)
         imageLayer.masksToBounds = false
@@ -349,9 +359,9 @@ final class CursorOverlayView: UIView {
         CATransaction.setDisableActions(true) // 位置自己插值，免 CA 双重动画
         switch mode {
         case .bitmap(let l, let hotX, let hotY):
-            // 位图按 2/密度 倍绘制（对齐安卓物理观感），热点偏移必须同一比例：
-            // 2x 屏等价旧值 hotX；3x 屏（iPhone Pro）旧值偏小 1/3，尖端对不准
-            let scale = Self.systemCursorScale / UIScreen.main.scale
+            // 位图按 cursorScaleFactor 倍绘制（含档位补偿），热点偏移同倍率：
+            // 原生档等价旧值 hotX；低分辨率档（特大）不补偿会偏大 1.63 倍
+            let scale = cursorScaleFactor / UIScreen.main.scale
             l.position = CGPoint(x: cx - CGFloat(hotX) * scale,
                                  y: cy - CGFloat(hotY) * scale)
         case .arrow(let shadow, let fill, let stroke):
