@@ -33,6 +33,8 @@ import Foundation
 
 enum PacketType: UInt8 {
     case welcome = 0x01, videoFrag = 0x02, config = 0x03, inputAck = 0x05, pong = 0x06, displays = 0x07, cursor = 0x08, cursorImage = 0x09, savedLayout = 0x0A, displayModeStatus = 0x0B
+    /// 会话期无线保活空包：客户端 parse default 返回 nil 直接丢弃，无状态副作用
+    case linkKeepalive = 0x0C
     case hello = 0x10, keyframeReq = 0x11, input = 0x12, ping = 0x13
     case selectDisplay = 0x14, createDisplay = 0x15, destroyDisplay = 0x16, nack = 0x17, subscribeDisplays = 0x18
     case cursorImageAck = 0x19, bye = 0x1A, encoderReset = 0x1B, setTier = 0x1C, layoutRestoreAck = 0x1D, displayModeStatusAck = 0x1E
@@ -140,6 +142,8 @@ enum Wire {
     // MARK: host→client
 
     /// 预留字段，纯显示产品始终为 false；保留以兼容旧客户端协议。
+    static func linkKeepalive() -> Data { Data(header(.linkKeepalive, seq: 0)) }
+
     static func welcome(codec: UInt8, displayId: UInt16, width: Int, height: Int, fps: Int, controlEnabled: Bool = true) -> Data {
         var d = Data(header(.welcome, seq: 0))
         d.appendLE(displayId)

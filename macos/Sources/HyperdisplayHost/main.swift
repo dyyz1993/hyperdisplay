@@ -912,6 +912,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
         // 快速移动时不会出现明显的「台阶感」。静止时 lastCursorKey 会抑制发送。
         let cursorTimer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             self?.pushCursorPosition()
+            self?.sendLinkKeepalive()
         }
         RunLoop.main.add(cursorTimer, forMode: .common)
 
@@ -2279,6 +2280,21 @@ final class HostApp: NSObject, NSApplicationDelegate {
     /// 读取系统光标位置是只读操作，不触发辅助功能权限。CGEvent.location 与
     /// CGDisplayBounds 在同一套全局桌面坐标中；SCK 输出也沿用该显示方向，
     /// 不能再翻转 Y（旧实现已在真机验证过）。
+    /// 会话期无线保活（2026-08-29 省电 WiFi 实测对策）：iPhone 省电模式下无线电
+    /// 间歇睡眠，视频静止期的寂静让睡眠加深，突发帧撞上睡眠窗即丢片（IDR 风暴的
+    /// 物理根源）。会话中 60Hz 发一个 5 字节空包（~300B/s，带宽九牛一毛），
+    /// 手机无线电保持接收唤醒。无订阅者不发（§7 闲时近零成本）；客户端对 0x0C
+    /// parse 返回 nil 直接丢弃，两端无状态副作用。
+    private func sendLinkKeepalive() {
+        guard let udp else { return }
+        clientsLock.lock()
+        let targets = clients.values.filter { !$0.displayIds.isEmpty }.map { $0.addr }
+        clientsLock.unlock()
+        guard !targets.isEmpty else { return }
+        let packet = Wire.linkKeepalive()
+        for var addr in targets { udp.send(to: &addr, packet) }
+    }
+
     private func pushCursorPosition() {
         guard let udp else { return }
         clientsLock.lock()
