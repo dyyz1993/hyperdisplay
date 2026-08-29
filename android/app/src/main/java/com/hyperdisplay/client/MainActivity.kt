@@ -1104,7 +1104,13 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
         override fun onVideoFragment(displayId: Int, frameId: Int, fragIdx: Int, fragCount: Int,
                                      keyframe: Boolean, payload: ByteArray) {
-            pipelineOf(displayId).assembler?.onFragment(frameId, fragIdx, fragCount, keyframe, payload)
+            // fragIdx ≥ fragCount = FEC 校验片（组号 = idx - count）
+            val asm = pipelineOf(displayId).assembler ?: return
+            if (fragIdx >= fragCount) {
+                asm.onParityFragment(frameId, fragIdx - fragCount, payload)
+            } else {
+                asm.onFragment(frameId, fragIdx, fragCount, keyframe, payload)
+            }
         }
 
         override fun onDisplays(list: List<HostSession.DisplayInfo>) {

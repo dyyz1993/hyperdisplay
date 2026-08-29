@@ -32,6 +32,19 @@ class FrameAssembler(
     private var lastCongestionReportAt = 0L
     private val lock = Object()
 
+    // FEC 校验片（2026-08-29，与 host Protocol.fecGroupSize 严格一致）：每 4 个
+    // 数据分片一组 XOR 校验，host 以组间轮转交织发送——相邻突发丢包每组最多
+    // 丢 1 片，全部可就地恢复，帧不再因单片丢失整帧报废（省电 WiFi 实测：
+    // 满码率 10M 持续、丢帧事件归零）。校验 payload = [XOR(补零到组内最长)]
+    // [u8 成员数][u16 真实长度 × N]，恢复后按真实长度截断（零填充留在流中间
+    // 会破坏跨分片 NAL 边界）。
+    private class ParityInfo(val xor: ByteArray, val lengths: IntArray)
+    private var parityFragments = HashMap<Int, ParityInfo>()
+
+    companion object {
+        const val FEC_GROUP_SIZE = 4
+    }
+
     fun onFragment(frameId: Int, fragIdx: Int, fragCount: Int, keyframe: Boolean, payload: ByteArray) {
         synchronized(lock) {
             val now = System.currentTimeMillis()
@@ -70,6 +83,7 @@ class FrameAssembler(
                 currentKeyframe = keyframe
                 deliveredCurrent = false
                 fragments = arrayOfNulls(fragCount)
+                parityFragments.clear()
             }
 
             if (fragIdx >= fragments.size) return
@@ -77,30 +91,87 @@ class FrameAssembler(
             if (fragments[fragIdx] == null) fragments[fragIdx] = payload
 
             if (isComplete()) {
-                val total = fragments.sumOf { it!!.size }
-                val out = ByteArray(total)
-                var offset = 0
-                for (frag in fragments) {
-                    System.arraycopy(frag!!, 0, out, offset, frag.size)
-                    offset += frag.size
-                }
-                fragments = arrayOfNulls(0)
-                deliveredCurrent = true
-                lastDeliveredFrameId = frameId
-                if (waitingForKeyframe) {
-                    if (!keyframe) {
-                        onAbandoned()
-                        return // 会话最初：解码器还没有任何参考帧，必须等 IDR
-                    }
-                    everGotKeyframe = true
-                    waitingForKeyframe = false
-                }
-                if (keyframe) {
-                    waitingForKeyframe = false
-                }
-                callback.onFrame(frameId, keyframe, out)
+                finishCompleteLocked(keyframe)
             }
         }
+    }
+
+    /** FEC 校验片入口（fragIdx ≥ fragCount 的分片由 MainActivity 分流到此） */
+    fun onParityFragment(frameId: Int, group: Int, payload: ByteArray) {
+        synchronized(lock) {
+            // 校验片紧随同帧数据片（同一 FIFO 顺序），帧未切换且未投递才有意义
+            if (frameId != currentFrameId || deliveredCurrent || fragments.isEmpty()) return
+            if (!parityFragments.containsKey(group)) {
+                val start = group * FEC_GROUP_SIZE
+                val memberCount = minOf(FEC_GROUP_SIZE, fragments.size - start)
+                if (memberCount <= 0 || payload.size <= 2 * memberCount + 1) return
+                val xorEnd = payload.size - 2 * memberCount - 1
+                if ((payload[xorEnd].toInt() and 0xFF) != memberCount) return
+                val xor = payload.copyOfRange(0, xorEnd)
+                val lengths = IntArray(memberCount)
+                for (k in 0 until memberCount) {
+                    lengths[k] = (payload[xorEnd + 1 + 2 * k].toInt() and 0xFF) or
+                        ((payload[xorEnd + 2 + 2 * k].toInt() and 0xFF) shl 8)
+                }
+                parityFragments[group] = ParityInfo(xor, lengths)
+            }
+            if (!isComplete()) recoverFromParity()
+            if (isComplete()) finishCompleteLocked(currentKeyframe)
+        }
+    }
+
+    /** 组内恰好丢 1 片且校验片在场 → XOR 就地恢复 */
+    private fun recoverFromParity() {
+        if (parityFragments.isEmpty()) return
+        val missing = fragments.indices.filter { fragments[it] == null }
+        for (m in missing) {
+            val g = m / FEC_GROUP_SIZE
+            val p = parityFragments[g] ?: continue
+            val start = g * FEC_GROUP_SIZE
+            val end = minOf(start + FEC_GROUP_SIZE, fragments.size)
+            var missingCount = 0
+            for (i in start until end) if (fragments[i] == null) missingCount++
+            if (missingCount != 1) continue // XOR 一组只能救一片
+            val acc = p.xor.copyOf()
+            for (i in start until end) {
+                if (i == m) continue
+                val d = fragments[i] ?: continue
+                for (j in d.indices) if (j < acc.size) {
+                    acc[j] = (acc[j].toInt() xor d[j].toInt()).toByte()
+                }
+            }
+            val memberIndex = m - start
+            if (memberIndex >= p.lengths.size) continue
+            val len = minOf(p.lengths[memberIndex], acc.size)
+            fragments[m] = acc.copyOf(len)
+        }
+    }
+
+    /** 帧已集齐（含校验恢复后）：拼接投递，处理会话最初的 IDR 门控 */
+    private fun finishCompleteLocked(keyframe: Boolean) {
+        val total = fragments.sumOf { it!!.size }
+        val out = ByteArray(total)
+        var offset = 0
+        for (frag in fragments) {
+            System.arraycopy(frag!!, 0, out, offset, frag.size)
+            offset += frag.size
+        }
+        fragments = arrayOfNulls(0)
+        parityFragments.clear()
+        deliveredCurrent = true
+        lastDeliveredFrameId = currentFrameId
+        if (waitingForKeyframe) {
+            if (!keyframe) {
+                onAbandoned()
+                return // 会话最初：解码器还没有任何参考帧，必须等 IDR
+            }
+            everGotKeyframe = true
+            waitingForKeyframe = false
+        }
+        if (keyframe) {
+            waitingForKeyframe = false
+        }
+        callback.onFrame(currentFrameId, keyframe, out)
     }
 
     /** 由外部周期调用（≥100ms 一次）：分片停滞检测 */
@@ -126,6 +197,7 @@ class FrameAssembler(
                 }
                 currentFrameId = -1
                 fragments = arrayOfNulls(0)
+                parityFragments.clear()
                 if (!everGotKeyframe) waitingForKeyframe = true
                 requestKeyframeRateLimited("stall ${idle}ms", System.currentTimeMillis())
             }
@@ -138,6 +210,7 @@ class FrameAssembler(
             lastDeliveredFrameId = -1
             currentFrameId = -1
             fragments = arrayOfNulls(0)
+            parityFragments.clear()
             waitingForKeyframe = true
             everGotKeyframe = false
         }

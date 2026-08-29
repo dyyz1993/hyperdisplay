@@ -446,7 +446,9 @@ class HostSession private constructor(
                         val fragCount = bb.getShort(9).toInt() and 0xFFFF
                         val flags = buf[11].toInt() and 0xFF
                         val payloadStart = 12
-                        if (len > payloadStart && fragIdx < fragCount && fragCount < 4096) {
+                        // fragIdx ≥ fragCount = FEC 校验片（组号 = idx - count）。
+                        // 曾在此 `fragIdx < fragCount` 一刀切丢弃校验片（与 iOS 同源坑）。
+                        if (len > payloadStart && fragCount < 4096 && fragIdx < fragCount + 512) {
                             listener.onVideoFragment(displayId, frameId, fragIdx, fragCount, flags and 1 == 1,
                                 buf.copyOfRange(payloadStart, len))
                         }
