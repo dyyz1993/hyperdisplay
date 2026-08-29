@@ -624,7 +624,11 @@ final class DisplayStream {
         // 时间充裕、低码率 IDR 依旧清晰（与 refineIfSettled 同一论据），分片数
         // 减半以上即可完整送达、断开风暴；IDR 编出后恢复原码率（onFrame）。
         // 标志位 encoder 线程读、主线程写，竞争最坏情形是多一次幂等 applyBitrate。
-        if Date().timeIntervalSince(lastCongestionAt) < 6.0, currentBitrate > 1_500_000 {
+        // ⚠️ 窗口必须远大于 AIMD 的 6s（实测漏洞）：风暴间隙 adaptQuality 回升到
+        // 4Mbps、拥塞史超 6s 后，静止锐化又用满码率编出 150KB IDR → 丢片 → 新
+        // 拥塞 → 循环重启。30s 内有过整帧拥塞的链路，锐化/恢复 IDR 一律瘦身；
+        // 干净链路（平板/USB）30s 无拥塞，满码率锐化不受影响。
+        if Date().timeIntervalSince(lastCongestionAt) < 30.0, currentBitrate > 1_500_000 {
             encoder?.applyBitrate(1_500_000)
             recoveryIdrSlimActive = true
         }
