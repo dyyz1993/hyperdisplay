@@ -700,6 +700,21 @@ final class DisplayStream {
                 guard self.lastContentFrameAt == sourceFrameAt else { return }
                 self.lastContentFrameAt = nil
             }
+            // 二段满画质升级（§7.5 画质优先）：省电 WiFi 上 30s 拥塞史窗口几乎常开，
+            // 瘦身（1.5M）锐化 IDR 会让静止画面永远停在低画质档——偏离“画质优先”。
+            // 锐化 IDR 送达后若链路安静（3.5s 无新整帧拥塞、内容仍静止），用满预算
+            // （targetBitrate）重编码一张替换；期间再拥塞则保持瘦身版（保送达）。
+            // onFrame 的 recoveryIdrSlimActive 恢复路径会把它收回 currentBitrate。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
+                guard let self, self.started else { return }
+                let still = self.lastContentFrameAt == nil || self.lastContentFrameAt == sourceFrameAt
+                guard still, Date().timeIntervalSince(self.lastCongestionAt) >= 3.5 else { return }
+                NSLog("[hyperdisplay] refinement upgrade to full bitrate \(self.targetBitrate/1000)k display \(self.display.displayID)")
+                self.encoder?.applyBitrate(self.targetBitrate)
+                self.recoveryIdrSlimActive = true
+                self.encoder?.requestKeyframe()
+                self.capture?.replayLastFrame()
+            }
         }
     }
 
