@@ -10,30 +10,44 @@ private let diag = Logger(subsystem: "com.hyperdisplay.session", category: "pipe
 /// - CONFIG 参数集 → CMVideoFormatDescription（VTS 需要，MediaCodec 用 csd-0 的对应物）；
 /// - 完整帧先进 FIFO（容量 4），满时拒绝并要求上层等 IDR——已编码依赖帧绝不越过缺口；
 /// - WELCOME 是格式边界：拓扑/分辨率切换后清空旧 CSD 等新 CONFIG，不以旧参数集抢跑。
+///
+/// 线程模型（2026-08-29 流畅度重构）：全部状态变更走 `stateQueue` 串行队列——
+/// 分片组装/整帧拼接曾压在主线程上，是"整体卡顿不如安卓丝滑"的主因（安卓在
+/// 收包线程组装、解码线程直写 Surface，主线程零参与）。解码输出在 VT 回调线程
+/// 直接 enqueue（AVSampleBufferDisplayLayer.enqueue 允许任意线程），上屏节奏与
+/// 主线程负载彻底解耦；仅 begin/首帧回调这类 UI 动作回主线程。
 final class VideoPipeline {
 
     struct Callbacks {
+        /// 可能在视频线程被调（已限频，频率低）：实现方自行保证线程安全
         var requestKeyframe: (UInt32) -> Void
         var sendNack: (UInt32, UInt32, [UInt16]) -> Void
-        /// 首帧真正上屏（等待画面消失的信号）
+        /// 首帧真正上屏（等待画面消失的信号）；保证主线程回调
         var firstFrameRendered: () -> Void
     }
 
     let displayId: UInt32
     private let callbacks: Callbacks
 
-    // 协商状态（主线程读写）
-    private(set) var codec: UInt8 = 0
-    private(set) var width = 0
-    private(set) var height = 0
-    var fps = 30
-    private(set) var csd: Data?
-    private(set) var engine: DecoderEngine?
-    weak var surfaceView: VideoLayerView? {
-        didSet { tryStartDecoder() }
-    }
-    private(set) var framesRendered = 0
-    private var firstFrameSeen = false
+    /// 状态串行队列：分片/CONFIG/WELCOME/重置的唯一入口，替代旧的"全在 MainActor"
+    private let stateQueue = DispatchQueue(label: "hyperdisplay.pipeline", qos: .userInteractive)
+    private let statsLock = NSLock()
+    private var widthBacking = 0
+    private var heightBacking = 0
+    private var renderedBacking = 0
+
+    /// 供统计/拓扑确认读取（跨线程快照）
+    var width: Int { statsLock.lock(); defer { statsLock.unlock() }; return widthBacking }
+    var height: Int { statsLock.lock(); defer { statsLock.unlock() }; return heightBacking }
+    var framesRendered: Int { statsLock.lock(); defer { statsLock.unlock() }; return renderedBacking }
+
+    // 协商状态（stateQueue 读写）
+    private var codec: UInt8 = 0
+    private var fps = 30
+    private var csd: Data?
+    private var engine: DecoderEngine?
+    private var surfaceViewRef: VideoLayerView?
+    private var firstFrameAnnounced = false
 
     lazy private(set) var assembler = FrameAssembler(callbacks: .init(
         onFrame: { [weak self] frameId, keyframe, data in self?.submitToDecoder(frameId, keyframe, data) },
@@ -52,66 +66,54 @@ final class VideoPipeline {
         self.callbacks = callbacks
     }
 
-    // MARK: - 会话回调
+    // MARK: - 会话回调（薄封装：全部 funnel 进 stateQueue）
 
     func handleWelcome(codec newCodec: UInt8, width w: Int, height h: Int, fps f: Int) {
-        let formatChanged = width != w || height != h || codec != newCodec
-        if formatChanged {
-            releaseDecoder()
-            csd = nil
-            framesRendered = 0
-            assembler.reset()
-            let id = displayId
-            diag.log("vp[\(id)]: format changed -> \(w)x\(h) codec=\(newCodec)")
-        }
-        codec = newCodec
-        width = w
-        height = h
-        fps = max(1, min(f, 144))
-        if formatChanged { callbacks.requestKeyframe(displayId) }
+        stateQueue.async { self.handleWelcomeOnQueue(codec: newCodec, width: w, height: h, fps: f) }
     }
 
     func handleConfig(_ paramSets: Data) {
-        // csd 完整性防御：CONFIG 走不可靠通道，坏参数集会毁掉之后所有解码器重建
-        guard paramSets.count >= 20,
-              paramSets[paramSets.startIndex] == 0x00,
-              paramSets[paramSets.startIndex + 1] == 0x00,
-              paramSets[paramSets.startIndex + 2] == 0x00,
-              paramSets[paramSets.startIndex + 3] == 0x01 else {
-            let id = displayId
-            diag.log("vp[\(id)]: drop malformed csd len=\(paramSets.count)")
-            return
-        }
-        let old = csd
-        if old != nil && engine != nil && old != paramSets {
-            releaseDecoder()
-            csd = paramSets
-            tryStartDecoder()
-            return
-        }
-        csd = paramSets
-        tryStartDecoder()
+        stateQueue.async { self.handleConfigOnQueue(paramSets) }
     }
 
     func handleFragment(frameId: Int64, fragIdx: Int, fragCount: Int, keyframe: Bool, payload: Data) {
-        assembler.onFragment(frameId: frameId, fragIdx: fragIdx, fragCount: fragCount,
-                             keyframe: keyframe, payload: payload)
+        stateQueue.async {
+            self.assembler.onFragment(frameId: frameId, fragIdx: fragIdx, fragCount: fragCount,
+                                      keyframe: keyframe, payload: payload)
+        }
+    }
+
+    /// 停滞检测（stallTick 每 200ms 驱动）
+    func heartbeat() {
+        stateQueue.async { self.assembler.stallCheck() }
     }
 
     func resetForLinkDown() {
-        releaseDecoder()
-        csd = nil
-        framesRendered = 0
-        firstFrameSeen = false
-        assembler.reset()
+        stateQueue.async {
+            self.releaseDecoderOnQueue()
+            self.csd = nil
+            self.setRendered(0)
+            self.firstFrameAnnounced = false
+            self.assembler.reset()
+        }
     }
 
     func teardown() {
-        releaseDecoder()
-        surfaceView = nil
+        stateQueue.async {
+            self.releaseDecoderOnQueue()
+            self.surfaceViewRef = nil
+        }
     }
 
-    // MARK: - 解码器
+    /// SwiftUI 挂载/换视图时调用（主线程）；图层配置回主线程执行
+    func attachSurface(_ view: VideoLayerView?) {
+        stateQueue.async {
+            self.surfaceViewRef = view
+            self.tryStartDecoderOnQueue()
+        }
+    }
+
+    // MARK: - 解码器（stateQueue 上下文）
 
     private func submitToDecoder(_ frameId: Int64, _ keyframe: Bool, _ data: Data) {
         guard let engine else { return } // CONFIG 未到：帧丢弃，assembler 自会请求 IDR
@@ -122,17 +124,55 @@ final class VideoPipeline {
         }
     }
 
-    private func tryStartDecoder() {
-        guard engine == nil else { return }
-        let hasSurface = surfaceView != nil
-        let curW = width
-        let curH = height
-        guard let csd else {
-            diag.log("vp[\(self.displayId)]: decoder wait csd surface=\(hasSurface) w=\(curW)")
+    private func handleWelcomeOnQueue(codec newCodec: UInt8, width w: Int, height h: Int, fps f: Int) {
+        let formatChanged = width != w || height != h || codec != newCodec
+        if formatChanged {
+            releaseDecoderOnQueue()
+            csd = nil
+            setRendered(0)
+            assembler.reset()
+            diag.log("vp[\(self.displayId)]: format changed -> \(w)x\(h) codec=\(newCodec)")
+        }
+        codec = newCodec
+        statsLock.lock()
+        widthBacking = w
+        heightBacking = h
+        statsLock.unlock()
+        fps = max(1, min(f, 144))
+        if formatChanged { callbacks.requestKeyframe(displayId) }
+    }
+
+    private func handleConfigOnQueue(_ paramSets: Data) {
+        // csd 完整性防御：CONFIG 走不可靠通道，坏参数集会毁掉之后所有解码器重建
+        guard paramSets.count >= 20,
+              paramSets[paramSets.startIndex] == 0x00,
+              paramSets[paramSets.startIndex + 1] == 0x00,
+              paramSets[paramSets.startIndex + 2] == 0x00,
+              paramSets[paramSets.startIndex + 3] == 0x01 else {
+            diag.log("vp[\(self.displayId)]: drop malformed csd len=\(paramSets.count)")
             return
         }
-        guard curW > 0, curH > 0, hasSurface else {
-            diag.log("vp[\(self.displayId)]: decoder wait surface=\(hasSurface) w=\(curW) h=\(curH)")
+        let old = csd
+        if old != nil && engine != nil && old != paramSets {
+            releaseDecoderOnQueue()
+            csd = paramSets
+            tryStartDecoderOnQueue()
+            return
+        }
+        csd = paramSets
+        tryStartDecoderOnQueue()
+    }
+
+    private func tryStartDecoderOnQueue() {
+        guard engine == nil else { return }
+        let hasSurface = surfaceViewRef != nil
+        guard let csd else {
+            diag.log("vp[\(self.displayId)]: decoder wait csd surface=\(hasSurface)")
+            return
+        }
+        let w = width, h = height
+        guard w > 0, h > 0, hasSurface else {
+            diag.log("vp[\(self.displayId)]: decoder wait surface=\(hasSurface) w=\(w) h=\(h)")
             return
         }
         // 按 host 实际使用的编码选解码器——硬编 HEVC 会话耗尽回退 H.264 时，
@@ -140,34 +180,46 @@ final class VideoPipeline {
         let kind: DecoderEngine.CodecKind = (codec == 2) ? .h264 : .hevc
         do {
             let eng = try DecoderEngine(kind: kind, fps: fps, csd: csd)
-            eng.outputHandler = { [weak self, weak view = surfaceView] sample in
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    if self.framesRendered == 0 {
-                        diag.log("vp[\(self.displayId)]: FIRST FRAME DECODED")
-                    }
-                    self.framesRendered += 1
-                    if !self.firstFrameSeen {
-                        self.firstFrameSeen = true
-                        self.callbacks.firstFrameRendered()
-                    }
-                    view?.enqueue(sample)
+            eng.outputHandler = { [weak self, weak view = surfaceViewRef] sample in
+                guard let self else { return }
+                let rendered = self.incrementRendered()
+                if rendered == 1 && !self.firstFrameAnnounced {
+                    self.firstFrameAnnounced = true
+                    diag.log("vp[\(self.displayId)]: FIRST FRAME DECODED")
+                    DispatchQueue.main.async { self.callbacks.firstFrameRendered() }
                 }
+                // enqueue 允许任意线程（AVSampleBufferDisplayLayer 文档语义）：
+                // 直接在 VT 输出回调上屏，上屏节奏与主线程负载解耦
+                view?.enqueue(sample)
             }
             engine = eng
-            surfaceView?.begin(formatDescription: eng.formatDescription)
-            let id = self.displayId
-            let dim = "\(self.width)x\(self.height)"
-            diag.log("vp[\(id)]: decoder started \(dim)")
+            if let view = surfaceViewRef {
+                let format = eng.formatDescription
+                DispatchQueue.main.async { view.begin(formatDescription: format) }
+            }
+            diag.log("vp[\(self.displayId)]: decoder started \(w)x\(h)")
         } catch {
-            let id = self.displayId
-            diag.log("vp[\(id)]: decoder start failed \(String(describing: error))")
+            diag.log("vp[\(self.displayId)]: decoder start failed \(String(describing: error))")
         }
     }
 
-    private func releaseDecoder() {
+    private func releaseDecoderOnQueue() {
         engine?.invalidate()
         engine = nil
+    }
+
+    private func incrementRendered() -> Int {
+        statsLock.lock()
+        renderedBacking += 1
+        let value = renderedBacking
+        statsLock.unlock()
+        return value
+    }
+
+    private func setRendered(_ value: Int) {
+        statsLock.lock()
+        renderedBacking = value
+        statsLock.unlock()
     }
 }
 

@@ -10,8 +10,15 @@ import os.log
 /// 诊断：Console.app 过滤 subsystem = com.hyperdisplay.session（临时仪表，稳定后移除）。
 private let diag = Logger(subsystem: "com.hyperdisplay.session", category: "session")
 protocol HostSessionListener: AnyObject {
-    /// 各类 host→client 报文统一回调（已在主线程）
+    /// 各类 host→client 控制报文统一回调（已在主线程）
     func hostSession(_ session: HostSession, didReceive packet: HostPacket)
+    /// 视频分片：sessionQueue 上同步回调，绝不经主线程。安卓在收包线程就地组装；
+    /// iOS 旧路径每个分片 DispatchQueue.main.async + Task{@MainActor} 两跳，
+    /// 60fps×多分片把主 actor 挤成帧节奏抖动（2026-08-29 流畅度重构的核心修复）。
+    func hostSession(_ session: HostSession, didReceiveVideoFragment displayId: UInt32,
+                     frameId: Int64, fragIdx: Int, fragCount: Int, keyframe: Bool, payload: Data)
+    /// 光标位置：60Hz 高频，主线程单跳直达 overlay（不再为它新建 Task 二跳）
+    func hostSession(_ session: HostSession, didReceiveCursor displayId: UInt32, x: Float, y: Float)
     /// 链路状态变化（已在主线程）。false 时应重置解码器并回到等待画面。
     func hostSession(_ session: HostSession, linkChangedUp up: Bool)
     /// 连续 unknown PONG：保存的地址/配对码可能已指向旧 Host，会话无法自愈。
@@ -184,20 +191,20 @@ final class HostSession {
     }
 
     private func sendHelloLocked() {
-        // 临时：layout 传 nil（省略布局段+D2 扩展）。实测带布局段的 HELLO 会让当前
-        // host 拓扑进入高频推送循环（见 Protocol.swift hello 注释）；specs 正常携带，
-        // 多屏订阅不受影响。host 侧修复后恢复 config.layout。
+        // 2026-08-29 恢复 layout 段：当初省略它是因为带布局段触发 host 拓扑高频
+        // 推送循环（05b49a2），后查实根因是 host 恢复死锁，已在 cacce55 修复。
+        // 不带 layout 的代价更大：host 把 iOS 当严格 2x 客户端（retina ?? true），
+        // 建屏失败/删屏循环且模式状态 transaction=0 被两端吞掉，客户端无法自愈。
         let hello = ClientWire.hello(clientWidth: config.clientWidth, clientHeight: config.clientHeight,
                                      code: config.pairingCode, deviceId: config.deviceId,
                                      fingerprint: config.fingerprint,
                                      deviceName: config.deviceName,
-                                     specs: config.specs, layout: nil)
+                                     specs: config.specs, layout: config.layout)
         sendLocked(hello)
     }
 
     /// 布局/尺寸变更不断开 UDP 会话：更新 HELLO 档案并重发，host 保留旧解码
     /// Surface 到新屏首帧（对照 HostSession.updateDisplayTopology）。
-    /// layout 暂被忽略（见 sendHelloLocked 注释），保留参数以备恢复。
     func updateDisplayTopology(specs: [RequestedDisplaySpec], layout: LayoutWire) {
         sessionQueue.async { [self] in
             config.specs = Array(specs.prefix(4))
@@ -314,6 +321,18 @@ final class HostSession {
     private func dispatchPacket(_ data: Data) {
         guard let packet = HostWire.parse(data) else { return }
         switch packet {
+        case .videoFragment(let displayId, let frameId, let fragIdx, let fragCount,
+                            let keyframe, let payload):
+            // 分片是全协议最高频负载：sessionQueue 就地交给监听者（其内部进视频队列），
+            // 与主线程彻底解耦
+            listener?.hostSession(self, didReceiveVideoFragment: UInt32(displayId),
+                                  frameId: Int64(frameId), fragIdx: Int(fragIdx),
+                                  fragCount: Int(fragCount), keyframe: keyframe, payload: payload)
+
+        case .cursor(let displayId, let x, let y):
+            // 60Hz：单跳主线程，不再经过通用回调的 Task{@MainActor} 二跳
+            notifyOnMain { $0.hostSession(self, didReceiveCursor: UInt32(displayId), x: x, y: y) }
+
         case .displays:
             receivedDisplaysForSession = true
             notifyWithPacket(packet)

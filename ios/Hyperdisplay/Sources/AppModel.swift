@@ -78,7 +78,38 @@ final class AppModel: ObservableObject {
     // MARK: 内部状态
 
     private var session: HostSession?
-    private var pipelines: [UInt32: VideoPipeline] = [:]
+    /// 管线注册表：视频分片在视频线程按 displayId 直查（AppModel 是 @MainActor，
+    /// 普通字典跨线程裸访问是数据竞争）
+    private final class PipelineRegistry: @unchecked Sendable {
+        private let lock = NSLock()
+        private var map: [UInt32: VideoPipeline] = [:]
+        func pipeline(_ id: UInt32) -> VideoPipeline? {
+            lock.lock(); defer { lock.unlock() }
+            return map[id]
+        }
+        func upsert(_ p: VideoPipeline) {
+            lock.lock(); defer { lock.unlock() }
+            map[p.displayId] = p
+        }
+        var all: [VideoPipeline] {
+            lock.lock(); defer { lock.unlock() }
+            return Array(map.values)
+        }
+        /// 只保留 ids，返回被移除的管线（调用方负责 teardown）
+        func keepOnly(_ ids: Set<UInt32>) -> [VideoPipeline] {
+            lock.lock(); defer { lock.unlock() }
+            let removed = map.values.filter { !ids.contains($0.displayId) }
+            map = map.filter { ids.contains($0.key) }
+            return removed
+        }
+        func removeAll() -> [VideoPipeline] {
+            lock.lock(); defer { lock.unlock() }
+            let removed = Array(map.values)
+            map.removeAll()
+            return removed
+        }
+    }
+    private let registry = PipelineRegistry()
     private let browser = DiscoveryBrowser()
     private var stallTimer: Timer?
     /// 后台被迫断开过 → 回前台无缝重连（host 侧 EDID 档案还原）
@@ -226,8 +257,7 @@ final class AppModel: ObservableObject {
     func disconnect(removeDisplay: Bool) {
         stopStallTimer()
         stopDiscovery()
-        pipelines.values.forEach { $0.teardown() }
-        pipelines.removeAll()
+        registry.removeAll().forEach { $0.teardown() }
         subscribedIds = []
         activeDisplayId = nil
         hasVideo = false
@@ -342,12 +372,12 @@ final class AppModel: ObservableObject {
     }
 
     private func stallTick() {
-        for p in pipelines.values { p.assembler.stallCheck() }
+        for p in registry.all { p.heartbeat() }
         // 布局替换横幅：整组新屏都出过一帧才能收（旧屏仍在播放时不能提前撤）；
         // 但 host 只建出部分屏（或建屏失败）时不能永远挂着——12s 强制收起。
         if topologyTransitionInFlight {
             if !topologyExpectedIds.isEmpty,
-               topologyExpectedIds.allSatisfy({ (pipelines[$0]?.framesRendered ?? 0) > 0 }) {
+               topologyExpectedIds.allSatisfy({ (registry.pipeline($0)?.framesRendered ?? 0) > 0 }) {
                 topologyTransitionInFlight = false
                 topologyExpectedIds = []
                 bannerTitle = nil
@@ -401,7 +431,7 @@ final class AppModel: ObservableObject {
         var parts: [String] = []
         parts.append(linkUp ? "链路OK" : "断")
         parts.append("标\(cursorRate)/s")
-        for p in pipelines.values.sorted(by: { $0.displayId < $1.displayId }) {
+        for p in registry.all.sorted(by: { $0.displayId < $1.displayId }) {
             let previous = lastRenderedSnapshot[p.displayId] ?? p.framesRendered
             let fps = p.framesRendered &- previous
             lastRenderedSnapshot[p.displayId] = p.framesRendered
@@ -418,29 +448,36 @@ final class AppModel: ObservableObject {
     private var lastKeyframeRequestAt: [UInt32: UInt64] = [:]
 
     func pipelineOf(id: UInt32) -> VideoPipeline {
-        if let existing = pipelines[id] { return existing }
+        if let existing = registry.pipeline(id) { return existing }
         let p = VideoPipeline(displayId: id, callbacks: .init(
+            // 回调可能在视频线程触发（已限频 ≤2/s）：回主线程统一处理，实现保持 MainActor 直觉
             requestKeyframe: { [weak self] displayId in
-                guard let self else { return }
-                let now = FrameAssembler.nowMs()
-                if let last = self.lastKeyframeRequestAt[displayId], now &- last < 2_000 { return }
-                self.lastKeyframeRequestAt[displayId] = now
-                self.session?.requestKeyframe(displayId: UInt16(clamping: Int(displayId)))
+                DispatchQueue.main.async { self?.requestKeyframeMain(displayId) }
             },
             sendNack: { [weak self] displayId, frameId, missing in
-                self?.session?.sendNack(displayId: UInt16(clamping: Int(displayId)),
-                                        frameId: frameId, indices: missing)
+                DispatchQueue.main.async {
+                    self?.session?.sendNack(displayId: UInt16(clamping: Int(displayId)),
+                                            frameId: frameId, indices: missing)
+                }
             },
             firstFrameRendered: { [weak self] in
                 self?.hasVideo = true
                 self?.waitingText = nil
             }
         ))
-        pipelines[id] = p
+        registry.upsert(p)
         return p
     }
 
-    func pipeline(for id: UInt32) -> VideoPipeline? { pipelines[id] }
+    /// requestKeyframe 闭包的主线程落点（同屏 2s 限频）
+    private func requestKeyframeMain(_ displayId: UInt32) {
+        let now = FrameAssembler.nowMs()
+        if let last = lastKeyframeRequestAt[displayId], now &- last < 2_000 { return }
+        lastKeyframeRequestAt[displayId] = now
+        session?.requestKeyframe(displayId: UInt16(clamping: Int(displayId)))
+    }
+
+    func pipeline(for id: UInt32) -> VideoPipeline? { registry.pipeline(id) }
 
     /// 区域序号 → displayId（越界 = 第二块屏还没建立）
     func regionId(at index: Int) -> UInt32? {
@@ -582,7 +619,37 @@ extension AppModel: HostSessionListener {
 
     nonisolated func hostSession(_ session: HostSession, didReceive packet: HostPacket) {
         if Self.shieldDrop(packet, now: FrameAssembler.nowMs()) { return }
-        Task { @MainActor in self.handle(packet: packet) }
+        // HostSession 只经 notifyOnMain（主线程）调本方法；assumeIsolated 消掉旧实现
+        // 每包新建 Task{@MainActor} 的第二跳调度（高频控制包下是可感知的延迟与分配）
+        MainActor.assumeIsolated { self.handle(packet: packet) }
+    }
+
+    nonisolated func hostSession(_ session: HostSession,
+                                 didReceiveVideoFragment displayId: UInt32,
+                                 frameId: Int64, fragIdx: Int, fragCount: Int,
+                                 keyframe: Bool, payload: Data) {
+        // sessionQueue 上下文：锁内查表后直达管线串行队列，全程不碰主线程
+        guard let pipeline = registry.pipeline(displayId) else { return }
+        pipeline.handleFragment(frameId: frameId, fragIdx: fragIdx, fragCount: fragCount,
+                                keyframe: keyframe, payload: payload)
+    }
+
+    nonisolated func hostSession(_ session: HostSession,
+                                 didReceiveCursor displayId: UInt32, x: Float, y: Float) {
+        // 已由 HostSession 单跳到主线程；直接更新 overlay，不再二次调度
+        MainActor.assumeIsolated {
+            cursorPacketCount += 1
+            if displayId == 0 {
+                for (_, ref) in cursorOverlayRefs { ref.value?.hide() }
+            } else {
+                // host 的拓扑回退（如 2x 被拒换 1x）会更换 CGDirectDisplayID；
+                // 精确匹配失败时回落到当前唯一 overlay，光标才不会因 id 变换消失。
+                // 60Hz 高频：直接扫 refs，不做 cursorOverlays 的整字典重建
+                let overlay = cursorOverlayRefs.first(where: { $0.0 == displayId })?.1.value
+                    ?? cursorOverlayRefs.first?.1.value
+                overlay?.moveTo(streamX: x, streamY: y)
+            }
+        }
     }
 
     nonisolated func hostSession(_ session: HostSession, linkChangedUp up: Bool) {
@@ -610,26 +677,8 @@ extension AppModel: HostSessionListener {
             Self.diag.log("CONFIG display=\(displayId) csd=\(paramSets.count) bytes")
             pipelineOf(id: UInt32(displayId)).handleConfig(paramSets)
 
-        case .videoFragment(let displayId, let frameId, let fragIdx, let fragCount,
-                            let keyframe, let payload):
-            pipelineOf(id: UInt32(displayId)).handleFragment(frameId: Int64(frameId),
-                                                             fragIdx: Int(fragIdx),
-                                                             fragCount: Int(fragCount),
-                                                             keyframe: keyframe, payload: payload)
-
         case .displays(let list):
             handleDisplays(list)
-
-        case .cursor(let displayId, let x, let y):
-            cursorPacketCount += 1
-            if displayId == 0 {
-                cursorOverlays.values.forEach { $0.hide() }
-            } else {
-                // host 的拓扑回退（如 2x 被拒换 1x）会更换 CGDirectDisplayID；
-                // 精确匹配失败时回落到当前唯一 overlay，光标才不会因 id 变换消失
-                let overlay = cursorOverlays[UInt32(displayId)] ?? cursorOverlays.values.first
-                overlay?.moveTo(streamX: x, streamY: y)
-            }
 
         case .cursorBitmap(let image):
             // 系统光标位图是全局一份；各区域各自绘制，位置仍由 cursor 包按 displayId 驱动
@@ -646,8 +695,9 @@ extension AppModel: HostSessionListener {
             handleDisplayModeStatus(transaction: transaction, status: status,
                                     requestedScale: requestedScale, actualScale: actualScale)
 
-        case .cursorImage, .inputAck, .pong:
-            break // 光标分片由 HostSession 组装；pong 状态机也在会话层内部
+        case .cursorImage, .inputAck, .pong, .cursor, .videoFragment:
+            break // 光标分片由 HostSession 组装；pong 状态机在会话层内部；
+                  // cursor/videoFragment 走专用高频通道（HostSession 就地分流），不该到这
         }
     }
 
@@ -675,6 +725,7 @@ extension AppModel: HostSessionListener {
             subscribedIds = desiredIds
             resetPipelines(keep: [])
             beginTopologyArming(expectedIds: Set(desiredIds))
+            desiredIds.forEach { requestKeyframeMain($0) }
         } else if desiredIds != subscribedIds {
             let oldIds = subscribedIds
             subscribedIds = desiredIds
@@ -686,6 +737,7 @@ extension AppModel: HostSessionListener {
                 resetPipelines(keep: [])
                 beginTopologyArming(expectedIds: Set(desiredIds))
             }
+            desiredIds.forEach { requestKeyframeMain($0) }
         } else {
             awaitingSecondDisplay = false
         }
@@ -696,7 +748,8 @@ extension AppModel: HostSessionListener {
         } else if !subscribedIds.isEmpty {
             session?.subscribeDisplays(ids: subscribedIds)
         }
-        subscribedIds.forEach { session?.requestKeyframe(displayId: UInt16(clamping: Int($0))) }
+        // 关键帧请求只随订阅集变更发出（对照安卓：仅首建/变更分支发）。host 重推
+        // DISPLAYS 时旧实现每包都请求，等于给 host 的 IDR/码率系统持续添堵。
         if !hasVideo { waitingText = waitingText ?? "等待画面…" }
         reconcileCurrentDeviceDisplayProfile(list)
     }
@@ -798,10 +851,7 @@ extension AppModel: HostSessionListener {
     }
 
     private func resetPipelines(keep: Set<UInt32>) {
-        for p in pipelines.values where !keep.contains(p.displayId) {
-            p.teardown()
-        }
-        pipelines = pipelines.filter { keep.contains($0.key) }
+        registry.keepOnly(keep).forEach { $0.teardown() }
     }
 
     // MARK: 布局换算
@@ -872,15 +922,15 @@ extension AppModel: HostSessionListener {
             }
         } else {
             // 掉线：解码器全部释放清 CSD，保持画面冻结比闪绿好。
-            // 订阅集一并清空：host 重启后会话是全新的，DISPLAYS 到达时需要完整重订阅。
+            // 订阅集保留（对照安卓：只有 closeSession 才清）——host 在 HELLO 重新
+            // attach 订阅，客户端清空反而把瞬时断链放大成全量重订阅+闪黑。
             linkUp = false
             hasVideo = false
-            subscribedIds = []
             topologyTransitionInFlight = false
             topologyExpectedIds = []
             bannerTitle = nil
             bannerDetail = nil
-            pipelines.values.forEach { $0.resetForLinkDown() }
+            registry.all.forEach { $0.resetForLinkDown() }
             if phase == .session {
                 waitingText = "连接中断，正在重试…"
             }
@@ -909,7 +959,7 @@ extension AppModel: HostSessionListener {
     }
 
     func attachRegion(pipeline: VideoPipeline, surface: VideoLayerView, cursor: CursorOverlayView) {
-        pipeline.surfaceView = surface
+        pipeline.attachSurface(surface)
         cursorOverlayRefs.removeAll { $0.0 == pipeline.displayId }
         cursorOverlayRefs.append((pipeline.displayId, WeakRef(cursor)))
         // 系统光标位图到达前先给一个可辨认的本地箭头兜底
@@ -922,7 +972,7 @@ extension AppModel: HostSessionListener {
     }
 
     func detachRegion(pipeline: VideoPipeline) {
-        pipeline.surfaceView = nil
+        pipeline.attachSurface(nil)
         cursorOverlayRefs.removeAll { $0.0 == pipeline.displayId }
     }
 }

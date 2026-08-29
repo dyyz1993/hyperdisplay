@@ -110,7 +110,10 @@ final class CursorOverlayView: UIView {
 
     func moveTo(streamX: Float, streamY: Float) {
         guard let p = streamToView(CGFloat(streamX), CGFloat(streamY)) else {
-            hide(); return
+            // 越界（边缘坐标抖动）不隐藏：保持最后位置与插值起点，等 host 的 did=0
+            // 再隐藏。旧实现这里 hide() 会把 hasPosition 一并清掉，光标在屏幕边缘
+            // 反复消失重现且每次瞬跳（安卓同场景只 return）
+            return
         }
         // hide() 之后 mode 保留，但兜底箭头若从未建过（或被系统光标替换流程清掉）需要重建
         if mode == nil { useFallbackArrow() }
@@ -127,12 +130,21 @@ final class CursorOverlayView: UIView {
 
     func hide() {
         // 只隐身不销毁：光标离开虚拟屏（host 推 did=0）是高频事件，销毁图层后
-        // moveTo 不重建会导致光标从此永久隐身（安卓 LocalCursorView 同场景只改可见性）
+        // moveTo 不重建会导致光标从此永久隐身（安卓 LocalCursorView 同场景只改可见性）。
+        // hasPosition 必须保留：下次重现从上次位置继续插值，而不是瞬跳（对齐安卓）。
         visible = false
-        hasPosition = false
-        alpha = 0
+        setCursorAlpha(0)
         displayLink?.invalidate()
         displayLink = nil
+    }
+
+    /// alpha 显隐必须是即时的：Core Animation 默认给 alpha 变更叠 ~0.25s 隐式动画，
+    /// 高频 hide/show 时光标会发虚拖尾（安卓 visible 布尔位即时生效）
+    private func setCursorAlpha(_ value: CGFloat) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        alpha = value
+        CATransaction.commit()
     }
 
     /// 流坐标 → 本视图坐标；越界返回 nil（对照 StreamView.streamToView）
@@ -254,13 +266,12 @@ final class CursorOverlayView: UIView {
     @objc private func tickCursor() {
         guard visible else {
             // 光标离开虚拟屏：立即消失并停止节拍，无新包时不会常驻刷新
-            alpha = 0
-            hasPosition = false
+            setCursorAlpha(0)
             displayLink?.invalidate()
             displayLink = nil
             return
         }
-        alpha = 1
+        setCursorAlpha(1)
         let dx = targetX - cx, dy = targetY - cy
         if dx * dx + dy * dy > 0.25 {
             // 一帧内追上大部分误差：视觉连续、滞后不到一帧；目标未到继续下一次 VSync
@@ -279,7 +290,11 @@ final class CursorOverlayView: UIView {
         CATransaction.setDisableActions(true) // 位置自己插值，免 CA 双重动画
         switch mode {
         case .bitmap(let l, let hotX, let hotY):
-            l.position = CGPoint(x: cx - CGFloat(hotX), y: cy - CGFloat(hotY))
+            // 位图按 2/密度 倍绘制（对齐安卓物理观感），热点偏移必须同一比例：
+            // 2x 屏等价旧值 hotX；3x 屏（iPhone Pro）旧值偏小 1/3，尖端对不准
+            let scale = Self.systemCursorScale / UIScreen.main.scale
+            l.position = CGPoint(x: cx - CGFloat(hotX) * scale,
+                                 y: cy - CGFloat(hotY) * scale)
         case .arrow(let shadow, let fill, let stroke):
             // 尖端即热点：整个箭头组直接以 cx,cy 为原点平移
             let t = CATransform3DMakeTranslation(cx, cy, 0)

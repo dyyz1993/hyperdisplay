@@ -789,9 +789,9 @@ struct StreamContainer: UIViewRepresentable {
             return
         }
         if let previous = context.coordinator.currentPipeline, previous !== pipeline {
-            previous.surfaceView = nil
+            previous.attachSurface(nil)
         }
-        pipeline.surfaceView = context.coordinator.videoView
+        pipeline.attachSurface(context.coordinator.videoView)
         context.coordinator.currentPipeline = pipeline
         if let video = context.coordinator.videoView, let cursor = context.coordinator.cursorView {
             model.attachRegion(pipeline: pipeline, surface: video, cursor: cursor)
@@ -800,6 +800,6 @@ struct StreamContainer: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
-        coordinator.currentPipeline?.surfaceView = nil
+        coordinator.currentPipeline?.attachSurface(nil)
     }
 }

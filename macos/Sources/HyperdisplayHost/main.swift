@@ -1904,8 +1904,13 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 let profiles = deviceProfiles(deviceId: deviceId, topology: topology, deviceName: deviceName,
                                               clientWidth: cw, clientHeight: ch,
                                               requested: restoringAfterReinstall ? [] : requestedDisplays)
+                // 无 layout 信息的 HELLO（如极老客户端/异常会话）安全默认必须是标准
+                // 1x——与下方 restoreWaitingDisplayIfHealthy 的 `?? false` 一致。
+                // 此处曾是 `?? true`：严格 2x 对达不到 1280×960 门槛的规格直接建屏
+                // 失败进入 5s 重试循环、或建后删屏，且 transaction=0 让模式状态被
+                // 双端吞掉无法自愈（2026-08-29 双端考古定责）。
                 reconcileDeviceDisplays(deviceId: deviceId, topology: topology, profiles: profiles,
-                                        retina: effectiveLayout?.requestsStrictRetina ?? true,
+                                        retina: effectiveLayout?.requestsStrictRetina ?? false,
                                         transaction: effectiveLayout?.transaction ?? 0)
             }
             // 目标屏：档案屏优先（剪枝后重入会也能回到自己的屏——setSubscriptions 对
