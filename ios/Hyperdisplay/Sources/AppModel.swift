@@ -120,8 +120,16 @@ final class AppModel: ObservableObject {
     private var reconnectOnForeground = false
     private var lastStatTickAtMs = UInt64(0)
     private var lastRenderedSnapshot: [UInt32: Int] = [:]
-    // 视图挂接：每区域一份（光标按 displayId 路由）
-    var cursorOverlayRefs: [(UInt32, WeakRef<CursorOverlayView>)] = []
+    // 视图挂接：光标全局唯一（对照安卓 root 级 LocalCursorView 单例，杜绝区域
+    // 重建产生双光标实例）；视频视图按 displayId 注册（光标坐标换算源）
+    var cursorOverlayRef: WeakRef<CursorOverlayView>?
+    private var videoViewRefs: [(UInt32, WeakRef<VideoLayerView>)] = []
+
+    private func videoView(for displayId: UInt32) -> VideoLayerView? {
+        videoViewRefs = videoViewRefs.filter { $0.1.value != nil }
+        return videoViewRefs.first(where: { $0.0 == displayId })?.1.value
+            ?? videoViewRefs.first?.1.value
+    }
 
     init() {
         browser.onUpdate = { [weak self] hosts in
@@ -684,16 +692,19 @@ extension AppModel: HostSessionListener {
         // 已由 HostSession 单跳到主线程；直接更新 overlay，不再二次调度
         MainActor.assumeIsolated {
             cursorPacketCount += 1
+            guard let overlay = cursorOverlayRef?.value else { return }
             if displayId == 0 {
-                for (_, ref) in cursorOverlayRefs { ref.value?.hide() }
-            } else {
-                // host 的拓扑回退（如 2x 被拒换 1x）会更换 CGDirectDisplayID；
-                // 精确匹配失败时回落到当前唯一 overlay，光标才不会因 id 变换消失。
-                // 60Hz 高频：直接扫 refs，不做 cursorOverlays 的整字典重建
-                let overlay = cursorOverlayRefs.first(where: { $0.0 == displayId })?.1.value
-                    ?? cursorOverlayRefs.first?.1.value
-                overlay?.moveTo(streamX: x, streamY: y)
+                overlay.hide()
+                return
             }
+            // 流坐标 → 目标视频视图内容区坐标 → 全局光标视图坐标（对照安卓
+            // streamToView + windowPos 双窗口原点换算）。displayId 未命中时回落
+            // 首个视频视图（host 拓扑回退换 id 时光标不至于消失）；换算越界 =
+            // 整包丢弃，光标停在原地（安卓同语义）。
+            guard let videoView = videoView(for: displayId),
+                  let local = videoView.contentPoint(forStreamX: CGFloat(x), y: CGFloat(y)) else { return }
+            let p = videoView.convert(local, to: overlay)
+            overlay.moveTo(viewX: p.x, viewY: p.y)
         }
     }
 
@@ -714,9 +725,8 @@ extension AppModel: HostSessionListener {
             pipeline.handleWelcome(codec: codec, width: Int(w), height: Int(h), fps: Int(fps))
             // 流尺寸是光标坐标换算的基准：WELCOME 到达时同步给光标层，
             // 否则尺寸为 0 → streamToView 恒 nil → 光标永远不显示
-            let overlay = cursorOverlayRefs.first(where: { $0.0 == UInt32(displayId) })?.1.value
-                ?? cursorOverlayRefs.first?.1.value
-            overlay?.setStreamSize(w: Int(w), h: Int(h))
+            let surface = videoView(for: UInt32(displayId))
+            surface?.setStreamSize(w: Int(w), h: Int(h))
 
         case .config(let displayId, _, let paramSets):
             Self.diag.log("CONFIG display=\(displayId) csd=\(paramSets.count) bytes")
@@ -726,12 +736,10 @@ extension AppModel: HostSessionListener {
             handleDisplays(list)
 
         case .cursorBitmap(let image):
-            // 系统光标位图是全局一份；各区域各自绘制，位置仍由 cursor 包按 displayId 驱动
-            for overlay in cursorOverlays.values {
-                overlay.setSystemCursorBitmap(width: image.width, height: image.height,
-                                              hotX: image.hotX, hotY: image.hotY,
-                                              bgra: image.pixels)
-            }
+            // 系统光标位图是全局一份（安卓同语义），全局光标视图直接更新
+            cursorOverlayRef?.value?.setSystemCursorBitmap(width: image.width, height: image.height,
+                                                           hotX: image.hotX, hotY: image.hotY,
+                                                           bgra: image.pixels)
 
         case .savedLayout(let wire):
             handleSavedLayout(wire)
@@ -998,18 +1006,11 @@ extension AppModel: HostSessionListener {
 
     // MARK: 视图挂接（每区域一份 Representable；光标按 displayId 路由）
 
-    var cursorOverlays: [UInt32: CursorOverlayView] {
-        cursorOverlayRefs = cursorOverlayRefs.filter { $0.1.value != nil }
-        return Dictionary(cursorOverlayRefs.map { ($0.0, $0.1.value!) }, uniquingKeysWith: { _, b in b })
-    }
-
-    func attachRegion(pipeline: VideoPipeline, surface: VideoLayerView, cursor: CursorOverlayView) {
+    func attachRegion(pipeline: VideoPipeline, surface: VideoLayerView) {
         pipeline.attachSurface(surface)
-        cursorOverlayRefs.removeAll { $0.0 == pipeline.displayId }
-        cursorOverlayRefs.append((pipeline.displayId, WeakRef(cursor)))
-        // 系统光标位图到达前先给一个可辨认的本地箭头兜底
-        cursor.useFallbackArrow()
-        cursor.setStreamSize(w: pipeline.width, h: pipeline.height)
+        videoViewRefs.removeAll { $0.0 == pipeline.displayId || $0.1.value == nil }
+        videoViewRefs.append((pipeline.displayId, WeakRef(surface)))
+        surface.setStreamSize(w: pipeline.width, h: pipeline.height)
         // 复用的旧 surface（旋转等）重新挂接后要一帧 IDR 立即点亮
         if pipeline.framesRendered > 0 {
             session?.requestKeyframe(displayId: UInt16(clamping: Int(pipeline.displayId)))
@@ -1018,7 +1019,7 @@ extension AppModel: HostSessionListener {
 
     func detachRegion(pipeline: VideoPipeline) {
         pipeline.attachSurface(nil)
-        cursorOverlayRefs.removeAll { $0.0 == pipeline.displayId }
+        videoViewRefs.removeAll { $0.0 == pipeline.displayId }
     }
 }
 

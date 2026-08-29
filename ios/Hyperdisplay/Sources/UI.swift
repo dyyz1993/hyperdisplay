@@ -201,6 +201,11 @@ struct SessionScreen: View {
                         model.handleViewportChange()
                     }
                     .onAppear { model.handleViewportChange() }
+                // 全局唯一光标层：覆盖整屏（含安全区），坐标由 AppModel 经视频
+                // 视图换算后投递（见 didReceiveCursor）
+                CursorOverlayHost(model: model)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
             }
             .ignoresSafeArea()
 
@@ -749,7 +754,6 @@ struct StreamContainer: UIViewRepresentable {
     final class Coordinator {
         weak var currentPipeline: VideoPipeline?
         weak var videoView: VideoLayerView?
-        weak var cursorView: CursorOverlayView?
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -763,29 +767,20 @@ struct StreamContainer: UIViewRepresentable {
         video.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(video)
 
-        let cursor = CursorOverlayView(frame: container.bounds)
-        cursor.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(cursor)
-
         NSLayoutConstraint.activate([
             video.topAnchor.constraint(equalTo: container.topAnchor),
             video.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             video.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             video.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            cursor.topAnchor.constraint(equalTo: container.topAnchor),
-            cursor.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            cursor.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            cursor.trailingAnchor.constraint(equalTo: container.trailingAnchor),
         ])
 
         context.coordinator.videoView = video
-        context.coordinator.cursorView = cursor
         return container
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {
         guard context.coordinator.currentPipeline !== pipeline else {
-            context.coordinator.cursorView?.setStreamSize(w: pipeline.width, h: pipeline.height)
+            context.coordinator.videoView?.setStreamSize(w: pipeline.width, h: pipeline.height)
             return
         }
         if let previous = context.coordinator.currentPipeline, previous !== pipeline {
@@ -793,13 +788,30 @@ struct StreamContainer: UIViewRepresentable {
         }
         pipeline.attachSurface(context.coordinator.videoView)
         context.coordinator.currentPipeline = pipeline
-        if let video = context.coordinator.videoView, let cursor = context.coordinator.cursorView {
-            model.attachRegion(pipeline: pipeline, surface: video, cursor: cursor)
+        if let video = context.coordinator.videoView {
+            model.attachRegion(pipeline: pipeline, surface: video)
         }
-        context.coordinator.cursorView?.setStreamSize(w: pipeline.width, h: pipeline.height)
+        context.coordinator.videoView?.setStreamSize(w: pipeline.width, h: pipeline.height)
     }
 
     static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
         coordinator.currentPipeline?.attachSurface(nil)
     }
+}
+
+/// 全局唯一光标视图宿主（对照安卓 root 级 LocalCursorView 单例）：会话顶层
+/// 铺满一层的 CursorOverlayView，任何区域重建/拓扑变化都不会再产生第二个实例
+/// （2026-08-29 真机双光标——区域级实例在视图重建后残留——的根治）。
+struct CursorOverlayHost: UIViewRepresentable {
+    @ObservedObject var model: AppModel
+
+    func makeUIView(context: Context) -> CursorOverlayView {
+        let v = CursorOverlayView(frame: .zero)
+        v.isUserInteractionEnabled = false
+        v.useFallbackArrow()
+        model.cursorOverlayRef = WeakRef(v)
+        return v
+    }
+
+    func updateUIView(_ uiView: CursorOverlayView, context: Context) {}
 }

@@ -56,6 +56,23 @@ final class VideoLayerView: UIView {
             displayLayer.flush()
         }
     }
+
+    // MARK: 流→视图坐标（全局光标的换算源，对照安卓 StreamView.streamToView）
+
+    private(set) var streamSize: CGSize = .zero
+
+    func setStreamSize(w: Int, h: Int) {
+        streamSize = CGSize(width: w, height: h)
+    }
+
+    /// 流坐标 → 本视图坐标（aspect-fit 内容矩形内）；越界返回 nil（调用方整包丢弃）
+    func contentPoint(forStreamX sx: CGFloat, y sy: CGFloat) -> CGPoint? {
+        guard streamSize.width > 0, streamSize.height > 0, bounds.width > 0 else { return nil }
+        if sx < 0 || sx > streamSize.width || sy < 0 || sy > streamSize.height { return nil }
+        let rect = aspectFitRect(contentWidth: streamSize.width, contentHeight: streamSize.height, in: bounds)
+        return CGPoint(x: rect.minX + sx / streamSize.width * rect.width,
+                       y: rect.minY + sy / streamSize.height * rect.height)
+    }
 }
 
 // MARK: - 本地光标
@@ -71,8 +88,6 @@ final class CursorOverlayView: UIView {
     }
 
     private var mode: CursorMode?
-    /// 流宽高（来自 WELCOME）；nil 时无内容区、隐藏
-    private var streamSize: CGSize = .zero
     private var cx: CGFloat = 0, cy: CGFloat = 0
     private var targetX: CGFloat = 0, targetY: CGFloat = 0
     private var hasPosition = false
@@ -86,40 +101,18 @@ final class CursorOverlayView: UIView {
 
     required init?(coder: NSCoder) { fatalError("unsupported") }
 
-    func setStreamSize(w: Int, h: Int) {
-        streamSize = CGSize(width: w, height: h)
-        layoutStreamMapping()
-    }
-
-    /// 安卓 1:1（LocalCursorView.kt systemCursorScale=2f，2026-08-29 用户定稿
+    // 安卓 1:1（LocalCursorView.kt systemCursorScale=2f，2026-08-29 用户定稿
     /// "不要特殊处理"）：canvas.scale(2) 在安卓 px 单位 = 物理像素恒 ×2、与密度
     /// 无关。iOS 等价：逻辑尺寸 = 位图像素 × 2 ÷ 屏幕密度。不随档位/视频缩放联动。
     private var cursorScaleFactor: CGFloat { 2 / UIScreen.main.scale }
 
-    private func layoutStreamMapping() {
-        guard visible else { return }
-        // 把当前位置从旧内容区迁移到新内容区
-        if hasPosition, !streamSize.equalTo(.zero),
-           let (sx, sy) = viewToStream(cx, cy), let p = streamToView(sx, sy) {
-            cx = p.x; cy = p.y; targetX = p.x; targetY = p.y
-        }
-        applyPosition()
-    }
+    // MARK: 位置（输入已是换算好的窗口坐标——AppModel 经 VideoLayerView.contentPoint
+    // + UIView.convert 完成；本类不再持有流尺寸，全局唯一实例，对照安卓 root 级光标）
 
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        layoutStreamMapping()
-    }
-
-    // MARK: 位置
-
-    func moveTo(streamX: Float, streamY: Float) {
-        guard let p = streamToView(CGFloat(streamX), CGFloat(streamY)) else {
-            // 越界（边缘坐标抖动）不隐藏：保持最后位置与插值起点，等 host 的 did=0
-            // 再隐藏。旧实现这里 hide() 会把 hasPosition 一并清掉，光标在屏幕边缘
-            // 反复消失重现且每次瞬跳（安卓同场景只 return）
-            return
-        }
+    /// 越界（边缘坐标抖动）由换算侧返回 nil 丢弃（对齐安卓 streamToView==null 整包
+    /// 丢弃）；本方法只吃合法坐标。
+    func moveTo(viewX: CGFloat, viewY: CGFloat) {
+        let p = CGPoint(x: viewX, y: viewY)
         // hide() 之后 mode 保留，但兜底箭头若从未建过（或被系统光标替换流程清掉）需要重建
         if mode == nil { useFallbackArrow() }
         targetX = p.x
@@ -150,25 +143,6 @@ final class CursorOverlayView: UIView {
         CATransaction.setDisableActions(true)
         alpha = value
         CATransaction.commit()
-    }
-
-    /// 流坐标 → 本视图坐标；越界返回 nil（对照 StreamView.streamToView）
-    private func streamToView(_ sx: CGFloat, _ sy: CGFloat) -> CGPoint? {
-        guard streamSize.width > 0, streamSize.height > 0, bounds.width > 0 else { return nil }
-        if sx < 0 || sx > streamSize.width || sy < 0 || sy > streamSize.height { return nil }
-        let rect = aspectFitRect(contentWidth: streamSize.width, contentHeight: streamSize.height,
-                                 in: bounds)
-        return CGPoint(x: rect.minX + sx / streamSize.width * rect.width,
-                       y: rect.minY + sy / streamSize.height * rect.height)
-    }
-
-    private func viewToStream(_ x: CGFloat, _ y: CGFloat) -> (CGFloat, CGFloat)? {
-        guard streamSize.width > 0, streamSize.height > 0 else { return nil }
-        let rect = aspectFitRect(contentWidth: streamSize.width, contentHeight: streamSize.height,
-                                 in: bounds)
-        guard rect.contains(CGPoint(x: x, y: y)) else { return nil }
-        return ((x - rect.minX) / rect.width * streamSize.width,
-                (y - rect.minY) / rect.height * streamSize.height)
     }
 
     // MARK: 绘制
