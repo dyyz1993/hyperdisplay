@@ -182,15 +182,24 @@ final class CursorOverlayView: UIView {
         velY = velY * 0.55 + instVy * 0.45
     }
 
-    /// 当前应追赶的目标：包流新鲜且速度显著时 = 真实目标 + 速度 × 前导时间
+    /// 当前应追赶的目标：包流新鲜且速度显著时 = 真实目标 + 速度 × 前导时间 × 淡出系数。
+    /// 前导量淡出（不瞬间归零）：鼠标停下后 ~150ms 平滑收回——实测瞬收会在定位时
+    /// 表现为"往后抽一下"，淡出把它变成不可察觉的滑动归位。
+    private var leadFade: CGFloat = 1
+
     private func leadTarget(nowMs now: UInt64) -> (x: CGFloat, y: CGFloat) {
         let fresh = lastPacketAtMs > 0 && (now &- lastPacketAtMs) < 50
+        if fresh {
+            leadFade = min(1, leadFade + 0.5)   // 移动中立即全量外推
+        } else {
+            leadFade = max(0, leadFade - 0.1)   // 停住后 ~8 帧（≈130ms）平滑收回
+        }
         let speed2 = velX * velX + velY * velY
-        guard fresh, speed2 > 900 else { return (targetX, targetY) }  // <30pt/s 视为静止
-        let leadSeconds: CGFloat = 0.045
-        let maxLead: CGFloat = 28   // 停下时最多过冲 28pt，约 2-3 帧收回
-        var lx = targetX + velX * leadSeconds
-        var ly = targetY + velY * leadSeconds
+        guard leadFade > 0.01, speed2 > 900 else { return (targetX, targetY) }  // <30pt/s 视为静止
+        let leadSeconds: CGFloat = 0.04
+        let maxLead: CGFloat = 20 * leadFade    // 停止过程中前导上限同步收小
+        var lx = targetX + velX * leadSeconds * leadFade
+        var ly = targetY + velY * leadSeconds * leadFade
         let dx = lx - targetX, dy = ly - targetY
         let dist = (dx * dx + dy * dy).squareRoot()
         if dist > maxLead {
