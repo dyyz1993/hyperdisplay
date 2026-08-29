@@ -88,21 +88,13 @@ final class CursorOverlayView: UIView {
 
     func setStreamSize(w: Int, h: Int) {
         streamSize = CGSize(width: w, height: h)
-        recomputeCursorScale()
         layoutStreamMapping()
     }
 
-    /// 光标是桌面的一部分：必须随视频同倍缩放（屏幕物理 px / 流 px）。
-    /// 原生档 ≈1.0（用户认可的自然大小）；特大档视频放大 ~1.63×，光标同步
-    /// 放大才与桌面内容成比例——恒定物理大小会在放大桌面上显得比例失调
-    /// （2026-08-29 用户"看起来很怪"的来源）。位图 28x40 各档同尺寸（host 实测）。
-    private var cursorScaleFactor: CGFloat = 1
-
-    private func recomputeCursorScale() {
-        guard streamSize.width > 0, bounds.width > 0 else { return }
-        let videoScale = bounds.width * UIScreen.main.scale / streamSize.width
-        cursorScaleFactor = min(2.0, max(0.5, videoScale))
-    }
+    /// 安卓 1:1（LocalCursorView.kt systemCursorScale=2f，2026-08-29 用户定稿
+    /// "不要特殊处理"）：canvas.scale(2) 在安卓 px 单位 = 物理像素恒 ×2、与密度
+    /// 无关。iOS 等价：逻辑尺寸 = 位图像素 × 2 ÷ 屏幕密度。不随档位/视频缩放联动。
+    private var cursorScaleFactor: CGFloat { 2 / UIScreen.main.scale }
 
     private func layoutStreamMapping() {
         guard visible else { return }
@@ -116,7 +108,6 @@ final class CursorOverlayView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        recomputeCursorScale()
         layoutStreamMapping()
     }
 
@@ -197,16 +188,16 @@ final class CursorOverlayView: UIView {
         layer.sublayers?.removeAll()
         let imageLayer = CALayer()
         imageLayer.contents = cgImage
-        // 物理大小 = 位图像素 × cursorScaleFactor（原生档=1 即自然大小；低分辨率档
-        // macOS 会放大光标位图，反向补偿保持恒定观感——见 recomputeCursorScale）。
-        // 安卓平板用 ×2（其高分大画布上 1:1 过小）；手机原生档 1:1 即 macOS 比例。
-        let density = UIScreen.main.scale
-        let logicalW = CGFloat(w) * cursorScaleFactor / density
-        let logicalH = CGFloat(h) * cursorScaleFactor / density
+        // 安卓 1:1：物理大小 = 位图像素 × 2（恒定，与密度/档位无关），
+        // 逻辑尺寸 = 物理 ÷ 屏幕密度。cursorScaleFactor 已含 2/密度。
+        let logicalW = CGFloat(w) * cursorScaleFactor
+        let logicalH = CGFloat(h) * cursorScaleFactor
         imageLayer.bounds = CGRect(x: 0, y: 0, width: logicalW, height: logicalH)
         imageLayer.anchorPoint = CGPoint(x: 0, y: 0)
         imageLayer.masksToBounds = false
-        mode = .bitmap(layer: imageLayer, hotX: hx, hotY: hy)
+        mode = .bitmap(layer: imageLayer,
+                               hotX: min(max(hx, 0), w),
+                               hotY: min(max(hy, 0), h))
         rebuildLayers()
         requestAnimationTick()
     }
@@ -217,9 +208,7 @@ final class CursorOverlayView: UIView {
         CGPoint(x: 10.0, y: 27.3), CGPoint(x: 13.5, y: 25.8), CGPoint(x: 9.5, y: 16.7),
         CGPoint(x: 16.4, y: 16.4),
     ]
-    // 兜底箭头对齐系统位图的自然大小（28x40px）：旧值 1.45 画出来有位图 ~3 倍大，
-    // 位图未到达的窗口期会被误判为"光标偏大"。~0.5 使箭头 ≈14pt≈位图 2x 屏逻辑高度。
-    private static let arrowScale: CGFloat = 0.5
+    private static let arrowScale: CGFloat = 1.45   // 安卓 1:1：scale=1.45f
 
     func useFallbackArrow() {
         layer.sublayers?.removeAll()
@@ -242,7 +231,7 @@ final class CursorOverlayView: UIView {
         stroke.path = base
         stroke.fillColor = UIColor.clear.cgColor
         stroke.strokeColor = UIColor(red: 0.137, green: 0.169, blue: 0.212, alpha: 0.85).cgColor
-        stroke.lineWidth = 1.35
+        stroke.lineWidth = 1.35 * Self.arrowScale   // 安卓 1:1：1.35f 在 path 空间，上屏 ×1.45 ≈1.96px
         stroke.lineJoin = .round
         stroke.lineCap = .round
         mode = .arrow(shadow: shadow, fill: fill, stroke: stroke)
@@ -288,8 +277,8 @@ final class CursorOverlayView: UIView {
         let dx = targetX - cx, dy = targetY - cy
         if dx * dx + dy * dy > 0.25 {
             // 一帧内追上大部分误差：视觉连续、滞后不到一帧；目标未到继续下一次 VSync
-            cx += dx * 0.8
-            cy += dy * 0.8
+            cx += dx * 0.72   // 安卓 1:1：0.72f 每帧指数追赶
+            cy += dy * 0.72
         } else {
             cx = targetX; cy = targetY
             displayLink?.invalidate()
@@ -303,17 +292,17 @@ final class CursorOverlayView: UIView {
         CATransaction.setDisableActions(true) // 位置自己插值，免 CA 双重动画
         switch mode {
         case .bitmap(let l, let hotX, let hotY):
-            // 位图按 cursorScaleFactor 倍绘制（含档位补偿），热点偏移同倍率：
-            // 原生档等价旧值 hotX；低分辨率档（特大）不补偿会偏大 1.63 倍
-            let scale = cursorScaleFactor / UIScreen.main.scale
+            // 安卓 1:1：canvas.translate(cx,cy)→scale(2)→drawBitmap(-hotX,-hotY)
+            // 的等价数学——位图与热点同 ×2/密度，尖端精确落在光标坐标
+            let scale = cursorScaleFactor
             l.position = CGPoint(x: cx - CGFloat(hotX) * scale,
                                  y: cy - CGFloat(hotY) * scale)
         case .arrow(let shadow, let fill, let stroke):
             // 尖端即热点：整个箭头组直接以 cx,cy 为原点平移
             let t = CATransform3DMakeTranslation(cx, cy, 0)
             var shadowT = t
-            shadowT.m41 += 1.1
-            shadowT.m42 += 1.4
+            shadowT.m41 += 1.1 * Self.arrowScale   // 安卓 1:1：偏移在缩放空间内，上屏 ×1.45
+            shadowT.m42 += 1.4 * Self.arrowScale
             shadow.transform = shadowT
             fill.transform = t
             stroke.transform = t
