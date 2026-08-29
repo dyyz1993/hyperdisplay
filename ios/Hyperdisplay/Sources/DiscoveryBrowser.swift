@@ -88,12 +88,15 @@ final class DiscoveryBrowser {
         sweepSocket = fd
         var rcvTimeout = timeval(tv_sec: 0, tv_usec: 200_000)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, socklen_t(MemoryLayout<timeval>.size))
+        // USB 个人热点（iPhone USB 网卡）网段是 172.20.10.0/28，只有 .1-.14 有效；
+        // 按 /24 扫会浪费 ~3s 在空地址上。特判该前缀收窄扫描范围，有线直连时秒级发现。
+        let sweepMax = basePrefix == "172.20.10." ? 14 : 254
         queue.async { [weak self] in
             defer { close(fd); self?.sweepActive = false; self?.sweepSocket = -1 }
             let ping: [UInt8] = [0x13, 0, 0, 0, 1]
             var sent = 0
             var sendErrors = 0
-            for i in 1...254 {
+            for i in 1...sweepMax {
                 guard self?.sweepActive == true else { return }
                 var addr = sockaddr_in()
                 addr.sin_family = sa_family_t(AF_INET)
@@ -166,7 +169,10 @@ final class DiscoveryBrowser {
                 inet_ntop(AF_INET, &addr.sin_addr, &cStr, socklen_t(16))
                 let ip = String(cString: cStr)
                 let name = String(cString: ifa.ifa_name)
-                if !ip.hasPrefix("127."), !ip.hasPrefix("169.254."), name.hasPrefix("en") {
+                if !ip.hasPrefix("127."), !ip.hasPrefix("169.254."),
+                   name.hasPrefix("en") || name.hasPrefix("bridge") {
+                    // bridge*：iPhone 作个人热点主机时的 USB 桥接口（bridge100，
+                    // 172.20.10.1）。漏掉它 = USB 直连场景取不到本机地址无法扫描。
                     let parts = ip.split(separator: ".")
                     if parts.count == 4 {
                         let prefix = "\(parts[0]).\(parts[1]).\(parts[2])."
