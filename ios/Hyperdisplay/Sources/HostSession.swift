@@ -299,7 +299,7 @@ final class HostSession {
             let hist = self.typeHistogram.sorted { $0.key < $1.key }
                 .map { String(format: "%02x:%d", $0.key, $0.value) }
                 .joined(separator: " ")
-            diag.log("tick: linkUp=\(self.linkUp) recv=\(self.receivedCount) listener=\(self.listener != nil) types[\(hist)]")
+            diag.log("tick: linkUp=\(self.linkUp) recv=\(self.receivedCount) listener=\(self.listener != nil) types[\(hist, privacy: .public)]")
         }
         let pongAge = now &- lastPongAtMs
         if linkUp && pongAge > 5_000 {
