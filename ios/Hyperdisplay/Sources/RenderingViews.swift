@@ -119,6 +119,7 @@ final class CursorOverlayView: UIView {
         if mode == nil { useFallbackArrow() }
         targetX = p.x
         targetY = p.y
+        updateVelocity(newX: p.x, newY: p.y)
         if !hasPosition {
             // 首包必须立即出现，不能为了平滑从左上角飞入
             cx = p.x; cy = p.y
@@ -126,6 +127,59 @@ final class CursorOverlayView: UIView {
         }
         visible = true
         requestAnimationTick()
+    }
+
+    // MARK: 速度外推（对照 RDP/Parsec 的指针预测）
+
+    /// 远程光标天生背 40-90ms 端到端延迟；Wi-Fi 省电抖动（实测 ping 20ms 均值/
+    /// 62ms 尖峰）让包一阵一阵到达，纯插值只能抹台阶、抹不掉延迟。移动稳定时按
+    /// 速度把目标前推一小段（约 2-3 帧），把链路延迟抵消掉；包流一断（>50ms 无
+    /// 新包）立即放弃外推——鼠标停下最多多冲一小段、2-3 帧内收回，不会画蛇添足。
+    private var velX: CGFloat = 0, velY: CGFloat = 0          // 平滑速度（pt/s，视图坐标）
+    private var prevTargetX: CGFloat = 0, prevTargetY: CGFloat = 0
+    private var prevTargetAtMs: UInt64 = 0
+    private var lastPacketAtMs: UInt64 = 0
+
+    private static func nowMs() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds / 1_000_000
+    }
+
+    private func updateVelocity(newX: CGFloat, newY: CGFloat) {
+        let now = Self.nowMs()
+        defer {
+            prevTargetX = newX; prevTargetY = newY
+            prevTargetAtMs = now
+            lastPacketAtMs = now
+        }
+        guard prevTargetAtMs > 0 else { return }
+        let dtMs = now &- prevTargetAtMs
+        // 窗口太短噪声大、太长速度已变；两次正常 60Hz 包间隔 16ms 左右
+        guard dtMs >= 4, dtMs <= 120 else {
+            velX = 0; velY = 0
+            return
+        }
+        let instVx = (newX - prevTargetX) * 1000 / CGFloat(dtMs)
+        let instVy = (newY - prevTargetY) * 1000 / CGFloat(dtMs)
+        velX = velX * 0.55 + instVx * 0.45
+        velY = velY * 0.55 + instVy * 0.45
+    }
+
+    /// 当前应追赶的目标：包流新鲜且速度显著时 = 真实目标 + 速度 × 前导时间
+    private func leadTarget(nowMs now: UInt64) -> (x: CGFloat, y: CGFloat) {
+        let fresh = lastPacketAtMs > 0 && (now &- lastPacketAtMs) < 50
+        let speed2 = velX * velX + velY * velY
+        guard fresh, speed2 > 900 else { return (targetX, targetY) }  // <30pt/s 视为静止
+        let leadSeconds: CGFloat = 0.045
+        let maxLead: CGFloat = 28   // 停下时最多过冲 28pt，约 2-3 帧收回
+        var lx = targetX + velX * leadSeconds
+        var ly = targetY + velY * leadSeconds
+        let dx = lx - targetX, dy = ly - targetY
+        let dist = (dx * dx + dy * dy).squareRoot()
+        if dist > maxLead {
+            lx = targetX + dx / dist * maxLead
+            ly = targetY + dy / dist * maxLead
+        }
+        return (lx, ly)
     }
 
     func hide() {
@@ -274,13 +328,16 @@ final class CursorOverlayView: UIView {
             return
         }
         setCursorAlpha(1)
-        let dx = targetX - cx, dy = targetY - cy
+        // 追赶点 = 速度外推目标（移动中前导 ~2-3 帧，停住/断流立即回落真实目标）
+        let lead = leadTarget(nowMs: Self.nowMs())
+        let dx = lead.x - cx, dy = lead.y - cy
         if dx * dx + dy * dy > 0.25 {
             // 一帧内追上大部分误差：视觉连续、滞后不到一帧；目标未到继续下一次 VSync
-            cx += dx * 0.72
-            cy += dy * 0.72
+            cx += dx * 0.8
+            cy += dy * 0.8
         } else {
             cx = targetX; cy = targetY
+            velX = 0; velY = 0
             displayLink?.invalidate()
             displayLink = nil
         }
