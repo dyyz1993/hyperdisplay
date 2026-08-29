@@ -472,8 +472,14 @@ final class DisplayStream {
                 // IDR 可以比 P 帧慢，但恢复锚点若传 350ms，再叠加一次帧缺口/请求
                 // 节流就会重新落入 1–2 秒冻结。90ms 是 Wi-Fi 下的恢复上限，而非
                 // 目标发送时间；小帧仍按实际分片数缩短。
+                // ⚠️ 2026-08-29 iPhone 省电 WiFi 实测：90ms 倾倒 107 片（瞬时 ~13Mbps）
+                // 会打爆手机接收缓冲 → 弃帧 → 再请求 IDR 的死循环（连续 12 分钟 IDR
+                // 风暴，光标包每轮被压住一次 = 光标卡顿的节拍）。接收端近期报过拥塞
+                // 时把恢复锚点摊到 250ms：慢而完整的 IDR，胜过快而永远缺片的 IDR。
+                let congested = Date().timeIntervalSince(lastCongestionAt) < 6.0
+                let idrPacingCap: Int = congested ? 250_000 : 90_000
                 let framePacingUs = keyframe
-                    ? min(90_000, max(20_000, fragCount * 180))
+                    ? min(idrPacingCap, max(20_000, fragCount * 180))
                     : min(8_000, max(2_000, fragCount * 60))
                 let perFragDelay: useconds_t = fragCount > 1
                     ? useconds_t(framePacingUs / fragCount)
