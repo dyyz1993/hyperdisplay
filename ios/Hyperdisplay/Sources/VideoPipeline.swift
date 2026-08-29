@@ -19,8 +19,9 @@ private let diag = Logger(subsystem: "com.hyperdisplay.session", category: "pipe
 final class VideoPipeline {
 
     struct Callbacks {
-        /// 可能在视频线程被调（已限频，频率低）：实现方自行保证线程安全
-        var requestKeyframe: (UInt32) -> Void
+        /// 可能在视频线程被调（已限频，频率低）：实现方自行保证线程安全。
+        /// reason 为组装器弃帧原因（gap/stall/decoder queue full…），供状态行诊断。
+        var requestKeyframe: (UInt32, String) -> Void
         var sendNack: (UInt32, UInt32, [UInt16]) -> Void
         /// 首帧真正上屏（等待画面消失的信号）；保证主线程回调
         var firstFrameRendered: () -> Void
@@ -51,14 +52,15 @@ final class VideoPipeline {
 
     lazy private(set) var assembler = FrameAssembler(callbacks: .init(
         onFrame: { [weak self] frameId, keyframe, data in self?.submitToDecoder(frameId, keyframe, data) },
-        onKeyframeNeeded: { [weak self] _ in
+        onKeyframeNeeded: { [weak self] reason in
             guard let self else { return }
-            self.callbacks.requestKeyframe(self.displayId)
+            self.callbacks.requestKeyframe(self.displayId, reason)
         },
         onNackKeyframeFragments: { [weak self] frameId, missing in
             guard let self else { return }
             self.callbacks.sendNack(self.displayId, UInt32(clamping: frameId), missing)
-        }
+        },
+        debugLog: { msg in diag.log("asm: \(msg, privacy: .public)") }
     ))
 
     init(displayId: UInt32, callbacks: Callbacks) {
@@ -139,7 +141,7 @@ final class VideoPipeline {
         heightBacking = h
         statsLock.unlock()
         fps = max(1, min(f, 144))
-        if formatChanged { callbacks.requestKeyframe(displayId) }
+        if formatChanged { callbacks.requestKeyframe(displayId, "format changed") }
     }
 
     private func handleConfigOnQueue(_ paramSets: Data) {

@@ -451,6 +451,14 @@ final class DisplayStream {
             },
             onFrame: { [weak self] keyframe, payload in
                 guard let self else { return }
+                // 瘦身恢复 IDR 已编出：立即恢复原码率（applyBitrate 统一在主线程调用）
+                if keyframe, self.recoveryIdrSlimActive {
+                    self.recoveryIdrSlimActive = false
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.encoder?.applyBitrate(self.currentBitrate)
+                    }
+                }
                 self.frameId &+= 1
                 // 注意：不在此更新 lastContentFrameAt——编码产出的帧包含 replay 回放
                 // 和 applyBitrate 触发的 IDR（同一画面的重编码，非新内容）。时间戳
@@ -609,9 +617,23 @@ final class DisplayStream {
     /// 永久停留在上一张模糊运动帧。
     private func forceKeyframeAndReplay() {
         lastKeyframeRequestAt = Date()
+        // 恢复锚点瘦身（2026-08-29 iPhone 省电 WiFi 实测）：148KB IDR = 107 片，
+        // 无论 90ms 还是 250ms 摊开都会丢片 → 客户端弃帧 → 500ms 后再请求的
+        // 死循环（连续 12+ 分钟 IDR 风暴，AIMD 砍到地板也无效——IDR 尺寸由内容
+        // 决定不受码率预算约束）。拥塞期的恢复 IDR 临时用 1.5M 编码：静态帧编码
+        // 时间充裕、低码率 IDR 依旧清晰（与 refineIfSettled 同一论据），分片数
+        // 减半以上即可完整送达、断开风暴；IDR 编出后恢复原码率（onFrame）。
+        // 标志位 encoder 线程读、主线程写，竞争最坏情形是多一次幂等 applyBitrate。
+        if Date().timeIntervalSince(lastCongestionAt) < 6.0, currentBitrate > 1_500_000 {
+            encoder?.applyBitrate(1_500_000)
+            recoveryIdrSlimActive = true
+        }
         encoder?.requestKeyframe()
         capture?.replayLastFrame()
     }
+
+    /// 恢复 IDR 正以瘦身码率编码；onFrame 见到下一张关键帧后恢复 currentBitrate
+    private var recoveryIdrSlimActive = false
 
     /// 同一平板订阅多块屏时由 Host 统一调用。此处不改虚拟屏、不重启采集/编码器，
     /// 因而不会引入 ColorSync churn；只把正在运行的 VideoToolbox 会话收敛到预算内。

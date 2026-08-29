@@ -169,10 +169,11 @@ final class CursorOverlayView: UIView {
     // MARK: 绘制
 
     /**
-     * macOS 光标 BGRA 位图按桌面像素给出（典型箭头仅 28×40）；直接 1:1 放到高分
-     * 平板会显得过小。仅放大绘制，不改变 host 坐标和热点语义。
+     * 光标位图绘制倍率：手机端视频≈1:1 映射物理像素，×1 即 macOS 光标在该屏的
+     * 自然比例（安卓平板是 ×2——高分大画布上 1:1 会过小，两端观感需求不同）。
+     * 热点偏移与绘制同倍率（applyPosition）。
      */
-    private static let systemCursorScale: CGFloat = 2
+    private static let systemCursorScale: CGFloat = 1
 
     /// Android ARGB_8888 little-endian 内存顺序正是 BGRA，故零转换解释 macOS 系统光标像素
     func setSystemCursorBitmap(width w: Int, height h: Int, hotX hx: Int, hotY hy: Int, bgra: Data) {
@@ -189,9 +190,10 @@ final class CursorOverlayView: UIView {
         layer.sublayers?.removeAll()
         let imageLayer = CALayer()
         imageLayer.contents = cgImage
-        // 缩放对齐安卓：安卓 systemCursorScale=2 画在物理像素画布（平板 2x 密度）
-        // 上；iOS CALayer 在逻辑坐标，等效物理观感 = 逻辑 × 屏幕密度。
-        // 逻辑尺寸 = 位图像素 × 2 ÷ 屏幕密度，光标物理大小与安卓平板一致。
+        // 自然大小：手机端视频≈1:1 映射物理像素，位图即视频像素尺寸，×1 直接
+        // 对应 macOS 光标在该屏上的真实比例。安卓平板用 ×2（systemCursorScale=2）
+        // 是因为其高分画布远大于光标位图；手机上照搬 ×2 实测观感偏大（2026-08-29
+        // 用户反馈"为什么把光标放大了"）。
         let density = UIScreen.main.scale
         let logicalW = CGFloat(w) * Self.systemCursorScale / density
         let logicalH = CGFloat(h) * Self.systemCursorScale / density

@@ -437,6 +437,12 @@ final class AppModel: ObservableObject {
             lastRenderedSnapshot[p.displayId] = p.framesRendered
             parts.append("屏\(p.displayId) \(p.width)x\(p.height) ~\(fps)fps")
         }
+        // 弃帧原因（3s 内有效）：真机诊断靠用户念这一行——gap=帧号缺口（网络丢帧）、
+        // stall=分片停滞、decoder queue full=解码背压、keyframe missing=IDR 缺片被弃
+        if let reason = lastKeyframeReason,
+           FrameAssembler.nowMs() &- lastKeyframeReasonAtMs < 3_000 {
+            parts.append("因:\(reason)")
+        }
         statsLine = parts.joined(separator: "  ")
     }
 
@@ -451,8 +457,8 @@ final class AppModel: ObservableObject {
         if let existing = registry.pipeline(id) { return existing }
         let p = VideoPipeline(displayId: id, callbacks: .init(
             // 回调可能在视频线程触发（已限频 ≤2/s）：回主线程统一处理，实现保持 MainActor 直觉
-            requestKeyframe: { [weak self] displayId in
-                DispatchQueue.main.async { self?.requestKeyframeMain(displayId) }
+            requestKeyframe: { [weak self] displayId, reason in
+                DispatchQueue.main.async { self?.requestKeyframeMain(displayId, reason: reason) }
             },
             sendNack: { [weak self] displayId, frameId, missing in
                 DispatchQueue.main.async {
@@ -469,13 +475,19 @@ final class AppModel: ObservableObject {
         return p
     }
 
-    /// requestKeyframe 闭包的主线程落点（同屏 2s 限频）
-    private func requestKeyframeMain(_ displayId: UInt32) {
+    /// requestKeyframe 闭包的主线程落点（同屏 2s 限频）。reason 记入状态行供真机诊断。
+    private func requestKeyframeMain(_ displayId: UInt32, reason: String) {
         let now = FrameAssembler.nowMs()
+        lastKeyframeReason = reason
+        lastKeyframeReasonAtMs = now
         if let last = lastKeyframeRequestAt[displayId], now &- last < 2_000 { return }
         lastKeyframeRequestAt[displayId] = now
         session?.requestKeyframe(displayId: UInt16(clamping: Int(displayId)))
     }
+
+    /// 最近一次弃帧原因（3s 内才显示——状态行是给用户念给开发者听的诊断仪表）
+    private var lastKeyframeReason: String?
+    private var lastKeyframeReasonAtMs: UInt64 = 0
 
     func pipeline(for id: UInt32) -> VideoPipeline? { registry.pipeline(id) }
 
@@ -725,7 +737,7 @@ extension AppModel: HostSessionListener {
             subscribedIds = desiredIds
             resetPipelines(keep: [])
             beginTopologyArming(expectedIds: Set(desiredIds))
-            desiredIds.forEach { requestKeyframeMain($0) }
+            desiredIds.forEach { requestKeyframeMain($0, reason: "subscription changed") }
         } else if desiredIds != subscribedIds {
             let oldIds = subscribedIds
             subscribedIds = desiredIds
@@ -737,7 +749,7 @@ extension AppModel: HostSessionListener {
                 resetPipelines(keep: [])
                 beginTopologyArming(expectedIds: Set(desiredIds))
             }
-            desiredIds.forEach { requestKeyframeMain($0) }
+            desiredIds.forEach { requestKeyframeMain($0, reason: "subscription changed") }
         } else {
             awaitingSecondDisplay = false
         }
