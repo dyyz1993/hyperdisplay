@@ -78,6 +78,10 @@ final class AppModel: ObservableObject {
     // MARK: 内部状态
 
     private var session: HostSession?
+    /// 当前会话目标 host（USB 升级判断用：已在 USB 上就不重复切）
+    private var sessionHost: String?
+    /// USB 热点链路监视（对照安卓 §7.2：插线自动升级、拔线自动降级 WiFi，零输入）
+    private let usbWatcher = UsbLinkWatcher()
     /// 管线注册表：视频分片在视频线程按 displayId 直查（AppModel 是 @MainActor，
     /// 普通字典跨线程裸访问是数据竞争）
     private final class PipelineRegistry: @unchecked Sendable {
@@ -159,6 +163,33 @@ final class AppModel: ObservableObject {
             Task { @MainActor [weak self] in self?.transportLabel = label }
         }
         pathMonitor.start(queue: DispatchQueue(label: "hyperdisplay-path-monitor"))
+        usbWatcher.onUsbHostFound = { [weak self] ip in
+            DispatchQueue.main.async { self?.upgradeToUsbLink(host: ip) }
+        }
+        usbWatcher.onUsbLinkLost = { [weak self] in
+            DispatchQueue.main.async { self?.downgradeFromUsbLink() }
+        }
+    }
+
+    /// USB 热点链路出现且探到 host：热切换会话（stopQuietly 语义，host 侧
+    /// EDID 身份恒定保留屏幕）。不动 UserDefaults——保存的仍是 WiFi 地址，
+    /// 拔线降级时直接回归。插线即生效，用户零输入（§7 零点击基线）。
+    private func upgradeToUsbLink(host: String) {
+        guard phase == .session || phase == .connect else { return }
+        guard sessionHost != host else { return }
+        Self.diag.log("USB link up (\(host, privacy: .public)) — switching session")
+        sessionHost = host
+        openSession(host: host, port: 5277)
+    }
+
+    /// USB 拔线：当前会话若在 USB 上，回落到保存的 WiFi 地址重连
+    private func downgradeFromUsbLink() {
+        guard phase == .session, let host = sessionHost,
+              host.hasPrefix("172.20.10.") else { return }
+        Self.diag.log("USB link lost — falling back to Wi-Fi")
+        sessionHost = nil
+        session?.stopQuietly()
+        smartConnect()
     }
 
     deinit {
@@ -172,6 +203,7 @@ final class AppModel: ObservableObject {
 
     func bootstrap() {
         UIApplication.shared.isIdleTimerDisabled = true
+        usbWatcher.start() // 插线自动升级 USB / 拔线自动降级，全程后台
         smartConnect()
     }
 
@@ -226,6 +258,7 @@ final class AppModel: ObservableObject {
 
     private func openSession(host: String, port: UInt16) {
         disconnect(removeDisplay: false) // 幂等重建
+        sessionHost = host
         guard let s = HostSession(host: host, port: port, listener: self,
                                   code: UInt32(clamping: Int(UserDefaults.standard.integer(forKey: "hd.pairingCode"))),
                                   deviceId: DeviceIdentity.loadOrCreateDeviceId(),

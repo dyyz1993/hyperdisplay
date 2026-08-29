@@ -325,3 +325,114 @@ final class DiscoveryBrowser {
         return (host, port)
     }
 }
+
+// MARK: - USB 热点链路监视（对照安卓 §7.2：USB 可用即升级，拔线自动降级 WiFi）
+
+/// iPhone 开个人热点 + USB 插线时，手机侧出现 bridge100 接口（172.20.10.1），
+/// Mac 拿同网段地址。本机出现 172.20.10.x 即 USB 链路活着（5s 轮询接口表，
+/// getifaddrs 开销可忽略）；链路出现时探测 .2-.14 找 host（PING→PONG），
+/// 找到即回调升级；链路消失回调降级。全程无用户输入（零点击基线）。
+final class UsbLinkWatcher {
+
+    var onUsbHostFound: ((String) -> Void)?
+    var onUsbLinkLost: (() -> Void)?
+
+    private var timer: DispatchSourceTimer?
+    private let queue = DispatchQueue(label: "hyperdisplay.usb-watch")
+    private var usbActive = false
+    private var probing = false
+
+    func start() {
+        guard timer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + 2, repeating: 5)
+        t.setEventHandler { [weak self] in self?.tick() }
+        t.resume()
+        timer = t
+    }
+
+    func stop() {
+        timer?.cancel()
+        timer = nil
+    }
+
+    private func tick() {
+        let linkUp = Self.usbHotspotAddress() != nil
+        if linkUp, !usbActive {
+            usbActive = true
+            probeHost()
+        } else if !linkUp, usbActive {
+            usbActive = false
+            DispatchQueue.main.async { [weak self] in self?.onUsbLinkLost?() }
+        }
+    }
+
+    /// bridge* 接口上的 172.20.10.x（iPhone 热点 USB 桥接口）
+    static func usbHotspotAddress() -> String? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0 else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        var ptr = ifaddr
+        while let p = ptr {
+            let ifa = p.pointee
+            if let sa = ifa.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) {
+                let name = String(cString: ifa.ifa_name)
+                if name.hasPrefix("bridge") {
+                    var addr = sockaddr_in()
+                    memcpy(&addr, sa, MemoryLayout<sockaddr_in>.size)
+                    var cStr = [CChar](repeating: 0, count: 16)
+                    inet_ntop(AF_INET, &addr.sin_addr, &cStr, socklen_t(16))
+                    let ip = String(cString: cStr)
+                    if ip.hasPrefix("172.20.10.") { return ip }
+                }
+            }
+            ptr = p.pointee.ifa_next
+        }
+        return nil
+    }
+
+    /// 对 172.20.10.2..14 逐个 PING 等 PONG（host 对任何来源都回 PONG，应答方即 Mac）
+    private func probeHost() {
+        guard !probing else { return }
+        probing = true
+        queue.async { [weak self] in
+            defer { self?.probing = false }
+            let fd = socket(AF_INET, SOCK_DGRAM, 0)
+            guard fd >= 0 else { return }
+            defer { close(fd) }
+            var rcvTimeout = timeval(tv_sec: 0, tv_usec: 200_000)
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, socklen_t(MemoryLayout<timeval>.size))
+            let ping: [UInt8] = [0x13, 0, 0, 0, 1]
+            for i in 2...14 {
+                guard self?.usbActive == true else { return }
+                var addr = sockaddr_in()
+                addr.sin_family = sa_family_t(AF_INET)
+                addr.sin_port = UInt16(5277).bigEndian
+                inet_pton(AF_INET, "172.20.10.\(i)", &addr.sin_addr)
+                withUnsafeBytes(of: ping) { raw in
+                    withUnsafePointer(to: &addr) { addrPtr in
+                        addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                            _ = sendto(fd, raw.baseAddress, ping.count, 0, $0,
+                                       socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                }
+                var buf = [UInt8](repeating: 0, count: 64)
+                var from = sockaddr_in()
+                var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let n = withUnsafeMutablePointer(to: &from) { fromPtr in
+                    fromPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        recvfrom(fd, &buf, buf.count, 0, $0, &fromLen)
+                    }
+                }
+                if n >= 6, buf[0] == 0x06 {
+                    var cStr = [CChar](repeating: 0, count: 16)
+                    inet_ntop(AF_INET, &from.sin_addr, &cStr, socklen_t(16))
+                    let hostIp = String(cString: cStr)
+                    DispatchQueue.main.async { [weak self] in self?.onUsbHostFound?(hostIp) }
+                    return
+                }
+            }
+        }
+    }
+}
