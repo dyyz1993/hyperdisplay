@@ -92,22 +92,16 @@ final class CursorOverlayView: UIView {
         layoutStreamMapping()
     }
 
-    /// 本机原生档的流尺寸（AppModel.videoRegionPixels）：光标物理大小的基准。
-    /// macOS 在低分辨率虚拟屏上会把光标位图按比例放大（720 宽的特大档约 ×1.63），
-    /// 若 1:1 直显，档位越低光标越大。任何档位下都按 streamSize/原生档 反向
-    /// 补偿，保持用户在原生档认可的物理大小。
-    private var nativeStreamWidth: CGFloat = 0
+    /// 光标是桌面的一部分：必须随视频同倍缩放（屏幕物理 px / 流 px）。
+    /// 原生档 ≈1.0（用户认可的自然大小）；特大档视频放大 ~1.63×，光标同步
+    /// 放大才与桌面内容成比例——恒定物理大小会在放大桌面上显得比例失调
+    /// （2026-08-29 用户"看起来很怪"的来源）。位图 28x40 各档同尺寸（host 实测）。
     private var cursorScaleFactor: CGFloat = 1
 
-    func setNativeStreamSize(w: Int, h: Int) {
-        nativeStreamWidth = CGFloat(max(1, w))
-        recomputeCursorScale()
-    }
-
     private func recomputeCursorScale() {
-        // 档位补偿已删（2026-08-29 host 实测位图 28x40 各档同尺寸）：
-        // 曾以为 macOS 在低分屏放大位图，实为兜底箭头过大造成的误判。
-        cursorScaleFactor = 1
+        guard streamSize.width > 0, bounds.width > 0 else { return }
+        let videoScale = bounds.width * UIScreen.main.scale / streamSize.width
+        cursorScaleFactor = min(2.0, max(0.5, videoScale))
     }
 
     private func layoutStreamMapping() {
@@ -122,6 +116,7 @@ final class CursorOverlayView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        recomputeCursorScale()
         layoutStreamMapping()
     }
 

@@ -976,9 +976,6 @@ extension AppModel: HostSessionListener {
         cursorOverlayRefs.append((pipeline.displayId, WeakRef(cursor)))
         // 系统光标位图到达前先给一个可辨认的本地箭头兜底
         cursor.useFallbackArrow()
-        // 原生档流尺寸 = 光标物理大小基准（档位补偿，见 CursorOverlayView）
-        let native = Self.videoRegionPixels()
-        cursor.setNativeStreamSize(w: native.width, h: native.height)
         cursor.setStreamSize(w: pipeline.width, h: pipeline.height)
         // 复用的旧 surface（旋转等）重新挂接后要一帧 IDR 立即点亮
         if pipeline.framesRendered > 0 {
