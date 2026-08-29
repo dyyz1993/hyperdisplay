@@ -166,10 +166,17 @@ enum Wire {
     }
 
     /// 一帧 Annex-B 载荷切成 VIDEO_FRAG 报文序列
+    /// FEC 组大小：每 4 个数据分片一组 XOR 校验（两端一致，改动即破坏兼容）。
+    /// 曾用 8：小 P 帧（4-5 片）整帧一组，相邻突发丢 2 片即整帧报废
+    /// （2026-08-29 动画负载实测 incomplete delta）。
+    static let fecGroupSize = 4
+
     static func videoFrags(displayId: UInt16, frameId: UInt32, keyframe: Bool, payload: Data) -> [Data] {
         let fragCount = UInt16(ceil(Double(payload.count) / Double(fragPayloadSize)))
         var out = [Data]()
         out.reserveCapacity(Int(fragCount))
+        var chunks: [Data] = []
+        chunks.reserveCapacity(Int(fragCount))
         var offset = 0
         while offset < payload.count {
             let end = min(offset + fragPayloadSize, payload.count)
@@ -178,9 +185,71 @@ enum Wire {
             d.appendLE(UInt16(out.count))
             d.appendLE(fragCount)
             d.appendLE(UInt8(keyframe ? 1 : 0))
-            d.append(payload.subdata(in: offset..<end))
+            let chunk = payload.subdata(in: offset..<end)
+            d.append(chunk)
+            chunks.append(chunk)
             out.append(d)
             offset = end
+        }
+        let parities = parityFragments(displayId: displayId, frameId: frameId,
+                                        keyframe: keyframe, dataCount: Int(fragCount),
+                                        chunks: chunks)
+        out.append(contentsOf: parities)
+        return interleaveForBurstLoss(out, dataCount: Int(fragCount))
+    }
+
+    /// 组间轮转交织（抗相邻突发丢包）：WiFi 突发丢的是**相邻 UDP 包**。原始
+    /// 顺序（组 0 全员、组 1 全员…）下一次突发全落同组，一组只能救 1 片。
+    /// 轮转后相邻包分属不同组，同样突发每组最多丢 1 片，XOR 全部可恢复。
+    /// 接收端（iOS/安卓组装器）按显式索引重组，与本顺序无关。
+    private static func interleaveForBurstLoss(_ packets: [Data], dataCount: Int) -> [Data] {
+        let g = fecGroupSize
+        let groups = (dataCount + g - 1) / g
+        guard groups > 1 else { return packets }
+        var out: [Data] = []
+        out.reserveCapacity(packets.count)
+        for slot in 0...g {
+            for grp in 0..<groups {
+                let i = grp * g + slot
+                if slot < g, i < dataCount { out.append(packets[i]) }
+                if slot == g, grp < packets.count - dataCount {
+                    out.append(packets[dataCount + grp])   // 该组校验片
+                }
+            }
+        }
+        return out
+    }
+
+    /// 组内任丢 1 片可就地恢复，帧不再因单片丢失整帧报废（省电 WiFi 弃帧→IDR
+    /// 请求循环的根治，2026-08-29）。校验片 fragIdx = dataCount + groupIndex
+    /// （≥ fragCount：老客户端走 fragIdx 越界安全丢弃，新客户端按校验解析）。
+    /// 校验 payload = [XOR（成员补零到组内最长）][u8 成员数][成员真实长度 u16×N]
+    /// ——恢复后按真实长度截断，零填充留在流中间会破坏跨分片 NAL 边界。
+    /// 开销 ~12.5% 带宽，§7.5"带宽不稀缺、画质优先"的正当花法。
+    private static func parityFragments(displayId: UInt16, frameId: UInt32, keyframe: Bool,
+                                        dataCount: Int, chunks: [Data]) -> [Data] {
+        guard dataCount > 1 else { return [] }
+        let groupSize = fecGroupSize
+        var out: [Data] = []
+        for g in 0..<(dataCount + groupSize - 1) / groupSize {
+            let start = g * groupSize
+            let end = min(start + groupSize, dataCount)
+            var maxLen = 0
+            for i in start..<end { maxLen = max(maxLen, chunks[i].count) }
+            var xor = [UInt8](repeating: 0, count: maxLen)
+            for i in start..<end {
+                let c = [UInt8](chunks[i])
+                for (j, b) in c.enumerated() { xor[j] ^= b }
+            }
+            var d = Data(header(.videoFrag, seq: frameId))
+            d.appendLE(displayId)
+            d.appendLE(UInt16(dataCount + g))   // 校验片索引 = dataCount + 组号
+            d.appendLE(UInt16(dataCount))       // fragCount 仍是数据片数（老客户端兼容）
+            d.appendLE(UInt8(keyframe ? 1 : 0))
+            d.append(contentsOf: xor)
+            d.appendLE(UInt8(end - start))      // 成员数
+            for i in start..<end { d.appendLE(UInt16(chunks[i].count)) }  // 真实长度表
+            out.append(d)
         }
         return out
     }

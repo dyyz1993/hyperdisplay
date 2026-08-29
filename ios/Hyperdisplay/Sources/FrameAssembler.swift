@@ -47,6 +47,11 @@ final class FrameAssembler {
     private var fragments: [Data?] = []
     private var deliveredCurrent = false
     private var lastFragmentAtMs = UInt64(0)
+    /// FEC 校验片（组号 → XOR 与成员真实长度表）。与 host Protocol.fecGroupSize
+    /// 严格一致；组内任丢 1 片可恢复，帧不再因单片丢失整帧报废（2026-08-29）。
+    private struct ParityInfo { var xor: [UInt8]; var lengths: [Int] }
+    private var parityFragments: [Int: ParityInfo] = [:]
+    static let fecGroupSize = 4   // 与 host Protocol.fecGroupSize 严格一致（曾 8→4：小帧抗突发）
     private var waitingForKeyframe = true   // 仅用于会话最初：第一帧必须是 IDR
     private var everGotKeyframe = false
     private var lastKeyframeRequestAtMs = UInt64(0)
@@ -76,6 +81,7 @@ final class FrameAssembler {
         lastDeliveredFrameId = -1
         currentFrameId = -1
         fragments = []
+        parityFragments = [:]
         waitingForKeyframe = true
         everGotKeyframe = false
     }
@@ -138,6 +144,7 @@ final class FrameAssembler {
             currentKeyframe = keyframe
             deliveredCurrent = false
             fragments = Array<Data?>(repeating: nil, count: fragCount)
+            parityFragments = [:]
         }
 
         guard fragIdx < fragments.count else { return actions }
@@ -145,23 +152,107 @@ final class FrameAssembler {
         if fragments[fragIdx] == nil { fragments[fragIdx] = payload }
 
         if isComplete() {
-            var out = Data()
-            out.reserveCapacity(fragments.reduce(0) { $0 + ($1?.count ?? 0) })
-            for frag in fragments where frag != nil { out.append(frag!) }
-            fragments = []
-            deliveredCurrent = true
-            lastDeliveredFrameId = frameId
-            if waitingForKeyframe {
-                if !keyframe {
-                    return actions // 会话最初：解码器还没有任何参考帧，必须等 IDR
-                }
-                everGotKeyframe = true
-                waitingForKeyframe = false
-            }
-            if keyframe { waitingForKeyframe = false }
-            actions.deliver = (frameId, keyframe, out)
+            return finishCompleteFrame(keyframe: keyframe)
         }
         return actions
+    }
+
+    /// 帧已集齐（含校验恢复后）：拼接投递，处理会话最初的 IDR 门控
+    private func finishCompleteFrame(keyframe: Bool) -> Actions {
+        var actions = Actions()
+        var out = Data()
+        out.reserveCapacity(fragments.reduce(0) { $0 + ($1?.count ?? 0) })
+        for frag in fragments where frag != nil { out.append(frag!) }
+        fragments = []
+        parityFragments = [:]
+        deliveredCurrent = true
+        lastDeliveredFrameId = currentFrameId
+        if waitingForKeyframe {
+            if !keyframe {
+                return actions // 会话最初：解码器还没有任何参考帧，必须等 IDR
+            }
+            everGotKeyframe = true
+            waitingForKeyframe = false
+        }
+        if keyframe { waitingForKeyframe = false }
+        actions.deliver = (currentFrameId, keyframe, out)
+        return actions
+    }
+
+    /// 校验片入口（fragIdx ≥ fragCount 的分片由 AppModel 路由到此）。
+    /// 校验 payload = [XOR（补零到组内最长）][u8 成员数][u16 真实长度×N]。
+    func onParityFragment(frameId: Int64, group: Int, payload: Data, nowMs now: UInt64? = nil) {
+        perform(computeParityStep(frameId: frameId, group: group, payload: payload))
+    }
+
+    private func computeParityStep(frameId: Int64, group: Int, payload: Data) -> Actions {
+        var actions = Actions()
+        lock.lock()
+        defer { lock.unlock() }
+        // 校验片紧随同帧数据片（同一 FIFO 顺序），帧未切换且未投递才有意义
+        guard frameId == currentFrameId, !deliveredCurrent, !fragments.isEmpty else {
+            return actions  // 帧已完整/已切换：校验片无事可做，静默丢弃（健康路径每帧都走，不可打日志）
+        }
+        if parityFragments[group] == nil {
+            // 布局 [XOR][u8 成员数 n][u16 真实长度 × n]：n 在 XOR 之后而非包尾
+            // （曾误读 bytes.last=长度表高位字节=0 导致守卫失败、校验片被丢——
+            // harness 复现定位）。成员数由组几何推算，n 字节做一致性校验。
+            let bytes = [UInt8](payload)
+            let start = group * Self.fecGroupSize
+            let memberCount = min(Self.fecGroupSize, fragments.count - start)
+            guard memberCount > 0, bytes.count > 2 * memberCount + 1,
+                  bytes[bytes.count - 2 * memberCount - 1] == memberCount else { return actions }
+            let xorEnd = bytes.count - 2 * memberCount - 1
+            var lengths = [Int]()
+            lengths.reserveCapacity(memberCount)
+            for k in 0..<memberCount {
+                lengths.append(Int(bytes[xorEnd + 1 + 2 * k]) | (Int(bytes[xorEnd + 2 + 2 * k]) << 8))
+            }
+            parityFragments[group] = ParityInfo(xor: Array(bytes[0..<xorEnd]), lengths: lengths)
+        }
+        let missingBefore = fragments.filter { $0 == nil }.count
+        if !isComplete() { recoverFromParity() }
+        let missingAfter = fragments.filter { $0 == nil }.count
+        if isComplete() {
+            actions = finishCompleteFrame(keyframe: currentKeyframe)
+            Self.fecDiag("parity g=\(group) recovered \(missingBefore - missingAfter) frag(s); frame delivered")
+        } else if missingBefore != missingAfter {
+            Self.fecDiag("parity g=\(group) recovered \(missingBefore - missingAfter) frag(s); still missing \(missingAfter)")
+        }
+        return actions
+    }
+
+    private static func fecDiag(_ msg: String) {
+        // 诊断走 os.Logger（VideoPipeline 的 debugLog 不在此作用域）
+        FECLogger.shared.log("\(msg, privacy: .public)")
+    }
+
+    /// 组内恰好丢 1 片且校验片在场 → XOR 就地恢复。恢复长度按真实长度表截断：
+    /// 零填充留在流中间会破坏跨分片 NAL 边界（尾随零在帧尾无害，但恢复的是
+    /// 中间片时必须精确）。
+    private func recoverFromParity() {
+        guard !parityFragments.isEmpty else { return }
+        let missing = fragments.indices.filter { fragments[$0] == nil }
+        guard !missing.isEmpty else { return }
+        for m in missing {
+            let g = m / Self.fecGroupSize
+            guard let parity = parityFragments[g] else { continue }
+            let start = g * Self.fecGroupSize
+            let end = min(start + Self.fecGroupSize, fragments.count)
+            var missingCount = 0
+            for i in start..<end where fragments[i] == nil { missingCount += 1 }
+            guard missingCount == 1 else { continue }  // XOR 一组只能救一片
+            var acc = parity.xor
+            for i in start..<end where i != m {
+                guard let d = fragments[i] else { continue }
+                let bytes = [UInt8](d)
+                for (j, b) in bytes.enumerated() where j < acc.count { acc[j] ^= b }
+            }
+            let memberIndex = m - start
+            guard memberIndex < parity.lengths.count else { continue }
+            let len = min(parity.lengths[memberIndex], acc.count)
+            fragments[m] = Data(acc.prefix(len))
+        }
     }
 
     private func computeStallCheck(now: UInt64) -> Actions {
@@ -190,6 +281,7 @@ final class FrameAssembler {
             }
             currentFrameId = -1
             fragments = []
+            parityFragments = [:]
             if !everGotKeyframe { waitingForKeyframe = true }
             noteKeyframeRequest(into: &actions, reason: "stall \(idle)ms", now: now)
         }
@@ -249,4 +341,10 @@ final class FrameAssembler {
             callbacks.onFrame(deliver.id, deliver.keyframe, deliver.data)
         }
     }
+}
+
+
+import os.log
+enum FECLogger {
+    static let shared = Logger(subsystem: "com.hyperdisplay.session", category: "fec")
 }

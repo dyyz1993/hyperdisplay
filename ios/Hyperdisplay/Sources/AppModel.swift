@@ -681,10 +681,15 @@ extension AppModel: HostSessionListener {
                                  didReceiveVideoFragment displayId: UInt32,
                                  frameId: Int64, fragIdx: Int, fragCount: Int,
                                  keyframe: Bool, payload: Data) {
-        // sessionQueue 上下文：锁内查表后直达管线串行队列，全程不碰主线程
+        // sessionQueue 上下文：锁内查表后直达管线串行队列，全程不碰主线程。
+        // fragIdx ≥ fragCount = FEC 校验片（host 在数据片后追加；老语义走安全丢弃）
         guard let pipeline = registry.pipeline(displayId) else { return }
-        pipeline.handleFragment(frameId: frameId, fragIdx: fragIdx, fragCount: fragCount,
-                                keyframe: keyframe, payload: payload)
+        if fragIdx >= fragCount {
+            pipeline.handleParity(frameId: frameId, group: fragIdx - fragCount, payload: payload)
+        } else {
+            pipeline.handleFragment(frameId: frameId, fragIdx: fragIdx, fragCount: fragCount,
+                                    keyframe: keyframe, payload: payload)
+        }
     }
 
     nonisolated func hostSession(_ session: HostSession,

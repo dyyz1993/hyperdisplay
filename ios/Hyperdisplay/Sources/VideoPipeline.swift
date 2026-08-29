@@ -85,6 +85,13 @@ final class VideoPipeline {
         }
     }
 
+    /// FEC 校验片（fragIdx ≥ fragCount）：组装器就地恢复组内丢失的分片
+    func handleParity(frameId: Int64, group: Int, payload: Data) {
+        stateQueue.async {
+            self.assembler.onParityFragment(frameId: frameId, group: group, payload: payload)
+        }
+    }
+
     /// 停滞检测（stallTick 每 200ms 驱动）
     func heartbeat() {
         stateQueue.async { self.assembler.stallCheck() }

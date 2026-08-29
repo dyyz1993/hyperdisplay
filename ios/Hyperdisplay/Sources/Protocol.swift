@@ -297,7 +297,11 @@ enum HostWire {
             // [displayId u16][fragIdx u16][fragCount u16][flags u8][payload]
             guard bytes.count > 12 else { return nil }
             let idx = readU16(bytes, 2), count = readU16(bytes, 4)
-            guard idx < count && count < 4096 else { return nil }
+            // idx ≥ count = FEC 校验片（组号 = idx - count，见 FrameAssembler）。
+            // 曾在此处 `idx < count` 一刀切，校验片进不了路由层——FEC 全链路
+            // 静默失效（2026-08-29 动画负载实测定位）。上界：数据片 4096，
+            // 校验组号 ≤ 数据片/8 = 512。
+            guard count < 4096, idx < count + 512 else { return nil }
             let payload = Data(bytes[12..<bytes.count])
             return .videoFragment(displayId: readU16(bytes, 0), frameId: headerSeq(bytes),
                                   fragIdx: idx, fragCount: count,

@@ -133,10 +133,18 @@ final class ProtocolTests: XCTestCase {
         XCTAssertTrue(keyframe)
         XCTAssertEqual(payload, Data([0xAB, 0xCD]))
 
-        // idx >= count → 拒绝
-        out[5 + 2] = 2
+        // idx ≥ count = FEC 校验片（组号 = idx - count），合法但须在组数上界内。
+        // idx 低字节 @7、高字节 @8（5B 头 + displayId u16 之后）
+        out[7] = 2   // idx=2, count=2 → 校验组 0
+        guard case .some(.videoFragment(let d2, let f2, let i2, let c2, _, _)) = HostWire.parse(Data(out)) else {
+            XCTFail("parity fragment should parse"); return
+        }
+        XCTAssertEqual(i2, 2); XCTAssertEqual(c2, 2)
+        XCTAssertEqual(d2, displayId); XCTAssertEqual(f2, frameId)
+        // 校验组号超上界（≥ count+512）→ 拒绝：idx 高字节置 0x08 → 2050
+        out[8] = 0x08
         if case .some(.videoFragment) = HostWire.parse(Data(out)) {
-            XCTFail("idx>=count should be rejected")
+            XCTFail("parity group beyond bound should be rejected")
         }
     }
 
