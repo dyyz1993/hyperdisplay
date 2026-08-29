@@ -106,7 +106,11 @@ final class CursorOverlayView: UIView {
 
     private func recomputeCursorScale() {
         guard streamSize.width > 0, nativeStreamWidth > 0 else { return }
-        cursorScaleFactor = min(2.0, max(0.4, streamSize.width / nativeStreamWidth))
+        // 几何插值（sqrt）：线性补偿（720/1168=0.617）实测过冲成"很小"，
+        // ×1 又"有点大"——取两端反馈的几何中点 ≈0.785。host 侧已加位图尺寸
+        // 日志，拿到真实档位位图比后替换为精确值。
+        let ratio = streamSize.width / nativeStreamWidth
+        cursorScaleFactor = min(1.5, max(0.5, ratio.squareRoot()))
     }
 
     private func layoutStreamMapping() {
@@ -154,6 +158,7 @@ final class CursorOverlayView: UIView {
     /// 速度把目标前推一小段（约 2-3 帧），把链路延迟抵消掉；包流一断（>50ms 无
     /// 新包）立即放弃外推——鼠标停下最多多冲一小段、2-3 帧内收回，不会画蛇添足。
     private var velX: CGFloat = 0, velY: CGFloat = 0          // 平滑速度（pt/s，视图坐标）
+    private var instVx: CGFloat = 0, instVy: CGFloat = 0    // 最近一包瞬时速度（减速感知）
     private var prevTargetX: CGFloat = 0, prevTargetY: CGFloat = 0
     private var prevTargetAtMs: UInt64 = 0
     private var lastPacketAtMs: UInt64 = 0
@@ -174,10 +179,11 @@ final class CursorOverlayView: UIView {
         // 窗口太短噪声大、太长速度已变；两次正常 60Hz 包间隔 16ms 左右
         guard dtMs >= 4, dtMs <= 120 else {
             velX = 0; velY = 0
+            instVx = 0; instVy = 0
             return
         }
-        let instVx = (newX - prevTargetX) * 1000 / CGFloat(dtMs)
-        let instVy = (newY - prevTargetY) * 1000 / CGFloat(dtMs)
+        instVx = (newX - prevTargetX) * 1000 / CGFloat(dtMs)
+        instVy = (newY - prevTargetY) * 1000 / CGFloat(dtMs)
         velX = velX * 0.55 + instVx * 0.45
         velY = velY * 0.55 + instVy * 0.45
     }
@@ -185,21 +191,32 @@ final class CursorOverlayView: UIView {
     /// 当前应追赶的目标：包流新鲜且速度显著时 = 真实目标 + 速度 × 前导时间 × 淡出系数。
     /// 前导量淡出（不瞬间归零）：鼠标停下后 ~150ms 平滑收回——实测瞬收会在定位时
     /// 表现为"往后抽一下"，淡出把它变成不可察觉的滑动归位。
-    private var leadFade: CGFloat = 1
+    private var leadFade: CGFloat = 0
 
+    /// 当前应追赶的目标。语义（2026-08-29 用户定稿："补偿到我停住的动作"）：
+    /// - 前导只属于快速移动段（>250pt/s）；瞄准/收尾速度段零前导、纯追赶，
+    ///   永不越过真实目标——停住就不会往回抽；
+    /// - 减速钳制：前导量按 min(平滑速度, 瞬时速度) 收缩。人停鼠标前必先减速
+    ///   （Fitts 律），减速过程中前导已同步收敛，到达终点时残余极小；
+    /// - 前导系数淡入淡出，避免速度阈值边界闪烁。
     private func leadTarget(nowMs now: UInt64) -> (x: CGFloat, y: CGFloat) {
         let fresh = lastPacketAtMs > 0 && (now &- lastPacketAtMs) < 50
-        if fresh {
-            leadFade = min(1, leadFade + 0.5)   // 移动中立即全量外推
+        let smoothedSpeed2 = velX * velX + velY * velY
+        let eligible = smoothedSpeed2 > 250 * 250   // <250pt/s = 精定位段，不补偿
+        if fresh && eligible {
+            leadFade = min(1, leadFade + 0.4)
         } else {
-            leadFade = max(0, leadFade - 0.1)   // 停住后 ~8 帧（≈130ms）平滑收回
+            leadFade = max(0, leadFade - 0.15)      // 减速/断流即收敛（~7 帧）
         }
-        let speed2 = velX * velX + velY * velY
-        guard leadFade > 0.01, speed2 > 900 else { return (targetX, targetY) }  // <30pt/s 视为静止
-        let leadSeconds: CGFloat = 0.04
-        let maxLead: CGFloat = 20 * leadFade    // 停止过程中前导上限同步收小
-        var lx = targetX + velX * leadSeconds * leadFade
-        var ly = targetY + velY * leadSeconds * leadFade
+        guard leadFade > 0.01 else { return (targetX, targetY) }
+        let smoothedSpeed = smoothedSpeed2.squareRoot()
+        let instSpeed = (instVx * instVx + instVy * instVy).squareRoot()
+        // 减速时瞬时速度 < 平滑速度 → 前导立即按比例收缩
+        let decelClamp = smoothedSpeed > 1 ? min(1, instSpeed / smoothedSpeed) : 0
+        let lead: CGFloat = 0.04 * leadFade * decelClamp
+        var lx = targetX + velX * lead
+        var ly = targetY + velY * lead
+        let maxLead: CGFloat = 20 * leadFade * decelClamp
         let dx = lx - targetX, dy = ly - targetY
         let dist = (dx * dx + dy * dy).squareRoot()
         if dist > maxLead {
@@ -357,6 +374,7 @@ final class CursorOverlayView: UIView {
         } else {
             cx = targetX; cy = targetY
             velX = 0; velY = 0
+            instVx = 0; instVy = 0
             displayLink?.invalidate()
             displayLink = nil
         }

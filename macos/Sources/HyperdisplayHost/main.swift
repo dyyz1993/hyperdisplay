@@ -2198,6 +2198,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
         let imageId = nextCursorImageId
         nextCursorImageId &+= 1
+        NSLog("[hyperdisplay] cursor image \(imageId): \(width)x\(height) hot=\(hotX),\(hotY)")
         let packets = Wire.cursorImage(imageId: imageId, width: width, height: height,
                                        hotX: hotX, hotY: hotY, pixels: pixels)
         guard !packets.isEmpty else { return }
