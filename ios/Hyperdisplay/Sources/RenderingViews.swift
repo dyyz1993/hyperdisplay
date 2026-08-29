@@ -105,12 +105,9 @@ final class CursorOverlayView: UIView {
     }
 
     private func recomputeCursorScale() {
-        guard streamSize.width > 0, nativeStreamWidth > 0 else { return }
-        // 几何插值（sqrt）：线性补偿（720/1168=0.617）实测过冲成"很小"，
-        // ×1 又"有点大"——取两端反馈的几何中点 ≈0.785。host 侧已加位图尺寸
-        // 日志，拿到真实档位位图比后替换为精确值。
-        let ratio = streamSize.width / nativeStreamWidth
-        cursorScaleFactor = min(1.5, max(0.5, ratio.squareRoot()))
+        // 档位补偿已删（2026-08-29 host 实测位图 28x40 各档同尺寸）：
+        // 曾以为 macOS 在低分屏放大位图，实为兜底箭头过大造成的误判。
+        cursorScaleFactor = 1
     }
 
     private func layoutStreamMapping() {
@@ -225,7 +222,9 @@ final class CursorOverlayView: UIView {
         CGPoint(x: 10.0, y: 27.3), CGPoint(x: 13.5, y: 25.8), CGPoint(x: 9.5, y: 16.7),
         CGPoint(x: 16.4, y: 16.4),
     ]
-    private static let arrowScale: CGFloat = 1.45
+    // 兜底箭头对齐系统位图的自然大小（28x40px）：旧值 1.45 画出来有位图 ~3 倍大，
+    // 位图未到达的窗口期会被误判为"光标偏大"。~0.5 使箭头 ≈14pt≈位图 2x 屏逻辑高度。
+    private static let arrowScale: CGFloat = 0.5
 
     func useFallbackArrow() {
         layer.sublayers?.removeAll()
