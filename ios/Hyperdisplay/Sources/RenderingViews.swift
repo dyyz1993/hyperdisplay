@@ -141,7 +141,6 @@ final class CursorOverlayView: UIView {
         if mode == nil { useFallbackArrow() }
         targetX = p.x
         targetY = p.y
-        updateVelocity(newX: p.x, newY: p.y)
         if !hasPosition {
             // 首包必须立即出现，不能为了平滑从左上角飞入
             cx = p.x; cy = p.y
@@ -149,81 +148,6 @@ final class CursorOverlayView: UIView {
         }
         visible = true
         requestAnimationTick()
-    }
-
-    // MARK: 速度外推（对照 RDP/Parsec 的指针预测）
-
-    /// 远程光标天生背 40-90ms 端到端延迟；Wi-Fi 省电抖动（实测 ping 20ms 均值/
-    /// 62ms 尖峰）让包一阵一阵到达，纯插值只能抹台阶、抹不掉延迟。移动稳定时按
-    /// 速度把目标前推一小段（约 2-3 帧），把链路延迟抵消掉；包流一断（>50ms 无
-    /// 新包）立即放弃外推——鼠标停下最多多冲一小段、2-3 帧内收回，不会画蛇添足。
-    private var velX: CGFloat = 0, velY: CGFloat = 0          // 平滑速度（pt/s，视图坐标）
-    private var instVx: CGFloat = 0, instVy: CGFloat = 0    // 最近一包瞬时速度（减速感知）
-    private var prevTargetX: CGFloat = 0, prevTargetY: CGFloat = 0
-    private var prevTargetAtMs: UInt64 = 0
-    private var lastPacketAtMs: UInt64 = 0
-
-    private static func nowMs() -> UInt64 {
-        DispatchTime.now().uptimeNanoseconds / 1_000_000
-    }
-
-    private func updateVelocity(newX: CGFloat, newY: CGFloat) {
-        let now = Self.nowMs()
-        defer {
-            prevTargetX = newX; prevTargetY = newY
-            prevTargetAtMs = now
-            lastPacketAtMs = now
-        }
-        guard prevTargetAtMs > 0 else { return }
-        let dtMs = now &- prevTargetAtMs
-        // 窗口太短噪声大、太长速度已变；两次正常 60Hz 包间隔 16ms 左右
-        guard dtMs >= 4, dtMs <= 120 else {
-            velX = 0; velY = 0
-            instVx = 0; instVy = 0
-            return
-        }
-        instVx = (newX - prevTargetX) * 1000 / CGFloat(dtMs)
-        instVy = (newY - prevTargetY) * 1000 / CGFloat(dtMs)
-        velX = velX * 0.55 + instVx * 0.45
-        velY = velY * 0.55 + instVy * 0.45
-    }
-
-    /// 当前应追赶的目标：包流新鲜且速度显著时 = 真实目标 + 速度 × 前导时间 × 淡出系数。
-    /// 前导量淡出（不瞬间归零）：鼠标停下后 ~150ms 平滑收回——实测瞬收会在定位时
-    /// 表现为"往后抽一下"，淡出把它变成不可察觉的滑动归位。
-    private var leadFade: CGFloat = 0
-
-    /// 当前应追赶的目标。语义（2026-08-29 用户定稿："补偿到我停住的动作"）：
-    /// - 前导只属于快速移动段（>250pt/s）；瞄准/收尾速度段零前导、纯追赶，
-    ///   永不越过真实目标——停住就不会往回抽；
-    /// - 减速钳制：前导量按 min(平滑速度, 瞬时速度) 收缩。人停鼠标前必先减速
-    ///   （Fitts 律），减速过程中前导已同步收敛，到达终点时残余极小；
-    /// - 前导系数淡入淡出，避免速度阈值边界闪烁。
-    private func leadTarget(nowMs now: UInt64) -> (x: CGFloat, y: CGFloat) {
-        let fresh = lastPacketAtMs > 0 && (now &- lastPacketAtMs) < 50
-        let smoothedSpeed2 = velX * velX + velY * velY
-        let eligible = smoothedSpeed2 > 250 * 250   // <250pt/s = 精定位段，不补偿
-        if fresh && eligible {
-            leadFade = min(1, leadFade + 0.4)
-        } else {
-            leadFade = max(0, leadFade - 0.15)      // 减速/断流即收敛（~7 帧）
-        }
-        guard leadFade > 0.01 else { return (targetX, targetY) }
-        let smoothedSpeed = smoothedSpeed2.squareRoot()
-        let instSpeed = (instVx * instVx + instVy * instVy).squareRoot()
-        // 减速时瞬时速度 < 平滑速度 → 前导立即按比例收缩
-        let decelClamp = smoothedSpeed > 1 ? min(1, instSpeed / smoothedSpeed) : 0
-        let lead: CGFloat = 0.04 * leadFade * decelClamp
-        var lx = targetX + velX * lead
-        var ly = targetY + velY * lead
-        let maxLead: CGFloat = 20 * leadFade * decelClamp
-        let dx = lx - targetX, dy = ly - targetY
-        let dist = (dx * dx + dy * dy).squareRoot()
-        if dist > maxLead {
-            lx = targetX + dx / dist * maxLead
-            ly = targetY + dy / dist * maxLead
-        }
-        return (lx, ly)
     }
 
     func hide() {
@@ -364,17 +288,16 @@ final class CursorOverlayView: UIView {
             return
         }
         setCursorAlpha(1)
-        // 追赶点 = 速度外推目标（移动中前导 ~2-3 帧，停住/断流立即回落真实目标）
-        let lead = leadTarget(nowMs: Self.nowMs())
-        let dx = lead.x - cx, dy = lead.y - cy
+        // 纯追赶真实目标（对照安卓 LocalCursorView，2026-08-29 用户定稿）：
+        // 绝不越过真实位置、绝不住后拉、绝不漂移。外推实验（前导/淡出/减速钳制）
+        // 全部废弃——WiFi 包突发到达污染速度估计，前导量乱跳表现为光标"飘"。
+        let dx = targetX - cx, dy = targetY - cy
         if dx * dx + dy * dy > 0.25 {
             // 一帧内追上大部分误差：视觉连续、滞后不到一帧；目标未到继续下一次 VSync
             cx += dx * 0.8
             cy += dy * 0.8
         } else {
             cx = targetX; cy = targetY
-            velX = 0; velY = 0
-            instVx = 0; instVy = 0
             displayLink?.invalidate()
             displayLink = nil
         }
