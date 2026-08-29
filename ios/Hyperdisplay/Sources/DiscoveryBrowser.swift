@@ -332,6 +332,8 @@ final class DiscoveryBrowser {
 /// Mac 拿同网段地址。本机出现 172.20.10.x 即 USB 链路活着（5s 轮询接口表，
 /// getifaddrs 开销可忽略）；链路出现时探测 .2-.14 找 host（PING→PONG），
 /// 找到即回调升级；链路消失回调降级。全程无用户输入（零点击基线）。
+private let usbWatchLog = Logger(subsystem: "com.hyperdisplay.session", category: "usbwatch")
+
 final class UsbLinkWatcher {
 
     var onUsbHostFound: ((String) -> Void)?
@@ -357,7 +359,9 @@ final class UsbLinkWatcher {
     }
 
     private func tick() {
-        let linkUp = Self.usbHotspotAddress() != nil
+        let link = Self.usbHotspotAddress()
+        usbWatchLog.log("tick: usb=\(link?.name ?? "none", privacy: .public)(\(link?.ip ?? "-", privacy: .public)) ifs[\(Self.allInterfaceIPv4s(), privacy: .public)]")
+        let linkUp = link != nil
         if linkUp, !usbActive {
             usbActive = true
             probeHost()
@@ -367,8 +371,10 @@ final class UsbLinkWatcher {
         }
     }
 
-    /// bridge* 接口上的 172.20.10.x（iPhone 热点 USB 桥接口）
-    static func usbHotspotAddress() -> String? {
+    /// 本机任何接口上的 172.20.10.x（iPhone 热点网段，仅热点场景出现）。
+    /// 不限定接口名：bridge* 是 Mac 的命名惯例，iOS 上热点主机接口名未证实，
+    /// 按网段判断 + tick 日志打出真实接口名，一次到位。
+    static func usbHotspotAddress() -> (name: String, ip: String)? {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0 else { return nil }
         defer { freeifaddrs(ifaddr) }
@@ -377,18 +383,38 @@ final class UsbLinkWatcher {
             let ifa = p.pointee
             if let sa = ifa.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) {
                 let name = String(cString: ifa.ifa_name)
-                if name.hasPrefix("bridge") {
-                    var addr = sockaddr_in()
-                    memcpy(&addr, sa, MemoryLayout<sockaddr_in>.size)
-                    var cStr = [CChar](repeating: 0, count: 16)
-                    inet_ntop(AF_INET, &addr.sin_addr, &cStr, socklen_t(16))
-                    let ip = String(cString: cStr)
-                    if ip.hasPrefix("172.20.10.") { return ip }
-                }
+                var addr = sockaddr_in()
+                memcpy(&addr, sa, MemoryLayout<sockaddr_in>.size)
+                var cStr = [CChar](repeating: 0, count: 16)
+                inet_ntop(AF_INET, &addr.sin_addr, &cStr, socklen_t(16))
+                let ip = String(cString: cStr)
+                if ip.hasPrefix("172.20.10.") { return (name, ip) }
             }
             ptr = p.pointee.ifa_next
         }
         return nil
+    }
+
+    /// 诊断：本机全部 IPv4 接口快照（usb-watch tick 打印，真机 syslog 可见）
+    static func allInterfaceIPv4s() -> String {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0 else { return "getifaddrs failed" }
+        defer { freeifaddrs(ifaddr) }
+        var out: [String] = []
+        var ptr = ifaddr
+        while let p = ptr {
+            let ifa = p.pointee
+            if let sa = ifa.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) {
+                let name = String(cString: ifa.ifa_name)
+                var addr = sockaddr_in()
+                memcpy(&addr, sa, MemoryLayout<sockaddr_in>.size)
+                var cStr = [CChar](repeating: 0, count: 16)
+                inet_ntop(AF_INET, &addr.sin_addr, &cStr, socklen_t(16))
+                out.append("\(name)=\(String(cString: cStr))")
+            }
+            ptr = p.pointee.ifa_next
+        }
+        return out.joined(separator: " ")
     }
 
     /// 对 172.20.10.2..14 逐个 PING 等 PONG（host 对任何来源都回 PONG，应答方即 Mac）
