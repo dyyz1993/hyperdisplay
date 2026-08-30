@@ -643,15 +643,14 @@ final class DisplayStream {
 
     /// 同一平板订阅多块屏时由 Host 统一调用。此处不改虚拟屏、不重启采集/编码器，
     /// 因而不会引入 ColorSync churn；只把正在运行的 VideoToolbox 会话收敛到预算内。
-    /// 借用预算时同步抬高的运行时上限（只升不降到原始值以下）
-    private var borrowedCeiling: UInt32 = 0
-
     func setTransportTargetBitrate(_ value: UInt32) {
         // 借还实测卡点（2026-08-30）：qualityCeiling 是建屏时的像素份额上限，
         // 借来的预算若不抬高它，min(ceiling, value) 会把 49M 针死在 15M。
-        let effectiveCeiling = max(qualityCeiling, borrowedCeiling)
-        let next = max(bitrateFloor, min(effectiveCeiling, value))
-        borrowedCeiling = max(borrowedCeiling, value)
+        // ⚠️ 2026-08-30 实测回滚：抬高 ceiling 后 Quality 模式编出 1.4MB 巨型 IDR
+        // （48.9M 预算下编码器按预算上限出帧），USB 隧道瞬间过载→客户端整帧报废
+        // →「等待Mac」死等。借还只在原 ceiling 内提速（受 DataRateLimits 硬顶
+        // 约束的 IDR 才是可交付尺寸）；跨 ceiling 借用需要先解决 IDR 尺寸上限。
+        let next = max(bitrateFloor, min(qualityCeiling, value))
         guard next != targetBitrate else { return }
         targetBitrate = next
         if currentBitrate > next {
@@ -671,7 +670,7 @@ final class DisplayStream {
         lastCongestionAt = now
         goodWindows = 0
         guard currentBitrate > bitrateFloor else { return }
-        currentBitrate = max(bitrateFloor, currentBitrate * 2 / 3)
+        currentBitrate = max(bitrateFloor, UInt32(Double(currentBitrate) * 2.0 / 3.0))
         encoder?.applyBitrate(currentBitrate)
         NSLog("[hyperdisplay] quality: receiver congested -> \(currentBitrate/1000)kbps display=\(display.displayID)")
     }
@@ -697,7 +696,7 @@ final class DisplayStream {
             // 容差 5%：AIMD 的 6/5→5/6 微调或按像素预算重分会把 currentBitrate
             // 拉到目标的 ±几 %，严格 >= 会让"已满档"短路每轮失效 → 时钟动画
             // 每秒重新武装 → 8s 限频内反复开升级事务（副屏实测 8-9s 一次）。
-            if currentBitrate >= targetBitrate * 95 / 100 && !recoveryIdrSlimActive {
+            if Double(currentBitrate) >= Double(targetBitrate) * 0.95 && !recoveryIdrSlimActive {
                 refinementWasMoving = false
                 return
             }
@@ -815,7 +814,7 @@ final class DisplayStream {
                 // 稳定窗口的 ×6/5 会以旧基准叠过目标再落回，把升级值踩掉
                 // （副屏实测 15000↔14400 每 10s 互踩一次，upgrade 循环不断）。
                 if currentBitrate < targetBitrate {
-                    currentBitrate = min(targetBitrate, currentBitrate * 6 / 5)
+                    currentBitrate = min(targetBitrate, UInt32(Double(currentBitrate) * 1.2))
                     encoder?.applyBitrate(currentBitrate)
                     NSLog("[hyperdisplay] quality: stable, bitrate->\(currentBitrate/1000)kbps display=\(display.displayID)")
                 }
