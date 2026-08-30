@@ -638,6 +638,8 @@ final class DisplayStream {
 
     /// 恢复 IDR 正以瘦身码率编码；onFrame 见到下一张关键帧后恢复 currentBitrate
     private var recoveryIdrSlimActive = false
+    /// 上次二段满画质升级时刻（8s 限频，防时钟驱动的重编码风暴）
+    private var lastUpgradeAt = Date.distantPast
 
     /// 同一平板订阅多块屏时由 Host 统一调用。此处不改虚拟屏、不重启采集/编码器，
     /// 因而不会引入 ColorSync churn；只把正在运行的 VideoToolbox 会话收敛到预算内。
@@ -682,8 +684,22 @@ final class DisplayStream {
         if still < 0.3 {
             refinementWasMoving = true
         } else if still > 0.5 && refinementWasMoving {
+            // 已满档且无瘦身恢复在途：画质已到位，时钟等每秒微动画不值得再开
+            // 一轮锐化+升级事务（双屏实测每 8.5s 两屏各重刷一次）。这一拍直接
+            // 消费掉"待锐化"状态，下次真运动由 wireCapture 重新武装。
+            // 容差 5%：AIMD 的 6/5→5/6 微调或按像素预算重分会把 currentBitrate
+            // 拉到目标的 ±几 %，严格 >= 会让"已满档"短路每轮失效 → 时钟动画
+            // 每秒重新武装 → 8s 限频内反复开升级事务（副屏实测 8-9s 一次）。
+            if currentBitrate >= targetBitrate * 95 / 100 && !recoveryIdrSlimActive {
+                refinementWasMoving = false
+                return
+            }
             refinementWasMoving = false
-            motionBitrateActive = false // 下一次真实内容到来立刻重新进入运动档
+            // motionBitrateActive 不在此复位（2026-08-30 双屏实测循环）：
+            // 复位后时钟微动画每秒走 enterMotionBitrateIfNeeded → 6s 拥塞史
+            // 窗口内把码率压回 5-12M → 触发 upgrade → 锐化再复位 → 死循环。
+            // 运动档的解除只由 upgrade 事务接管（其内已置 true 锁定）；真运动
+            // 的码率档由 enterMotionBitrateIfNeeded 自身的 active 守卫覆盖。
             let sourceFrameAt = last
             NSLog("[hyperdisplay] refinement IDR for display \(display.displayID) (settled; bitrate \(currentBitrate/1000)k)")
             forceKeyframeAndReplay()
@@ -707,11 +723,25 @@ final class DisplayStream {
             // onFrame 的 recoveryIdrSlimActive 恢复路径会把它收回 currentBitrate。
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
                 guard let self, self.started else { return }
-                let still = self.lastContentFrameAt == nil || self.lastContentFrameAt == sourceFrameAt
-                guard still, Date().timeIntervalSince(self.lastCongestionAt) >= 3.5 else { return }
+                // 静止判定不能依赖 lastContentFrameAt：屏幕上的时钟/网速表每秒都
+                // 产生真实内容帧（双屏实测——任务栏时钟让静止判定永假，二段升级
+                // 从未触发）。改看链路本身：3.5s 无整帧拥塞即认为送得动满码率；
+                // 就算此刻仍在动，运动帧本就该用更高码率，升级无损。
+                guard Date().timeIntervalSince(self.lastCongestionAt) >= 3.5 else { return }
+                // 幂等 + 限频（双屏时钟实测风暴）：任务栏时钟每秒重新武装锐化，
+                // 上一版这里每秒重复"applyBitrate+强制 IDR"，150KB 大帧连环挤爆
+                // 发送队列，清晰画面永远等不到稳定帧。已满档就不动；否则 8s 一次。
+                guard currentBitrate < targetBitrate,
+                      Date().timeIntervalSince(lastUpgradeAt) >= 8.0 else { return }
+                lastUpgradeAt = Date()
                 NSLog("[hyperdisplay] refinement upgrade to full bitrate \(self.targetBitrate/1000)k display \(self.display.displayID)")
                 self.encoder?.applyBitrate(self.targetBitrate)
-                self.recoveryIdrSlimActive = true
+                self.recoveryIdrSlimActive = false   // 升级帧不是瘦身帧：onFrame 不得回写收敛码率（曾致升级→回写→再升级振荡）
+                // 同理锁住运动档：时钟微动画每秒走 wireCapture → enterMotion-
+                // BitrateIfNeeded 会把刚升的码率压回 5-12M 运动档（三方循环：
+                // upgrade→motion 压回→AIMD 回升→再 upgrade）。置 true 后该路径
+                // 短路；真正的用户运动本来就 in-motion，无损。
+                self.motionBitrateActive = true
                 self.encoder?.requestKeyframe()
                 self.capture?.replayLastFrame()
             }
@@ -763,6 +793,10 @@ final class DisplayStream {
             goodWindows += 1
             if goodWindows >= 4 { // 至少 8 秒未见整帧拥塞才小步回升，避免双屏运动时振荡。
                 goodWindows = 0
+                // 回升只发生在 AIMD 自己砍过的情况（current < target）。
+                // upgrade/refinement 事务把 currentBitrate 抬到 target 后，
+                // 稳定窗口的 ×6/5 会以旧基准叠过目标再落回，把升级值踩掉
+                // （副屏实测 15000↔14400 每 10s 互踩一次，upgrade 循环不断）。
                 if currentBitrate < targetBitrate {
                     currentBitrate = min(targetBitrate, currentBitrate * 6 / 5)
                     encoder?.applyBitrate(currentBitrate)
