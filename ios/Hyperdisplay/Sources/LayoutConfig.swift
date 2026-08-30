@@ -133,12 +133,17 @@ enum DisplayResolution {
         (max(width, height), min(width, height))
     }
 
-    /// Host 创建 CGVirtualDisplay 前的统一 16px 对齐规则
+    /// Host 创建 CGVirtualDisplay 前的统一 16px 对齐规则。
+    /// 下限钳制必须按原始比例补偿另一维：窄高分屏的侧屏按比例只有 ~432px 宽，
+    /// 被抬到 640 下限后若高度不同步放大，宽高比断裂 → aspect-fit 上下大黑边
+    /// （2026-08-30 平板左右分屏实测，与安卓 DisplayResolution.hostAligned 同修）。
     static func hostAligned(_ width: Int, _ height: Int) -> (Int, Int) {
-        func aligned(_ value: Int, _ minimum: Int) -> Int {
-            max((value + 15) & ~15, minimum)
-        }
-        return (aligned(width, 640), aligned(height, 480))
+        func align16(_ v: Int) -> Int { (v + 15) & ~15 }
+        var w = max(align16(width), 640)
+        var h = max(align16(height), 480)
+        if (1...639).contains(width) { h = max(h, align16(w * height / width)) }
+        if (1...479).contains(height) { w = max(w, align16(h * width / height)) }
+        return (w, h)
     }
 
     static func scale(_ width: Int, _ height: Int, deviceCanvasLongEdge: Int, longEdge: Int) -> (Int, Int) {
@@ -146,8 +151,7 @@ enum DisplayResolution {
         if normalized == native { return (width, height) }
         let source = max(deviceCanvasLongEdge, 1)
         let scale = Float(normalized) / Float(source)
-        func aligned(_ value: Int) -> Int { max((Int(Float(value) * scale) + 15) & ~15, 640) }
-        return (aligned(width), aligned(height))
+        return hostAligned(Int(Float(width) * scale), Int(Float(height) * scale))
     }
 }
 

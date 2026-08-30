@@ -37,5 +37,9 @@ class DisplayResolutionTest {
     fun hostAlignmentIsNotTreatedAsANewDisplayProfile() {
         assertEquals(1072 to 1088, DisplayResolution.hostAligned(1064, 1080))
         assertEquals(1072 to 1088, DisplayResolution.hostAligned(1066, 1080))
+        // 下限钳制不破坏比例（2026-08-30 分屏侧屏黑边根因修复）：
+        // 100x100 方形 → 宽抬 640，高按比例同抬 640；窄高侧屏 432x960 → 640x1424
+        assertEquals(640 to 640, DisplayResolution.hostAligned(100, 100))
+        assertEquals(640 to 1424, DisplayResolution.hostAligned(432, 960))
     }
 }

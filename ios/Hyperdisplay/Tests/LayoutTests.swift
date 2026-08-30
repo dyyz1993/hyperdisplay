@@ -27,9 +27,21 @@ final class LayoutTests: XCTestCase {
     func testHostAlignedFollows16pxRule() {
         XCTAssertEqual(DisplayResolution.hostAligned(1064, 1080).0, 1072)
         XCTAssertEqual(DisplayResolution.hostAligned(1064, 1080).1, 1088)
-        // 宽下限 640、高下限 480（对照 DisplayResolution.hostAligned）
+        // 下限钳制不破坏比例：100x100（方形）→ 宽抬到 640，高按比例同抬到 640
         XCTAssertEqual(DisplayResolution.hostAligned(100, 100).0, 640)
-        XCTAssertEqual(DisplayResolution.hostAligned(100, 100).1, 480)
+        XCTAssertEqual(DisplayResolution.hostAligned(100, 100).1, 640)
+    }
+
+    /// 分屏侧屏场景（2026-08-30 平板实测黑边根因）：窄高区域 ~432x960 按比例
+    /// 宽度触 640 下限——高度必须同步放大保持 0.45 比例，否则 aspect-fit 上下大黑边
+    func testHostAlignedNarrowSideRegionKeepsAspect() {
+        let (w, h) = DisplayResolution.hostAligned(432, 960)
+        XCTAssertEqual(w, 640)                       // 宽度抬到下限
+        XCTAssertEqual(h, 1424)                      // 640*960/432=1422 → align16 → 1424
+        // 比例漂移 ≤ 一个 16px 对齐档
+        let regionAspect = 432.0 / 960.0
+        let specAspect = Double(w) / Double(h)
+        XCTAssertLessThan(abs(specAspect - regionAspect), 0.02)
     }
 
     func testScaleKeepsNativeAndScalesLongEdge() {
