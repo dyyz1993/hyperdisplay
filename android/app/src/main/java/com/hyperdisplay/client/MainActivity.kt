@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.SystemClock
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -80,6 +81,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var switchingBannerDetail: TextView? = null
     /** 布局替换必须等整组新屏都至少渲染一帧，不能被仍在播放的旧屏提前取消动画。 */
     private var topologyTransitionInFlight = false
+    private var topologyTransitionSinceMs = 0L
     private var topologyTransitionOldIds = emptySet<Int>()
     private var topologyTransitionExpectedIds = emptySet<Int>()
     private val regionViews = mutableListOf<StreamView>()
@@ -273,13 +275,27 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             renderFps = total
             // 通道切换的任意首帧即可收起；布局替换则必须等完整新屏组都出过一帧，
             // 旧屏仍在播放时不能把“正在优化布局”的提示提前撤掉。
+            // 2026-08-30 平板实测横幅永挂：期望集只在「新屏 id ≠ 旧 id」的 DISPLAYS
+            // 到达时才被填充——拓扑重建复用同 id/列表不再推送时恒为空，
+            // isNotEmpty() 门控把撤除条件判死。回落：期望空时用订阅集判断首帧；
+            // 另加 12s 兜底（iOS 同款）：静态桌面等任何等不到新屏组首帧的场景，
+            // 到时强收——旧画面仍在播放，提示滞留只会让用户以为卡死。
+            val readinessIds = synchronized(pipelineLock) {
+                if (topologyTransitionExpectedIds.isNotEmpty()) topologyTransitionExpectedIds
+                else subscribedIds.toSet()
+            }
             val topologyReady = synchronized(pipelineLock) {
-                topologyTransitionExpectedIds.isNotEmpty() &&
-                    topologyTransitionExpectedIds.all { id ->
-                        (pipelines[id]?.renderedNow ?: 0) > 0
-                    }
+                readinessIds.isNotEmpty() && readinessIds.all { id ->
+                    (pipelines[id]?.renderedNow ?: 0) > 0
+                }
             }
             if (topologyTransitionInFlight && topologyReady) {
+                topologyTransitionInFlight = false
+                topologyTransitionExpectedIds = emptySet()
+                cancelSwitchingBanner()
+            } else if (topologyTransitionInFlight &&
+                SystemClock.elapsedRealtime() - topologyTransitionSinceMs > 12_000) {
+                Log.w(TAG, "topology banner timeout — dismissing (first frames may be retained textures)")
                 topologyTransitionInFlight = false
                 topologyTransitionExpectedIds = emptySet()
                 cancelSwitchingBanner()
@@ -709,6 +725,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     private fun beginTopologyTransition() {
         topologyTransitionInFlight = true
+        topologyTransitionSinceMs = SystemClock.elapsedRealtime()
         topologyTransitionOldIds = subscribedIds.toSet()
         topologyTransitionExpectedIds = emptySet()
         scheduleSwitchingBanner(
@@ -1357,6 +1374,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             textSize = 18f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
+            // 卡片在 root 未完成首次布局时创建会测得极窄宽度且不再重测
+            // （实测截断成“正/保留”单字竖排）——最小宽度兜底
+            minWidth = dp(240)
         }
         card.addView(title)
         val detail = android.widget.TextView(this).apply {
@@ -1365,6 +1385,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             setTextColor(0xFFD0D8E4.toInt())
             gravity = Gravity.CENTER
             setPadding(0, 10, 0, 0)
+            minWidth = dp(240)
         }
         card.addView(detail)
         banner.addView(card, android.widget.LinearLayout.LayoutParams(
