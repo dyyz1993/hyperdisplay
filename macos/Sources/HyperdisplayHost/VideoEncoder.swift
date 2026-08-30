@@ -1,5 +1,7 @@
 import Foundation
 import VideoToolbox
+import CoreImage
+import AppKit
 import CoreMedia
 import CoreVideo
 
@@ -80,8 +82,14 @@ final class VideoEncoder {
             throw HostError("VTCompressionSessionCreate failed: \(status)")
         }
 
+        // 2026-08-30 画质调优（USB 实测文字发糊）：RealTime 模式的编码决策偏向
+        // 延迟牺牲细节，文字边缘涂抹明显。改用 Quality 优先模式——远程桌面场景
+        // 帧间延迟由采集/解码主导（各 ~16ms），编码端几十 ms 的决策时间换静态
+        // 文字清晰度是纯赚。Quality 值 1.0 = 该码率下最高保真。
+        // AllowFrameReordering 仍关（断引用帧安全策略不变）。
         let props: [NSString: Any] = [
-            kVTCompressionPropertyKey_RealTime: true,
+            kVTCompressionPropertyKey_RealTime: false,
+            kVTCompressionPropertyKey_Quality: 1.0,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
             kVTCompressionPropertyKey_AverageBitRate: Int(bitrate),
             // DataRateLimits 的单位是字节/秒。实时 UDP 不能靠一个远超平均码率的
@@ -94,8 +102,10 @@ final class VideoEncoder {
             // 2 秒收紧到半秒，运动时以细节换连贯性，静止锐化仍会补高质量 IDR。
             kVTCompressionPropertyKey_MaxKeyFrameInterval: max(1, fps / 2),
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 0.5,
+            // Main10/High Profile：10bit 色深与更强帧内预测，静态桌面文字边缘
+            // 的色带/涂抹在高码率下进一步收敛（解码端 iPhone 13/华为平板均硬解支持）
             kVTCompressionPropertyKey_ProfileLevel:
-                (codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_Main_AutoLevel),
+                (codec == .hevc ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_H264_High_AutoLevel),
         ]
         var allApplied = true
         for (key, value) in props {
@@ -152,7 +162,20 @@ final class VideoEncoder {
         NSLog("[hyperdisplay] bitrate -> \(clamped / 1000)kbps")
     }
 
+    /// 诊断开关（环境变量 HD_DUMP_SOURCE=1 触发）：把第一张采集帧原样转存 PNG，
+    /// 用于源头画质判责（与平板端截图对比，分离"源糊"与"链路/编码糊"）。
+    static var dumpSourcePending = ProcessInfo.processInfo.environment["HD_DUMP_SOURCE"] == "1"
+    private static let dumpLock = NSLock()
+
     func encode(pixelBuffer: CVPixelBuffer) {
+        if Self.dumpSourcePending {
+            Self.dumpLock.lock()
+            if Self.dumpSourcePending {
+                Self.dumpSourcePending = false
+                Self.dumpPixelBuffer(pixelBuffer)
+            }
+            Self.dumpLock.unlock()
+        }
         lock.lock()
         guard session != nil, inFlight < maxInFlight else {
             lock.unlock()
@@ -325,5 +348,19 @@ final class VideoEncoder {
             offset = start + length
         }
         return offset == data.count ? out : nil
+    }
+}
+
+
+extension VideoEncoder {
+    static func dumpPixelBuffer(_ pb: CVPixelBuffer) {
+        let ci = CIImage(cvPixelBuffer: pb)
+        let ctx = CIContext()
+        guard let cg = ctx.createCGImage(ci, from: ci.extent) else { return }
+        let rep = NSBitmapImageRep(cgImage: cg)
+        guard let data = rep.representation(using: .png, properties: [:]) else { return }
+        let url = URL(fileURLWithPath: "/tmp/hd-source-frame.png")
+        try? data.write(to: url)
+        NSLog("[hyperdisplay] source frame dumped: \(cg.width)x\(cg.height) -> \(url.path)")
     }
 }
