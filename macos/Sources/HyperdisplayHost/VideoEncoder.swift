@@ -89,7 +89,9 @@ final class VideoEncoder {
         // AllowFrameReordering 仍关（断引用帧安全策略不变）。
         let props: [NSString: Any] = [
             kVTCompressionPropertyKey_RealTime: false,
-            kVTCompressionPropertyKey_Quality: 1.0,
+            // 0.5：静态文字锐度显著优于 RealTime，但不把 IDR 推向 DataRateLimits
+            // 上限（1.0 实测 IDR 中位 1.4MB=上限的 93%，是平板负载暴涨的放大器）
+            kVTCompressionPropertyKey_Quality: 0.5,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
             kVTCompressionPropertyKey_AverageBitRate: Int(bitrate),
             // DataRateLimits 的单位是字节/秒。实时 UDP 不能靠一个远超平均码率的
@@ -105,7 +107,7 @@ final class VideoEncoder {
             // Main10/High Profile：10bit 色深与更强帧内预测，静态桌面文字边缘
             // 的色带/涂抹在高码率下进一步收敛（解码端 iPhone 13/华为平板均硬解支持）
             kVTCompressionPropertyKey_ProfileLevel:
-                (codec == .hevc ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_H264_High_AutoLevel),
+                (codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_Main_AutoLevel),
         ]
         var allApplied = true
         for (key, value) in props {
@@ -156,8 +158,13 @@ final class VideoEncoder {
         }
         lock.unlock()
         let clamped = max(1_000_000, bitrate)
-        // 只调平均码率：运行中同时改 DataRateLimits 曾产生华为硬解输出全零的流（绿屏）
+        // 只调平均码率 + 同步收紧 DataRateLimits（2026-08-30 双子任务审计：
+        // 冻结的 1.5MB 上限 + Quality 模式让静止 IDR 暴涨到 1.4MB/1583 片，
+        // 2Mbps 链路被每秒 3 个巨型突发冲垮=平板性能恶化的主因。当年绿屏是
+        // 运行中同时改多项所致；这里只收紧字节上限，方向是更小更安全的帧）
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: Int(clamped) as CFTypeRef)
+        let limits = [max(500_000, Int(clamped) / 8), 1] as NSArray
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: limits)
         requestKeyframe()
         NSLog("[hyperdisplay] bitrate -> \(clamped / 1000)kbps")
     }
