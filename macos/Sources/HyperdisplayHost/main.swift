@@ -272,7 +272,7 @@ final class DisplayStream {
     /// 运动末尾的帧是低质量帧（码率被运动分摊），静止后不重编码就永远糊着。
     /// 检测「动→静」转换（≥0.5s 无新帧）时重编码一帧全质量 IDR，客户端无感刷新
     /// 为清晰画面（macOS 自带屏幕共享的同款行为）。
-    private var lastContentFrameAt: Date?
+    var lastContentFrameAt: Date?
     private var refinementWasMoving = false
     private var starting = false
     private(set) var started = false
@@ -643,8 +643,15 @@ final class DisplayStream {
 
     /// 同一平板订阅多块屏时由 Host 统一调用。此处不改虚拟屏、不重启采集/编码器，
     /// 因而不会引入 ColorSync churn；只把正在运行的 VideoToolbox 会话收敛到预算内。
+    /// 借用预算时同步抬高的运行时上限（只升不降到原始值以下）
+    private var borrowedCeiling: UInt32 = 0
+
     func setTransportTargetBitrate(_ value: UInt32) {
-        let next = max(bitrateFloor, min(qualityCeiling, value))
+        // 借还实测卡点（2026-08-30）：qualityCeiling 是建屏时的像素份额上限，
+        // 借来的预算若不抬高它，min(ceiling, value) 会把 49M 针死在 15M。
+        let effectiveCeiling = max(qualityCeiling, borrowedCeiling)
+        let next = max(bitrateFloor, min(effectiveCeiling, value))
+        borrowedCeiling = max(borrowedCeiling, value)
         guard next != targetBitrate else { return }
         targetBitrate = next
         if currentBitrate > next {
@@ -746,6 +753,16 @@ final class DisplayStream {
                 self.capture?.replayLastFrame()
             }
         }
+    }
+
+    /// 近期实际发送码率（Mbps）：动/静判定用。分片数 × ~1400B / 窗口秒数。
+    /// adaptQuality 的 2s 窗口计数器复用——不新增锁与状态。
+    func recentSendRateMbps() -> Double {
+        fragLock.lock()
+        let sent = fragmentsSentTotal - windowSentBase
+        let windowSec = max(0.5, Date().timeIntervalSince(windowStart))
+        fragLock.unlock()
+        return Double(sent) * 1400.0 / windowSec / 1_000_000.0
     }
 
     /// 视频不做分片重传：NACK 的非空形式可能来自旧客户端，直接当作“这一帧已过期”
@@ -1828,19 +1845,61 @@ final class HostApp: NSObject, NSApplicationDelegate {
             .sorted { ($0.screenSlot ?? 0) < ($1.screenSlot ?? 0) }
         guard deviceStreams.count > 1 else { return }
 
+        // ⚠️ 静态按像素均分（2026-08-30 用户点破的浪费）：副屏静止（内容驱动
+        // = 零发送）时它的预算空占，主屏滚动却顶在自己的份额上。改为动态借还：
+        // 静止屏（>2s 无新内容帧）只留地板码率，余量按像素权重全给活动屏；
+        // 一旦静止屏恢复运动，下个周期自动还回（tick 每秒驱动重分）。
+        let now = Date()
+        // 动/静判定用实际发送码率而非内容帧时间戳：菜单栏时钟每秒产帧会让
+        // 时间戳判定恒为"动"（实测 [动+动] 签名永不翻转）。发送码率直接反映
+        // 链路占用——静止屏（时钟微动画）实际发送 <1Mbps，运动屏远高于此。
+        let idle: [Bool] = deviceStreams.map { s in s.recentSendRateMbps() < 1.0 }
+        let anyIdle = idle.contains { $0 }
         let floor: UInt64 = 2_000_000
         let desired = deviceStreams.map { UInt64($0.qualityCeiling) }
         let desiredTotal = desired.reduce(0, +)
         let budget = min(UInt64(60_000_000), desiredTotal)
+
+        let effective: [UInt64]
+        if !anyIdle {
+            // 全动/全静：按像素权重均分（原逻辑）
+            effective = desired
+        } else {
+            // 有静止屏：它只留地板，其余预算按像素权重给活动屏
+            effective = desired.enumerated().map { i, d in idle[i] ? floor : d }
+        }
         let remaining = max(UInt64(0), budget - floor * UInt64(deviceStreams.count))
-        let weights = desired.map { max(UInt64(1), $0 - floor) }
+        let weights = effective.map { max(UInt64(1), $0 - floor) }
         let weightTotal = weights.reduce(0, +)
 
         for (index, stream) in deviceStreams.enumerated() {
             let allocated = UInt32(min(UInt64(UInt32.max), floor + remaining * weights[index] / weightTotal))
             stream.setTransportTargetBitrate(allocated)
         }
-        NSLog("[hyperdisplay] dual-screen shared transport budget=\(budget/1_000_000)Mbps device=\(deviceId)")
+        let idleDesc = idle.map { $0 ? "静" : "动" }.joined(separator: "+")
+        NSLog("[hyperdisplay] dual-screen budget \(budget/1_000_000)Mbps [\(idleDesc)] device=\(deviceId)")
+    }
+
+    /// 周期驱动的动态借还（tick 每秒调用）：内容活跃状态翻转时重算预算。
+    /// 建屏路径的重分只做初始分配；静止↔运动的转换在这里接住。
+    private var lastBudgetIdleSignature: [UInt32: String] = [:]
+
+    private func rebalanceBudgetsIfActivityChanged() {
+        let deviceIds = Set(streams.values.compactMap { $0.deviceId })
+        for deviceId in deviceIds {
+            let deviceStreams = streams.values
+                .filter { $0.deviceId == deviceId }
+                .sorted { ($0.screenSlot ?? 0) < ($1.screenSlot ?? 0) }
+            guard deviceStreams.count > 1 else { continue }
+            let now = Date()
+            let sig = deviceStreams
+                .map { s -> String in s.recentSendRateMbps() < 1.0 ? "静" : "动" }
+                .joined(separator: "+")
+            if lastBudgetIdleSignature[deviceId] != sig {
+                lastBudgetIdleSignature[deviceId] = sig
+                rebalanceDeviceTransportBudget(deviceId: deviceId)
+            }
+        }
     }
 
     /// allowLast=true：闲置回收允许清到零屏（菜单手动移除仍保留最后一块护栏）
@@ -2371,6 +2430,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
 
     private func tick() {
         let now = Date()
+        rebalanceBudgetsIfActivityChanged()
         _ = processResources.sampleIfDue(now: now)
         enforcePostCreateColorSyncGuard(now: now)
         advanceTopologyTransition(now: now)
