@@ -2464,14 +2464,17 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     secondFingerDownAt = System.currentTimeMillis()
                     wheelLastX = (event.getX(0) + event.getX(1)) / 2f
                     wheelLastY = (event.getY(0) + event.getY(1)) / 2f
-                } else if (count == 3 && (touchMode == 1 || touchMode == 4 || dragGrace)) {
+                } else if (count == 3 && (touchMode == 1 || touchMode == 4 || dragGrace || touchMode == 3)) {
                     // 三指进入待判定：快上扫=调度中心，慢速移动=中键拖动，轻点=中键
                     // 点击——都不在落下瞬间定性（与单指点按同一原则）。
+                    // mode 3（滚轮已启动）也可升级：滚轮事件无按键状态残留，
+                    // 直接以当前质心重锚即可——三指上扫时双指常先一步滚动起来，
+                    // 缺这条升级路径手势会死在滚轮态（真机实测第三根手指落点）。
                     touchMode = 7
                     val c = centroidView(event)
                     threeAnchorX = c.first; threeAnchorY = c.second
                     threeAnchorAt = System.currentTimeMillis()
-                } else if (count >= 4 && (touchMode == 1 || touchMode == 4 || touchMode == 7 || touchMode == 5 || dragGrace)) {
+                } else if (count >= 4 && (touchMode == 1 || touchMode == 3 || touchMode == 4 || touchMode == 7 || touchMode == 5 || dragGrace)) {
                     if (touchMode == 5) {
                         // 中键拖动中途加指升到四指：先释放中键，再进四指判定。
                         centroid(view, event)?.let { s.sendButton(displayId, 2, false, it[0], it[1]) }
@@ -2481,6 +2484,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     fourAnchorX = c.first
                     fourSpan0 = pointerSpan(event)
                 }
+                Log.i(TAG, "gesture: fingerDown count=$count -> mode=$touchMode")
             }
             MotionEvent.ACTION_MOVE -> {
                 when (touchMode) {
@@ -2556,6 +2560,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             }
             MotionEvent.ACTION_POINTER_UP -> {
                 val count = event.pointerCount // 含正在抬起的手指
+                val modeBefore = touchMode
                 if (count == 2 && touchMode == 4) {
                     if (System.currentTimeMillis() - secondFingerDownAt < twoFingerTapMs) {
                         // 双指轻点=右键：在双指中点完成一次右键点击。
@@ -2579,6 +2584,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 } else if (count == 3 && touchMode == 8) {
                     touchMode = 6 // 四指抬掉一根：本手势收尾，不再判定
                 }
+                Log.i(TAG, "gesture: fingerUp count=$count mode=$modeBefore -> $touchMode")
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 when (touchMode) {
