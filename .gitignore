@@ -26,3 +26,9 @@ captures/
 # Swift Package Manager
 .swiftpm/
 Package.resolved
+
+# Agent / tooling artifacts
+.brainstorm/
+.codex/
+.playwright-cli/
+output/
