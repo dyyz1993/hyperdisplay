@@ -206,6 +206,10 @@ private final class DeviceTopologyTransition {
     var screenCaptureVisible = false
     var modeReadyRecorded = false
     var healthGateUntil = Date.distantPast
+    /// 严格 Retina 首次读到 mismatch 的时刻。模式发布是异步的：拆除旧屏后立即重建的
+    /// 窗口里，回读常先落在 1x 再翻到 hiDPI。零宽限枪毙会把这种瞬时竞态固化为
+    /// 永久拒绝（2026-09-01 平板 2x 退化事故），先给短沉降窗口再定性。
+    var retinaMismatchSince: Date?
 
     init(deviceId: UInt32, topology: DeviceTopology, profiles: [DeviceScreenProfile], generation: UInt64,
          retina: Bool, transaction: UInt32) {
@@ -268,6 +272,31 @@ final class DisplayStream {
     private var encoder: VideoEncoder?
     private var frameId: UInt32 = 0
     private var lastKeyframeRequestAt = Date.distantPast
+
+    // MARK: 采集尺寸实测（严格 Retina 的权威证据）
+    // macOS 26 负载下 CGDisplayCopyDisplayMode 可能长期滞留在 1x 回报：
+    // 2026-09-01 实测 282 号屏——模式 API 连续 10s 报 1400x920 像素，SCK 却
+    // 交付了 83 帧 2800x1840 全像素。逻辑排版（CGDisplayBounds=1400x920）与
+    // 采集编码（2800x1840）都已正确生效，唯一撒谎的是模式回读 API。
+    private var captureSizeLock = NSLock()
+    private var capturePixelWidthStorage = 0
+    private var capturePixelHeightStorage = 0
+
+    /// SCK 最近一帧的实际像素尺寸。与 requestedPixel 尺寸一致即为严格 Retina
+    /// 生效的直接证据，优先于滞后的模式 API 回读。
+    func capturePixelSize() -> (width: Int, height: Int) {
+        captureSizeLock.lock()
+        defer { captureSizeLock.unlock() }
+        return (capturePixelWidthStorage, capturePixelHeightStorage)
+    }
+
+    private func recordCaptureSize(width: Int, height: Int) {
+        captureSizeLock.lock()
+        capturePixelWidthStorage = width
+        capturePixelHeightStorage = height
+        captureSizeLock.unlock()
+    }
+
     /// 静止锐化（2026-08-21）：内容驱动的编码下，画面停在哪帧就保持哪帧的质量——
     /// 运动末尾的帧是低质量帧（码率被运动分摊），静止后不重编码就永远糊着。
     /// 检测「动→静」转换（≥0.5s 无新帧）时重编码一帧全质量 IDR，客户端无感刷新
@@ -340,6 +369,8 @@ final class DisplayStream {
     private func wireCapture(_ capture: CaptureEngine) {
         capture.onFrame = { [weak self, weak capture] pixelBuffer in
             guard let self else { return }
+            self.recordCaptureSize(width: CVPixelBufferGetWidth(pixelBuffer),
+                                   height: CVPixelBufferGetHeight(pixelBuffer))
             // 采集侧新鲜像素 = 真实内容活跃（静止锐化的唯一时间戳来源；编码侧
             // 重编码帧不算——见 makeEncoder 注释）。放在订阅门控之前：无人订阅时
             // 内容活跃与否的追踪也不该停（重新订阅后锐化检测需要正确基线）。
@@ -1373,16 +1404,32 @@ final class HostApp: NSObject, NSApplicationDelegate {
         return "hyperdisplay.retina.unsupported.v1.\(deviceId).\(topology.persistenceComponent).\(os).\(geometry)"
     }
 
+    /// 严格 Retina 拒绝的进程内记忆：只防同一进程内的重连 churn，绝不落盘。
+    /// macOS 对 2x 的接受度随 WindowServer 瞬时状态波动（拆屏竞态、外接屏变化），
+    /// 永久记忆会把一次瞬时拒绝固化成"该设备永不 2x"（2026-09-01 平板事故）。
+    /// host 进程重启后各设备获得一次诚实重试，churn 代价每次至多一个建屏事务。
+    private var strictRetinaUnsupportedInProcess = Set<String>()
+
     private func isStrictRetinaKnownUnsupported(deviceId: UInt32, topology: DeviceTopology,
-                                                profiles: [DeviceScreenProfile]) -> Bool {
-        UserDefaults.standard.bool(forKey: strictRetinaCapabilityKey(deviceId: deviceId, topology: topology,
-                                                                       profiles: profiles))
+                                           profiles: [DeviceScreenProfile]) -> Bool {
+        strictRetinaUnsupportedInProcess.contains(strictRetinaCapabilityKey(deviceId: deviceId, topology: topology,
+                                                                            profiles: profiles))
     }
 
     private func rememberStrictRetinaUnsupported(_ active: DeviceTopologyTransition) {
-        UserDefaults.standard.set(true, forKey: strictRetinaCapabilityKey(deviceId: active.deviceId,
-                                                                            topology: active.topology,
-                                                                            profiles: active.profiles))
+        strictRetinaUnsupportedInProcess.insert(strictRetinaCapabilityKey(deviceId: active.deviceId,
+                                                                          topology: active.topology,
+                                                                          profiles: active.profiles))
+    }
+
+    /// 历史版本曾把拒绝写进 UserDefaults（永不过期）。启动时清除这类中毒标记；
+    /// 清不掉的旧二进制行为不受影响，新版本自此不再读取。
+    func purgeLegacyStrictRetinaFlags() {
+        let legacy = UserDefaults.standard.dictionaryRepresentation().keys
+            .filter { $0.hasPrefix("hyperdisplay.retina.unsupported.") }
+        guard !legacy.isEmpty else { return }
+        for key in legacy { UserDefaults.standard.removeObject(forKey: key) }
+        NSLog("[hyperdisplay] purged \(legacy.count) legacy strict-retina flag(s) from UserDefaults")
     }
 
     /// `CGGetActiveDisplayList` 是唯一可用于确认 WindowServer 已放下旧显示器的低层
@@ -1556,12 +1603,33 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 }
                 switch display.currentModeState {
                 case .matching:
+                    active.retinaMismatchSince = nil
                     if !active.modeReadyRecorded {
                         active.modeReadyRecorded = true
                         TopologyTimeline.shared.record("device=\(active.deviceId) display id=\(displayID) mode ready in \(Int(display.age * 1000))ms")
                     }
                 case .mismatch:
                     if active.retina {
+                        // 采集证据优先于模式 API：CGDisplayCopyDisplayMode 在负载下
+                        // 可能长期滞留 1x 回报（2026-09-01 实测模式 API 10s 仍报 1x、
+                        // SCK 却持续交付全像素）。SCK 已交付请求尺寸 = 2x 实际生效，
+                        // 按 matching 处理，落入后续 removal barrier / SCK 枚举检查。
+                        if let stream = streams[displayID] {
+                            let size = stream.capturePixelSize()
+                            if size.width == display.requestedPixelWidth && size.height == display.requestedPixelHeight {
+                                active.retinaMismatchSince = nil
+                                if !active.modeReadyRecorded {
+                                    active.modeReadyRecorded = true
+                                    TopologyTimeline.shared.record("device=\(active.deviceId) display id=\(displayID) retina accepted via capture evidence \(size.width)x\(size.height) in \(Int(display.age * 1000))ms")
+                                }
+                                break
+                            }
+                        }
+                        // 无采集证据时给沉降窗口：模式发布是异步的，拆屏后立即重建的
+                        // 窗口里回读常先落在 1x；窗口结束既无 2x 回读也无全像素采集，
+                        // 才是系统真的拒绝了该几何（8-27 的 1376x1840 案例）。
+                        if active.retinaMismatchSince == nil { active.retinaMismatchSince = now }
+                        if now.timeIntervalSince(active.retinaMismatchSince!) < 10 { return }
                         rejectStrictRetina(active, reason: display.currentModeState.diagnosticDescription)
                     } else if display.adoptActualStandardOneXMode() {
                         active.modeReadyRecorded = true
@@ -2828,6 +2896,7 @@ if singleInstanceFd < 0 || flock(singleInstanceFd, LOCK_EX | LOCK_NB) != 0 {
 
 let app = NSApplication.shared
 let delegate = HostApp(config: config)
+delegate.purgeLegacyStrictRetinaFlags()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()
