@@ -2379,9 +2379,13 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         slop * slop
     }
     private val twoFingerTapMs = 220L
-    /** 三/四指轻扫的定性距离（约 44dp）与快扫时限。 */
-    private val swipeDistancePx: Float by lazy { 44f * resources.displayMetrics.density }
-    private val swipeFastMs = 450L
+    /** 三指快上扫的定性距离与窗口。窗口内只等快扫、不转中键（防快扫被 slop
+     *  提前截胡定性成拖动）；窗口过后仍未触发=慢速意图，才转中键拖动。 */
+    private val swipeDistancePx: Float by lazy { 28f * resources.displayMetrics.density }
+    private val swipeFastMs = 600L
+    /** 左键拖动开始后的多指升级宽限：窗内落下的更多手指=多指手势前奏，撤销
+     *  拖动转入对应模式；窗外=真实拖动被误碰，保持拖动。 */
+    private val dragGraceMs = 250L
     /** 四指捏合：相邻指距和缩到初始的该比例即触发启动台。 */
     private val pinchTriggerRatio = 0.72f
 
@@ -2391,6 +2395,8 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var threeAnchorAt = 0L
     private var fourAnchorX = 0f
     private var fourSpan0 = 0f
+    /** mode 2（左键拖动）的定性时刻，供多指升级宽限判定。 */
+    private var dragStartedAt = 0L
 
     /** 全部指针的流坐标质心（三/四指锚点与中键拖动用）。 */
     private fun centroid(view: StreamView, event: MotionEvent): FloatArray? {
@@ -2444,19 +2450,28 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
                 val count = event.pointerCount
-                if (count == 2 && touchMode == 1) {
+                // 拖动宽限：三/四指手势的手指落下有先后，第一指往往已先移动而进入
+                // 左键拖动（mode 2）。短窗内落下的更多手指=多指手势前奏——撤销拖动
+                // （补发的 up 落在已远离按下点的位置，不构成点击，无误触）并升级；
+                // 宽限外的加指=真实拖动被误碰，保持拖动。
+                val dragGrace = touchMode == 2 &&
+                    System.currentTimeMillis() - dragStartedAt < dragGraceMs
+                if (dragGrace) {
+                    view.viewToStream(event.x, event.y)?.let { s.sendButton(displayId, 0, false, it[0], it[1]) }
+                }
+                if ((count == 2 && touchMode == 1) || (count == 2 && dragGrace)) {
                     touchMode = 4
                     secondFingerDownAt = System.currentTimeMillis()
                     wheelLastX = (event.getX(0) + event.getX(1)) / 2f
                     wheelLastY = (event.getY(0) + event.getY(1)) / 2f
-                } else if (count == 3 && (touchMode == 1 || touchMode == 4)) {
+                } else if (count == 3 && (touchMode == 1 || touchMode == 4 || dragGrace)) {
                     // 三指进入待判定：快上扫=调度中心，慢速移动=中键拖动，轻点=中键
                     // 点击——都不在落下瞬间定性（与单指点按同一原则）。
                     touchMode = 7
                     val c = centroidView(event)
                     threeAnchorX = c.first; threeAnchorY = c.second
                     threeAnchorAt = System.currentTimeMillis()
-                } else if (count >= 4 && (touchMode == 1 || touchMode == 4 || touchMode == 7 || touchMode == 5)) {
+                } else if (count >= 4 && (touchMode == 1 || touchMode == 4 || touchMode == 7 || touchMode == 5 || dragGrace)) {
                     if (touchMode == 5) {
                         // 中键拖动中途加指升到四指：先释放中键，再进四指判定。
                         centroid(view, event)?.let { s.sendButton(displayId, 2, false, it[0], it[1]) }
@@ -2476,6 +2491,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                             // 越界才定性为左键拖动：先定位再按下，保证落点正确。
                             val p = view.viewToStream(event.x, event.y) ?: return
                             touchMode = 2
+                            dragStartedAt = System.currentTimeMillis()
                             s.sendMove(displayId, p[0], p[1])
                             s.sendButton(displayId, 0, true, p[0], p[1])
                         }
@@ -2504,18 +2520,21 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                         val c = centroidView(event)
                         val dx = c.first - threeAnchorX
                         val dy = c.second - threeAnchorY
-                        val fast = System.currentTimeMillis() - threeAnchorAt < swipeFastMs
-                        if (dy <= -swipeDistancePx && -dy >= 2f * kotlin.math.abs(dx) && fast) {
+                        val elapsed = System.currentTimeMillis() - threeAnchorAt
+                        if (dy <= -swipeDistancePx && -dy >= 2f * kotlin.math.abs(dx) && elapsed < swipeFastMs) {
                             // 三指快上扫 = 调度中心（触控板默认手势）。
                             s.sendAction(displayId, 1)
                             touchMode = 6
-                        } else if (dx * dx + dy * dy > touchSlopSq) {
-                            // 慢速/水平移动 → 中键拖动：此刻起按下并注入移动。
+                        } else if (elapsed >= swipeFastMs && dx * dx + dy * dy > touchSlopSq) {
+                            // 快扫窗口已过仍未触发 = 慢速意图，此刻才转中键拖动。
+                            // 窗口内不转（即使已越 slop）：否则快扫还没扫到距离阈值，
+                            // 就会被 slop 提前截胡定性成拖动（真机实测踩过）。
                             touchMode = 5
                             val p = centroid(view, event) ?: return
                             s.sendMove(displayId, p[0], p[1])
                             s.sendButton(displayId, 2, true, p[0], p[1])
                         }
+                        // 窗口内未达快扫阈值：继续等待，不动作。
                     }
                     8 -> {
                         val span = pointerSpan(event)
