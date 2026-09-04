@@ -59,12 +59,35 @@ final class InputInjector {
         postMouseEvent(type: type, at: point, button: mouseButton, clickState: 1)
     }
 
-    /// 滚轮：像素单位，「自然滚动」语义——内容跟随手指方向。倍率 2 为初始值，
-    /// 真机手感不对时再调。
+    // MARK: 滚动方向（跟随 Mac「自然滚动」偏好）
+
+    private var naturalScrollCache: Bool?
+    private var naturalScrollCheckedAt = Date.distantPast
+
+    /// Mac 的「自然滚动」设置（com.apple.swipescrolldirection，默认开）。
+    /// 合成滚轮事件不经过系统对物理 HID 输入的自然翻转，方向必须在这里自行对齐：
+    /// 开=内容跟随手指（触控板习惯），关=传统鼠标（内容反向手指）。
+    /// 平板手感因此始终与该 Mac 本机触控板一致；用户改系统设置后 5s 内跟进。
+    /// 经 cfprefsd 读全局域（拿最新值），5s 缓存避免 60Hz 滚动流打爆 IPC。
+    private func naturalScrolling() -> Bool {
+        if let cached = naturalScrollCache,
+           Date().timeIntervalSince(naturalScrollCheckedAt) < 5 { return cached }
+        naturalScrollCheckedAt = Date()
+        let raw = CFPreferencesCopyAppValue("com.apple.swipescrolldirection" as CFString,
+                                            kCFPreferencesAnyApplication) as? Bool
+        let natural = raw ?? true // key 缺失 = 系统默认：自然滚动开
+        naturalScrollCache = natural
+        return natural
+    }
+
+    /// 滚轮：像素单位。倍率 2 为初始值，真机手感不对时再调。
+    /// 方向按 Mac 自然滚动偏好适配（2026-09-04 用户实测：固定取负在自然滚动的
+    /// Mac 上=内容反向手指，与触控板习惯相反）。
     func wheel(dx: Double, dy: Double, at point: CGPoint) {
         postMouseEvent(type: .mouseMoved, at: point)
-        let intDx = Int32(max(-10_000, min(10_000, -dx * 2)))
-        let intDy = Int32(max(-10_000, min(10_000, -dy * 2)))
+        let gain = naturalScrolling() ? 1.0 : -1.0
+        let intDx = Int32(max(-10_000, min(10_000, dx * 2 * gain)))
+        let intDy = Int32(max(-10_000, min(10_000, dy * 2 * gain)))
         guard intDx != 0 || intDy != 0 else { return }
         guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
                                   wheel1: intDy, wheel2: intDx, wheel3: 0) else { return }
