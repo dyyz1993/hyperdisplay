@@ -1217,7 +1217,14 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                         switchingBannerDetail?.text = "实测 ${actualScale}x，正在恢复画面…"
                     }
                     2, 3 -> {
-                        val restore = committedLayoutConfig
+                        var restore = committedLayoutConfig
+                        // 上一套已提交配置若同样是 2x，"恢复一次"就是原地打转：再要 2x
+                        // 只会再次被拒（host 已记录该组合不支持），屏永远建不出来，
+                        // 平板停留在黑屏（2026-09-01）。此时显式退回标准 1x——
+                        // 1x 请求不走严格 Retina 拒绝路径，必然能建屏。
+                        if (requestedScale == 2 && restore.clarity == 1) {
+                            restore = restore.copy(clarity = 0)
+                        }
                         layoutConfig = restore
                         pendingLayoutConfig = null
                         pendingModeTransaction = 0

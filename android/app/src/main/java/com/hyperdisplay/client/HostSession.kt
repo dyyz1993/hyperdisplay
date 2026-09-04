@@ -328,6 +328,7 @@ class HostSession private constructor(
             val fbuf = ByteArray(65536 + 8)
             var acc = 0
             try {
+                var lastTcpTrafficAt = System.currentTimeMillis()
                 while (running) {
                     val n = try {
                         inp.read(fbuf, acc, fbuf.size - acc)
@@ -345,10 +346,21 @@ class HostSession private constructor(
                             sendHello()
                             lastPongAt = now
                         }
+                        // 写路径可能卡死在已死 socket 的满发送缓冲（TCP 无写超时），
+                        // HELLO 会永远进黑洞，看门狗随之空转（2026-09-01 平板 10 分钟
+                        // 冻结）。以"最近收到字节"为准，完全静默 10s 强制终结本会话，
+                        // 交给上层用全新 socket 重建。
+                        if (now - lastTcpTrafficAt > 10_000) {
+                            Log.w(TAG, "tcp tunnel silent ${now - lastTcpTrafficAt}ms; forcing session rebuild")
+                            running = false
+                            listener.onLinkEvent(false)
+                            break
+                        }
                         continue
                     }
                     if (n < 0) break
                     acc += n
+                    if (n > 0) lastTcpTrafficAt = System.currentTimeMillis()
                     tcpFrames[0] += n.toLong()
                     while (acc >= 4) {
                         val ln = ((fbuf[0].toInt() and 0xFF) or
