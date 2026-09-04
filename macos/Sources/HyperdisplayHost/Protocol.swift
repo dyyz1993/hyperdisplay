@@ -24,7 +24,7 @@ import Foundation
 //   DESTROY_DISPLAY id u32
 //   INPUT         seq          [displayId u16][subtype u8][body]
 //     move   x f32 y f32
-//     button button u8 (0=left 1=right) down u8 x f32 y f32
+//     button button u8 (0=left 1=right 2=middle) down u8 x f32 y f32
 //     wheel  dx f32 dy f32 x f32 y f32
 //   PING
 //   CURSOR_IMAGE_ACK seq=imageId —— 光标图像分片已完整收到

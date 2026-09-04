@@ -252,6 +252,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     private var usbTunnelBurstGeneration = 0
     // 产品定位是外置显示器；不申请辅助功能，也不把触摸转换为 Mac 输入。
     @Volatile private var remoteControlEnabled = false
+    /** 用户偏好（配置面板开关，持久化）；生效与否还要看 host 在 WELCOME 里宣告的能力。 */
+    private var remoteControlUserPref = false
+    /** host 通过 WELCOME.controlEnabled 宣告支持注入；旧 host 恒 false。 */
+    @Volatile private var hostControlSupported = false
     private var renderFps = 0
     private var appCpuPercent = 0.0
     private var appMemoryMB = 0
@@ -436,6 +440,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         val layoutPrefs = getSharedPreferences("hyperdisplay", MODE_PRIVATE)
         pipLeft = layoutPrefs.getInt("layout.pipLeft", -1)
         pipTop = layoutPrefs.getInt("layout.pipTop", -1)
+        remoteControlUserPref = layoutPrefs.getBoolean("remoteControl", false)
         root = FrameLayout(this)
         setContentView(root)
         showConnectView()
@@ -640,6 +645,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     ) {
         disconnectSession()
         if (isSwitch) scheduleSwitchingBanner()
+        // 新会话重新协商：host 能力以新 WELCOME 为准，协商前不注入。
+        hostControlSupported = false
+        remoteControlEnabled = false
         val code = getPreferences(MODE_PRIVATE).getInt("pairingCode", 0)
         val deviceId = HostSession.loadOrCreateDeviceId(this)
         val deviceFingerprint = HostSession.loadDeviceFingerprint(this)
@@ -1044,6 +1052,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             val v = view.streamToView(x, y) ?: return
             val w = windowPos(view, v[0], v[1])
             mainHandler.post {
+                // 触摸期间光标保持隐藏（手指即指针），host 推送一律不显示；
+                // 抬手后由 finishTouch 的回显接管。
+                if (touchMode != 0) return@post
                 // 双写者仲裁（2026-08-21 卡顿根因）：触摸期间手指以零延迟驱动本地光标，
                 // host 推送（20Hz+网络滞后）无条件覆盖 = 光标被反复拽回 → 顿挫。
                 // 规则：250ms 内有手指回显且 host 位置就在附近（<48px）→ 手指权威，丢弃；
@@ -1064,9 +1075,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
         override fun onWelcome(displayId: Int, codec: Int, width: Int, height: Int, fps: Int, controlEnabled: Boolean) {
             mainHandler.post {
-                // Host 即使收到旧版本协商结果，也始终保持纯显示模式。
-                remoteControlEnabled = false
-                session?.setRemoteControlEnabled(false)
+                // host 在 WELCOME 里宣告注入能力；用户偏好开启且 host 支持才生效。
+                // 旧 host（无注入）恒为 false，自动退回纯显示。
+                hostControlSupported = controlEnabled
+                applyRemoteControlState()
                 val p = pipelineOf(displayId)
                 // WELCOME 是这一路编码流的格式边界。拓扑/分辨率切换后 Host 会用同一
                 // displayId 建立新的 VideoToolbox 会话；若继续拿旧 MediaCodec（例如
@@ -2184,6 +2196,27 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
         panel.addView(clarityRow)
 
+        // 触控远控：点按=鼠标左键、双指滚动=滚轮、双指轻点=右键、三指拖动=中键。
+        // 用户偏好持久化；是否真正生效还取决于 host 能力（WELCOME 协商）。
+        panel.addView(android.widget.CheckBox(this).apply {
+            text = "触控远控（点按/双指滚动/双指点右键/三指中键）"
+            textSize = 13f
+            setPadding(0, 18, 0, 0)
+            isChecked = remoteControlUserPref
+            setOnCheckedChangeListener { _, checked ->
+                remoteControlUserPref = checked
+                getSharedPreferences("hyperdisplay", MODE_PRIVATE).edit()
+                    .putBoolean("remoteControl", checked).apply()
+                applyRemoteControlState()
+            }
+        })
+        panel.addView(TextView(this).apply {
+            text = "首次使用时 Mac 会弹出「辅助功能」授权引导，允许后立即生效。" +
+                "若 Mac 未弹窗，请检查 Mac 端 Hyperdisplay 是否在运行。"
+            textSize = 11f
+            setPadding(pad / 2, 2, pad / 2, 6)
+        })
+
         // 参数区（随所选布局刷新）
         var frac = layoutConfig.fraction
         var sideLeft = layoutConfig.sideLeft
@@ -2316,28 +2349,48 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
 
     // MARK: 触摸 → 输入（按区域路由）
 
-    private var touchMode = 0 // 0=idle 1=single 2=wheel
+    /** 触控远控生效 = 用户偏好（配置面板）∧ host 在 WELCOME 宣告支持。 */
+    private fun applyRemoteControlState() {
+        val on = remoteControlUserPref && hostControlSupported
+        remoteControlEnabled = on
+        session?.setRemoteControlEnabled(on)
+    }
+
+    // 手势状态机（2026-09-04 重构为 slop 判定模型）：
+    // 0=idle 1=按下待定 2=左键拖动 3=双指滚轮 4=双指点(右键)待定 5=三指中键 6=已消费
+    // 原则：动作在「抬起」或「移动越界」时才定性，绝不在 ACTION_DOWN 瞬间发左键。
+    // 旧版按下即发 button-down，第二根手指落下只能补发 button-up——双指滚动前必先
+    // 闪一次幻影左键点击（在视频页面=暂停/播放各一次）。
+    private var touchMode = 0
+    /** 手势归属的屏。运动事件会按屏拆分派发，手势进行中其他屏的手指一律忽略，
+     * 防止两块屏各拿半套共享状态互相踩。 */
+    private var touchView: StreamView? = null
+    private var touchDownX = 0f
+    private var touchDownY = 0f
+    private var secondFingerDownAt = 0L
     private var wheelLastX = 0f
     private var wheelLastY = 0f
+    // by lazy：Activity 构造期 base context 尚未附加，字段初始化器里调
+    // ViewConfiguration.get(this) 会 NPE 启动即崩（2026-09-04 真机实锤）。
+    private val touchSlopSq: Float by lazy {
+        val slop = android.view.ViewConfiguration.get(this).scaledTouchSlop.toFloat()
+        slop * slop
+    }
+    private val twoFingerTapMs = 220L
+
+    /** 全部指针的流坐标质心（三指手势/滚轮锚点用）。 */
+    private fun centroid(view: StreamView, event: MotionEvent): FloatArray? {
+        val n = event.pointerCount
+        if (n == 0) return null
+        var sx = 0f; var sy = 0f
+        for (i in 0 until n) { sx += event.getX(i); sy += event.getY(i) }
+        return view.viewToStream(sx / n, sy / n)
+    }
 
     private fun handleTouch(displayId: Int, view: StreamView, event: MotionEvent) {
-        // 纯显示产品不向 Mac 注入触摸、鼠标或滚轮事件。
         if (!remoteControlEnabled) return
         val s = session ?: return
-        // 本地光标：手指位置零延迟反馈（远程画面不再含系统光标）。
-        // 记录回显位置/时刻供 onCursor 仲裁（防 host 滞后推送拽回，见 onCursor）
-        val lc = localCursor
-        if (lc != null) {
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
-                    val w = windowPos(view, event.x, event.y)
-                    lastCursorEchoAt = System.currentTimeMillis()
-                    lastCursorEchoX = w[0]; lastCursorEchoY = w[1]
-                    lc.moveTo(w[0], w[1])
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> Unit // 常驻：抬手不隐藏，由 host 光标包驱动
-            }
-        }
+        if (touchMode != 0 && touchView !== view) return
         // 画中画处于选中（编辑）态时，第一次点其他区域=退出选中，不透传给 Mac
         if (pipSelected && event.actionMasked == MotionEvent.ACTION_DOWN && pipRoot != null) {
             pipRoot?.let { setPipSelected(it, false) }
@@ -2345,47 +2398,120 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                val p = view.viewToStream(event.x, event.y) ?: return
-                s.sendMove(displayId, p[0], p[1])
-                s.sendButton(displayId, 0, true, p[0], p[1])
+                touchView = view
                 touchMode = 1
+                touchDownX = event.x
+                touchDownY = event.y
+                secondFingerDownAt = 0L
+                // 手指即指针：触摸期间隐藏本地光标，抬手后再回显——治「点击后
+                // 光标飞回原位」的飘感（见 finishTouch）。
+                localCursor?.hide()
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
-                if (event.pointerCount == 2) {
-                    if (touchMode == 1) {
-                        view.viewToStream(event.x, event.y)?.let { s.sendButton(displayId, 0, false, it[0], it[1]) }
-                    }
-                    touchMode = 2
+                val count = event.pointerCount
+                if (count == 2 && touchMode == 1) {
+                    touchMode = 4
+                    secondFingerDownAt = System.currentTimeMillis()
                     wheelLastX = (event.getX(0) + event.getX(1)) / 2f
                     wheelLastY = (event.getY(0) + event.getY(1)) / 2f
+                } else if (count >= 3 && (touchMode == 1 || touchMode == 4)) {
+                    // 三指=中键：落下即按住、移动拖动、抬手释放；快速三指点=中键点击。
+                    val c = centroid(view, event)
+                    if (c != null) {
+                        touchMode = 5
+                        s.sendMove(displayId, c[0], c[1])
+                        s.sendButton(displayId, 2, true, c[0], c[1])
+                    }
                 }
             }
             MotionEvent.ACTION_MOVE -> {
-                if (touchMode == 2 && event.pointerCount >= 2) {
-                    val cx = (event.getX(0) + event.getX(1)) / 2f
-                    val cy = (event.getY(0) + event.getY(1)) / 2f
-                    val dx = cx - wheelLastX
-                    val dy = cy - wheelLastY
-                    wheelLastX = cx
-                    wheelLastY = cy
-                    if (dx != 0f || dy != 0f) {
-                        view.viewToStream(cx, cy)?.let { s.sendWheel(displayId, dx, dy, it[0], it[1]) }
+                when (touchMode) {
+                    1 -> {
+                        val dx = event.x - touchDownX
+                        val dy = event.y - touchDownY
+                        if (dx * dx + dy * dy > touchSlopSq) {
+                            // 越界才定性为左键拖动：先定位再按下，保证落点正确。
+                            val p = view.viewToStream(event.x, event.y) ?: return
+                            touchMode = 2
+                            s.sendMove(displayId, p[0], p[1])
+                            s.sendButton(displayId, 0, true, p[0], p[1])
+                        }
                     }
-                } else if (event.pointerCount == 1) {
-                    view.viewToStream(event.x, event.y)?.let { s.sendMove(displayId, it[0], it[1]) }
+                    2 -> view.viewToStream(event.x, event.y)?.let { s.sendMove(displayId, it[0], it[1]) }
+                    3 -> {
+                        val cx = (event.getX(0) + event.getX(1)) / 2f
+                        val cy = (event.getY(0) + event.getY(1)) / 2f
+                        val dx = cx - wheelLastX
+                        val dy = cy - wheelLastY
+                        wheelLastX = cx
+                        wheelLastY = cy
+                        if (dx != 0f || dy != 0f) {
+                            view.viewToStream(cx, cy)?.let { s.sendWheel(displayId, dx, dy, it[0], it[1]) }
+                        }
+                    }
+                    4 -> {
+                        val cx = (event.getX(0) + event.getX(1)) / 2f
+                        val cy = (event.getY(0) + event.getY(1)) / 2f
+                        val dx = cx - wheelLastX
+                        val dy = cy - wheelLastY
+                        if (dx * dx + dy * dy > touchSlopSq) touchMode = 3 // 双指移动越界 → 滚轮
+                    }
+                    5 -> centroid(view, event)?.let { s.sendMove(displayId, it[0], it[1]) }
                 }
             }
-            MotionEvent.ACTION_POINTER_UP -> { }
+            MotionEvent.ACTION_POINTER_UP -> {
+                val count = event.pointerCount // 含正在抬起的手指
+                if (count == 2 && touchMode == 4) {
+                    if (System.currentTimeMillis() - secondFingerDownAt < twoFingerTapMs) {
+                        // 双指轻点=右键：在双指中点完成一次右键点击。
+                        val cx = (event.getX(0) + event.getX(1)) / 2f
+                        val cy = (event.getY(0) + event.getY(1)) / 2f
+                        view.viewToStream(cx, cy)?.let { p ->
+                            s.sendMove(displayId, p[0], p[1])
+                            s.sendButton(displayId, 1, true, p[0], p[1])
+                            s.sendButton(displayId, 1, false, p[0], p[1])
+                        }
+                    }
+                    // 按得太久=取消：既不是点击也不进滚轮。剩余手指只负责抬手。
+                    touchMode = 6
+                } else if (count == 2 && touchMode == 3) {
+                    touchMode = 6 // 滚轮结束：剩余单指抬起不得触发点击
+                } else if (count == 2 && touchMode == 5) {
+                    centroid(view, event)?.let { s.sendButton(displayId, 2, false, it[0], it[1]) }
+                    touchMode = 6
+                }
+            }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (touchMode == 1) {
-                    view.viewToStream(event.x, event.y)?.let { p ->
+                when (touchMode) {
+                    1 -> view.viewToStream(event.x, event.y)?.let { p ->
+                        // 纯点按：抬起时一次性完成按下+抬起（native 触屏语义）。
                         s.sendMove(displayId, p[0], p[1])
+                        s.sendButton(displayId, 0, true, p[0], p[1])
                         s.sendButton(displayId, 0, false, p[0], p[1])
                     }
+                    2 -> view.viewToStream(event.x, event.y)?.let { p ->
+                        // CANCEL 同样释放，防止 Mac 侧按键卡死。
+                        s.sendButton(displayId, 0, false, p[0], p[1])
+                    }
+                    5 -> centroid(view, event)?.let { s.sendButton(displayId, 2, false, it[0], it[1]) }
                 }
-                touchMode = 0
+                finishTouch(view, event)
             }
         }
+    }
+
+    /** 触摸收尾：复位手势并以抬起点为回显位。注入成功时 Mac 光标已在抬起点
+     *  （拖动期间 host 光标推送被抑制），120ms 后重新显示；期间到达的 host 光标包
+     *  由既有双写者仲裁处理（近=丢弃、远=接管）。可见的「光标飞回原位」就此消失。 */
+    private fun finishTouch(view: StreamView, event: MotionEvent) {
+        touchMode = 0
+        touchView = null
+        val w = windowPos(view, event.x, event.y)
+        lastCursorEchoAt = System.currentTimeMillis()
+        lastCursorEchoX = w[0]; lastCursorEchoY = w[1]
+        mainHandler.postDelayed({
+            if (touchMode == 0) localCursor?.moveTo(lastCursorEchoX, lastCursorEchoY)
+        }, 120)
     }
 
     /** 重建全部解码管线（等效重启 app 的解码部分，不丢布局/连接） */

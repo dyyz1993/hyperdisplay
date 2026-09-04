@@ -1,22 +1,37 @@
 import AppKit
 
-private enum PermissionGuideKind: Equatable {
+enum PermissionGuideKind: Equatable {
     case screenRecording
+    case accessibility
 
     var title: String {
-        "允许 Hyperdisplay 显示副屏"
+        switch self {
+        case .screenRecording: return "允许 Hyperdisplay 显示副屏"
+        case .accessibility: return "允许 Hyperdisplay 触控远控"
+        }
     }
 
     var settingsName: String {
-        "屏幕录制"
+        switch self {
+        case .screenRecording: return "屏幕录制"
+        case .accessibility: return "辅助功能"
+        }
     }
 
     var detail: String {
-        "开启后，需要重新启动 Hyperdisplay 才能开始出画面。"
+        switch self {
+        case .screenRecording: return "开启后，需要重新启动 Hyperdisplay 才能开始出画面。"
+        case .accessibility: return "开启后，平板即可点按、滚动、拖动控制 Mac；立即生效，无需重启。"
+        }
     }
 
     var settingsURL: URL? {
-        URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+        switch self {
+        case .screenRecording:
+            return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+        case .accessibility:
+            return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        }
     }
 }
 
@@ -24,7 +39,7 @@ private enum PermissionGuideKind: Equatable {
 /// 从不绕过 TCC，也不读取任意屏幕像素。
 final class PermissionPanelController: NSObject, NSWindowDelegate {
     var onRestartRequested: (() -> Void)?
-    var onPermissionDetected: (() -> Void)?
+    var onPermissionDetected: ((PermissionGuideKind) -> Void)?
 
     private var panel: NSPanel?
     private var followTimer: Timer?
@@ -37,6 +52,9 @@ final class PermissionPanelController: NSObject, NSWindowDelegate {
     private var acceptedDropGraceUntil: Date?
 
     func showScreenRecordingRequired(force: Bool = false) { showGuide(for: .screenRecording, force: force) }
+
+    /// 触控远控的辅助功能引导。与屏幕录制不同：授权热生效，检测到即收起，无需重启。
+    func showAccessibilityRequired(force: Bool = false) { showGuide(for: .accessibility, force: force) }
 
     /// 屏幕录制授权由新进程接收；这里不假装热生效，而是给出最后一步。
     func showScreenRecordingRestartRequired(force: Bool = false) {
@@ -232,12 +250,16 @@ final class PermissionPanelController: NSObject, NSWindowDelegate {
         let now = Date()
         guard force || now.timeIntervalSince(lastPermissionCheckAt) >= 0.25 else { return }
         lastPermissionCheckAt = now
-        let granted = Permissions.hasScreenRecording()
+        let granted: Bool
+        switch kind {
+        case .screenRecording: granted = Permissions.hasScreenRecording()
+        case .accessibility: granted = Permissions.hasAccessibility()
+        }
         guard granted else { return }
         reportedGrantedKind = kind
         panel?.orderOut(nil)
         NSLog("[hyperdisplay] %@ permission detected by guide", kind.settingsName)
-        onPermissionDetected?()
+        onPermissionDetected?(kind)
     }
 
     private func positionBelowSystemSettings() {

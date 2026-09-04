@@ -297,6 +297,22 @@ final class DisplayStream {
         captureSizeLock.unlock()
     }
 
+    // MARK: 触控远控注入（2026-09-04 恢复）
+
+    let injector = InputInjector()
+
+    /// 流像素坐标 → 虚拟屏全局坐标。与 pushCursorPosition 的逆映射共用同一套
+    /// bounds/outputWidth 参数；按需现算，档位切换或屏重排后不会用到过期映射。
+    func streamPointToGlobal(x: Double, y: Double) -> CGPoint {
+        let b = display.bounds
+        let w = max(1, Double(outputWidth))
+        let h = max(1, Double(outputHeight))
+        let px = b.minX + (x / w) * b.width
+        let py = b.minY + (y / h) * b.height
+        return CGPoint(x: min(max(px, b.minX), b.maxX - 0.5),
+                       y: min(max(py, b.minY), b.maxY - 0.5))
+    }
+
     /// 静止锐化（2026-08-21）：内容驱动的编码下，画面停在哪帧就保持哪帧的质量——
     /// 运动末尾的帧是低质量帧（码率被运动分摊），静止后不重编码就永远糊着。
     /// 检测「动→静」转换（≥0.5s 无新帧）时重编码一帧全质量 IDR，客户端无感刷新
@@ -629,7 +645,7 @@ final class DisplayStream {
         let w = outputWidth
         let h = outputHeight
         let data = Wire.welcome(codec: c.rawValue, displayId: did, width: w, height: h, fps: fps,
-                                controlEnabled: false)
+                                controlEnabled: true)
         for var addr in host?.addressesOfSubscribers(of: display.displayID) ?? [] {
             udp.send(to: &addr, data)
         }
@@ -964,8 +980,14 @@ final class HostApp: NSObject, NSApplicationDelegate {
         permissionPanel.onRestartRequested = { [weak self] in
             self?.restartAfterScreenRecordingPermission()
         }
-        permissionPanel.onPermissionDetected = { [weak self] in
-            self?.pollPermissionsAndStart()
+        permissionPanel.onPermissionDetected = { [weak self] kind in
+            switch kind {
+            case .screenRecording:
+                self?.pollPermissionsAndStart()
+            case .accessibility:
+                // 辅助功能授权热生效，注入在下一次输入包自然开始；无需任何重启。
+                NSLog("[hyperdisplay] accessibility granted; touch control now active")
+            }
         }
     }
 
@@ -2032,13 +2054,29 @@ final class HostApp: NSObject, NSApplicationDelegate {
                     stream.handleNack(frameId: frameId, indices: indices, to: addr)
                 }
             }
-        // 产品收敛为纯外置显示器：不申请辅助功能，也绝不把平板事件注入 macOS。
-        // 仍确认旧客户端的可靠输入包，避免它们因未收到 ACK 制造重传风暴。
-        case .inputMove(_, let seq, _, _),
-             .inputButton(_, let seq, _, _, _, _),
-             .inputWheel(_, let seq, _, _, _, _):
+        // 触控远控（2026-09-04 恢复）：可靠输入包先 ACK 防重传风暴，再走注入。
+        // 注入有双重门：辅助功能 TCC（未授权弹引导面板，绝不静默失效）+ 该地址
+        // 必须已订阅目标屏（未配对的 LAN 对端无法借输入包控制 Mac）。
+        case .inputMove(let displayId, let seq, let x, let y):
             var a = addr
             udp?.send(to: &a, Wire.inputAck(seq: seq))
+            injectRemoteInput(displayId: displayId, from: addr) { stream in
+                stream.injector.move(to: stream.streamPointToGlobal(x: Double(x), y: Double(y)))
+            }
+        case .inputButton(let displayId, let seq, let button, let down, let x, let y):
+            var a = addr
+            udp?.send(to: &a, Wire.inputAck(seq: seq))
+            injectRemoteInput(displayId: displayId, from: addr) { stream in
+                stream.injector.button(button, down: down != 0,
+                                        at: stream.streamPointToGlobal(x: Double(x), y: Double(y)))
+            }
+        case .inputWheel(let displayId, let seq, let dx, let dy, let x, let y):
+            var a = addr
+            udp?.send(to: &a, Wire.inputAck(seq: seq))
+            injectRemoteInput(displayId: displayId, from: addr) { stream in
+                stream.injector.wheel(dx: Double(dx), dy: Double(dy),
+                                       at: stream.streamPointToGlobal(x: Double(x), y: Double(y)))
+            }
         case .keyframeReq(let displayId):
             // 一个客户端不能通过猜测 displayId 干扰另一台设备的编码/关键帧节奏。
             let allowed = subscribedDisplayIDs(for: clientKey(addr))
@@ -2303,6 +2341,41 @@ final class HostApp: NSObject, NSApplicationDelegate {
         clientsLock.lock()
         defer { clientsLock.unlock() }
         return clients[key]?.displayIds ?? []
+    }
+
+    // MARK: 触控远控注入的门与缓存
+
+    /// AXIsProcessTrusted 是 Mach 调用；60Hz 移动流下最多 1s 复查一次，授权后缓存。
+    private var inputTrustCache = false
+    private var inputTrustCheckedAt = Date.distantPast
+    /// 引导面板的弹射限流：未授权时每 2s 至多请求一次，避免移动流把主线程刷爆。
+    private var inputGuideRequestedAt = Date.distantPast
+
+    private func injectRemoteInput(displayId: UInt16, from addr: sockaddr_in, inject: (DisplayStream) -> Void) {
+        if !inputTrustCache {
+            if Date().timeIntervalSince(inputTrustCheckedAt) >= 1 {
+                inputTrustCheckedAt = Date()
+                if Permissions.hasAccessibility() {
+                    inputTrustCache = true
+                    NSLog("[hyperdisplay] accessibility trusted; remote control input flowing")
+                }
+            }
+            guard inputTrustCache else {
+                // 未授权：点按在 Mac 上不会有任何效果，必须让用户看见原因——弹
+                // 辅助功能引导面板（拖图标进系统设置列表，授权热生效）。
+                if Date().timeIntervalSince(inputGuideRequestedAt) >= 2 {
+                    inputGuideRequestedAt = Date()
+                    DispatchQueue.main.async { [weak self] in
+                        self?.permissionPanel.showAccessibilityRequired()
+                    }
+                }
+                return
+            }
+        }
+        let id = CGDirectDisplayID(displayId)
+        guard subscribedDisplayIDs(for: clientKey(addr)).contains(id),
+              let stream = snapshotStreams()[id] else { return }
+        inject(stream)
     }
 
     private func sanitizedDeviceName(_ name: String) -> String {
