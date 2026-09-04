@@ -2199,7 +2199,7 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         // 触控远控：点按=鼠标左键、双指滚动=滚轮、双指轻点=右键、三指拖动=中键。
         // 用户偏好持久化；是否真正生效还取决于 host 能力（WELCOME 协商）。
         panel.addView(android.widget.CheckBox(this).apply {
-            text = "触控远控（点按/双指滚动/双指点右键/三指中键）"
+            text = "触控远控（点按/滚动/右键/中键/调度中心/切桌面/启动台）"
             textSize = 13f
             setPadding(0, 18, 0, 0)
             isChecked = remoteControlUserPref
@@ -2211,8 +2211,9 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
             }
         })
         panel.addView(TextView(this).apply {
-            text = "首次使用时 Mac 会弹出「辅助功能」授权引导，允许后立即生效。" +
-                "若 Mac 未弹窗，请检查 Mac 端 Hyperdisplay 是否在运行。"
+            text = "点按=鼠标 · 双指滚/双指点=滚轮/右键 · 三指快上扫=调度中心 · " +
+                "三指慢拖/轻点=中键 · 四指左右扫=切桌面 · 四指捏合=启动台。\n" +
+                "首次使用时 Mac 会弹出「辅助功能」授权引导，允许后立即生效。"
             textSize = 11f
             setPadding(pad / 2, 2, pad / 2, 6)
         })
@@ -2357,13 +2358,14 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
     }
 
     // 手势状态机（2026-09-04 重构为 slop 判定模型）：
-    // 0=idle 1=按下待定 2=左键拖动 3=双指滚轮 4=双指点(右键)待定 5=三指中键 6=已消费
-    // 原则：动作在「抬起」或「移动越界」时才定性，绝不在 ACTION_DOWN 瞬间发左键。
-    // 旧版按下即发 button-down，第二根手指落下只能补发 button-up——双指滚动前必先
-    // 闪一次幻影左键点击（在视频页面=暂停/播放各一次）。
+    // 0=idle 1=按下待定 2=左键拖动 3=双指滚轮 4=双指点(右键)待定 5=三指中键
+    // 6=已消费 7=三指待判定（快扫/中键未分） 8=四指（扫/捏合待判定）
+    // 原则：动作在「抬起」「移动越界」或「特征成立」时才定性，绝不在 ACTION_DOWN
+    // 瞬间发左键/中键。旧版按下即发 button-down，第二根手指落下只能补发 button-up
+    // ——双指滚动前必闪一次幻影左键点击（在视频页面=暂停/播放各一次）。
     private var touchMode = 0
     /** 手势归属的屏。运动事件会按屏拆分派发，手势进行中其他屏的手指一律忽略，
-     * 防止两块屏各拿半套共享状态互相踩。 */
+     *  防止两块屏各拿半套共享状态互相踩。 */
     private var touchView: StreamView? = null
     private var touchDownX = 0f
     private var touchDownY = 0f
@@ -2377,14 +2379,47 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
         slop * slop
     }
     private val twoFingerTapMs = 220L
+    /** 三/四指轻扫的定性距离（约 44dp）与快扫时限。 */
+    private val swipeDistancePx: Float by lazy { 44f * resources.displayMetrics.density }
+    private val swipeFastMs = 450L
+    /** 四指捏合：相邻指距和缩到初始的该比例即触发启动台。 */
+    private val pinchTriggerRatio = 0.72f
 
-    /** 全部指针的流坐标质心（三指手势/滚轮锚点用）。 */
+    // 三指待判定的锚点（质心、时刻）与四指的锚点（质心 X、初始指距和）。
+    private var threeAnchorX = 0f
+    private var threeAnchorY = 0f
+    private var threeAnchorAt = 0L
+    private var fourAnchorX = 0f
+    private var fourSpan0 = 0f
+
+    /** 全部指针的流坐标质心（三/四指锚点与中键拖动用）。 */
     private fun centroid(view: StreamView, event: MotionEvent): FloatArray? {
         val n = event.pointerCount
         if (n == 0) return null
         var sx = 0f; var sy = 0f
         for (i in 0 until n) { sx += event.getX(i); sy += event.getY(i) }
         return view.viewToStream(sx / n, sy / n)
+    }
+
+    /** 相邻指针两两距离之和（view px）：四指捏合的膨胀/收缩度量。 */
+    private fun pointerSpan(event: MotionEvent): Float {
+        val n = event.pointerCount
+        if (n < 2) return 0f
+        var sum = 0f
+        for (i in 0 until n - 1) {
+            val dx = event.getX(i + 1) - event.getX(i)
+            val dy = event.getY(i + 1) - event.getY(i)
+            sum += kotlin.math.hypot(dx, dy)
+        }
+        return sum
+    }
+
+    /** 全部指针的 view 坐标质心（手势特征判定用，不做流坐标换算）。 */
+    private fun centroidView(event: MotionEvent): Pair<Float, Float> {
+        val n = event.pointerCount
+        var sx = 0f; var sy = 0f
+        for (i in 0 until n) { sx += event.getX(i); sy += event.getY(i) }
+        return Pair(sx / n, sy / n)
     }
 
     private fun handleTouch(displayId: Int, view: StreamView, event: MotionEvent) {
@@ -2414,14 +2449,22 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                     secondFingerDownAt = System.currentTimeMillis()
                     wheelLastX = (event.getX(0) + event.getX(1)) / 2f
                     wheelLastY = (event.getY(0) + event.getY(1)) / 2f
-                } else if (count >= 3 && (touchMode == 1 || touchMode == 4)) {
-                    // 三指=中键：落下即按住、移动拖动、抬手释放；快速三指点=中键点击。
-                    val c = centroid(view, event)
-                    if (c != null) {
-                        touchMode = 5
-                        s.sendMove(displayId, c[0], c[1])
-                        s.sendButton(displayId, 2, true, c[0], c[1])
+                } else if (count == 3 && (touchMode == 1 || touchMode == 4)) {
+                    // 三指进入待判定：快上扫=调度中心，慢速移动=中键拖动，轻点=中键
+                    // 点击——都不在落下瞬间定性（与单指点按同一原则）。
+                    touchMode = 7
+                    val c = centroidView(event)
+                    threeAnchorX = c.first; threeAnchorY = c.second
+                    threeAnchorAt = System.currentTimeMillis()
+                } else if (count >= 4 && (touchMode == 1 || touchMode == 4 || touchMode == 7 || touchMode == 5)) {
+                    if (touchMode == 5) {
+                        // 中键拖动中途加指升到四指：先释放中键，再进四指判定。
+                        centroid(view, event)?.let { s.sendButton(displayId, 2, false, it[0], it[1]) }
                     }
+                    touchMode = 8
+                    val c = centroidView(event)
+                    fourAnchorX = c.first
+                    fourSpan0 = pointerSpan(event)
                 }
             }
             MotionEvent.ACTION_MOVE -> {
@@ -2457,6 +2500,39 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                         if (dx * dx + dy * dy > touchSlopSq) touchMode = 3 // 双指移动越界 → 滚轮
                     }
                     5 -> centroid(view, event)?.let { s.sendMove(displayId, it[0], it[1]) }
+                    7 -> {
+                        val c = centroidView(event)
+                        val dx = c.first - threeAnchorX
+                        val dy = c.second - threeAnchorY
+                        val fast = System.currentTimeMillis() - threeAnchorAt < swipeFastMs
+                        if (dy <= -swipeDistancePx && -dy >= 2f * kotlin.math.abs(dx) && fast) {
+                            // 三指快上扫 = 调度中心（触控板默认手势）。
+                            s.sendAction(displayId, 1)
+                            touchMode = 6
+                        } else if (dx * dx + dy * dy > touchSlopSq) {
+                            // 慢速/水平移动 → 中键拖动：此刻起按下并注入移动。
+                            touchMode = 5
+                            val p = centroid(view, event) ?: return
+                            s.sendMove(displayId, p[0], p[1])
+                            s.sendButton(displayId, 2, true, p[0], p[1])
+                        }
+                    }
+                    8 -> {
+                        val span = pointerSpan(event)
+                        if (span < pinchTriggerRatio * fourSpan0) {
+                            // 四指捏合 = 启动台。
+                            s.sendAction(displayId, 2)
+                            touchMode = 6
+                        } else {
+                            val c = centroidView(event)
+                            val dx = c.first - fourAnchorX
+                            if (kotlin.math.abs(dx) >= swipeDistancePx) {
+                                // 四指水平扫 = 切换桌面空间（左/右按扫向）。
+                                s.sendAction(displayId, if (dx < 0f) 3 else 4)
+                                touchMode = 6
+                            }
+                        }
+                    }
                 }
             }
             MotionEvent.ACTION_POINTER_UP -> {
@@ -2479,6 +2555,10 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                 } else if (count == 2 && touchMode == 5) {
                     centroid(view, event)?.let { s.sendButton(displayId, 2, false, it[0], it[1]) }
                     touchMode = 6
+                } else if (count == 2 && touchMode == 7) {
+                    touchMode = 6 // 三指抬到剩两指：待判定手势取消
+                } else if (count == 3 && touchMode == 8) {
+                    touchMode = 6 // 四指抬掉一根：本手势收尾，不再判定
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -2494,6 +2574,12 @@ class MainActivity : androidx.appcompat.app.AppCompatActivity() {
                         s.sendButton(displayId, 0, false, p[0], p[1])
                     }
                     5 -> centroid(view, event)?.let { s.sendButton(displayId, 2, false, it[0], it[1]) }
+                    7 -> view.viewToStream(event.x, event.y)?.let { p ->
+                        // 三指轻点（未定向未越界）= 中键点击。
+                        s.sendMove(displayId, p[0], p[1])
+                        s.sendButton(displayId, 2, true, p[0], p[1])
+                        s.sendButton(displayId, 2, false, p[0], p[1])
+                    }
                 }
                 finishTouch(view, event)
             }

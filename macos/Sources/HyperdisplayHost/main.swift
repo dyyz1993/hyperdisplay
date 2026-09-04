@@ -2077,6 +2077,12 @@ final class HostApp: NSObject, NSApplicationDelegate {
                 stream.injector.wheel(dx: Double(dx), dy: Double(dy),
                                        at: stream.streamPointToGlobal(x: Double(x), y: Double(y)))
             }
+        case .inputAction(let displayId, let seq, let action):
+            var a = addr
+            udp?.send(to: &a, Wire.inputAck(seq: seq))
+            injectRemoteInput(displayId: displayId, from: addr) { stream in
+                stream.injector.performAction(action)
+            }
         case .keyframeReq(let displayId):
             // 一个客户端不能通过猜测 displayId 干扰另一台设备的编码/关键帧节奏。
             let allowed = subscribedDisplayIDs(for: clientKey(addr))
@@ -2199,7 +2205,7 @@ final class HostApp: NSObject, NSApplicationDelegate {
             // 忽略旧客户端的自由建销指令，防止不受控的 ColorSync churn。
             NSLog("[hyperdisplay] ignored legacy direct display mutation from \(addressString(addr))")
 
-        case .keyframeReq, .nack, .inputMove, .inputButton, .inputWheel, .ping, .cursorImageAck:
+        case .keyframeReq, .nack, .inputMove, .inputButton, .inputWheel, .inputAction, .ping, .cursorImageAck:
             break // 已在接收线程直接处理（见 handlePacket），主线程不再走
 
         case .encoderReset(let displayId):

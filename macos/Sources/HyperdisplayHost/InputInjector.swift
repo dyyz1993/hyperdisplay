@@ -59,6 +59,39 @@ final class InputInjector {
         postMouseEvent(type: type, at: point, button: mouseButton, clickState: 1)
     }
 
+    private func postKey(keyCode: CGKeyCode, modifiers: CGEventFlags) {
+        let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true)
+        down?.flags = modifiers
+        down?.post(tap: .cghidEventTap)
+        let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false)
+        up?.flags = modifiers
+        up?.post(tap: .cghidEventTap)
+    }
+
+    // MARK: 系统动作（触控板默认手势的等效合成）
+
+    /// 系统级手势（调度中心/切空间/启动台）不碰私有 gesture 事件，一律合成等效
+    /// 动作：调度中心/切空间走系统默认全局快捷键（^↑ / ^← / ^→），启动台直接
+    /// 打开 Launchpad.app（Sonoma+ 均为标准路径）。用户自定义过快捷键的机器上
+    /// 以默认快捷键为准——自定义热键解析（symbolichotkeys）暂不支持。
+    func performAction(_ raw: UInt8) {
+        switch RemoteAction(rawValue: raw) {
+        case .missionControl:
+            postKey(keyCode: 126, modifiers: .maskControl) // ↑
+        case .spaceLeft:
+            postKey(keyCode: 123, modifiers: .maskControl) // ←
+        case .spaceRight:
+            postKey(keyCode: 124, modifiers: .maskControl) // →
+        case .launchpad:
+            // NSWorkspace 归 AppKit，回主线程调用。
+            DispatchQueue.main.async {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Launchpad.app"))
+            }
+        case nil:
+            break
+        }
+    }
+
     // MARK: 滚动方向（跟随 Mac「自然滚动」偏好）
 
     private var naturalScrollCache: Bool?

@@ -754,6 +754,13 @@ class HostSession private constructor(
         sendReliable(body)
     }
 
+    /** Mac 系统动作（INPUT subtype=3，可靠发送）：1=调度中心 2=启动台 3=左空间 4=右空间。 */
+    fun sendAction(displayId: Int, action: Int) {
+        val body = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
+            .putShort(displayId.toShort()).put(3).put(action.toByte()).array()
+        sendReliable(body)
+    }
+
     fun setRemoteControlEnabled(enabled: Boolean) {
         remoteControlEnabled = enabled
         if (!enabled) pendingAcks.clear()

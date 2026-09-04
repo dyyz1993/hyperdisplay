@@ -43,7 +43,15 @@ enum PacketType: UInt8 {
 /// 0xFFFF 表示「全部显示屏」（KEYFRAME_REQ 专用）
 let displayIdBroadcast: UInt16 = 0xFFFF
 
-enum InputSubtype: UInt8 { case move = 0, button = 1, wheel = 2 }
+enum InputSubtype: UInt8 { case move = 0, button = 1, wheel = 2, action = 3 }
+
+/// 触控手势触发的 Mac 系统动作（INPUT subtype=action 的 body）。
+enum RemoteAction: UInt8 {
+    case missionControl = 1  // 三指上扫（触控板默认手势）
+    case launchpad = 2       // 四指捏合
+    case spaceLeft = 3       // 四指左扫
+    case spaceRight = 4      // 四指右扫
+}
 
 struct DisplayListEntry {
     var id: UInt32
@@ -112,6 +120,7 @@ enum Packet {
     case inputMove(displayId: UInt16, seq: UInt32, x: Float32, y: Float32)
     case inputButton(displayId: UInt16, seq: UInt32, button: UInt8, down: UInt8, x: Float32, y: Float32)
     case inputWheel(displayId: UInt16, seq: UInt32, dx: Float32, dy: Float32, x: Float32, y: Float32)
+    case inputAction(displayId: UInt16, seq: UInt32, action: UInt8)
     case ping(seq: UInt32)
     case selectDisplay(id: UInt32)
     case subscribeDisplays(ids: [UInt32])
@@ -579,6 +588,9 @@ enum Wire {
             case .wheel:
                 guard body >= 19 else { return nil }
                 return .inputWheel(displayId: displayId, seq: seq, dx: f32(3), dy: f32(7), x: f32(11), y: f32(15))
+            case .action:
+                guard body >= 4 else { return nil }
+                return .inputAction(displayId: displayId, seq: seq, action: u8(3))
             case nil:
                 return nil
             }
